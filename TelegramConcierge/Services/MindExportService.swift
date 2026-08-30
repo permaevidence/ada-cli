@@ -1,0 +1,443 @@
+import Foundation
+
+// MARK: - Mind Export Service
+
+/// Handles exporting and importing all user data for portability
+actor MindExportService {
+    static let shared = MindExportService()
+    
+    // MARK: - Configuration
+    
+    /// Version for forward compatibility
+    private let exportVersion = "1.1"
+    
+    /// File extension for mind exports
+    static let fileExtension = "mind"
+    
+    /// Base app folder
+    private let appFolder: URL = {
+        let folder = StoragePaths.dataRoot
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }()
+
+    /// User-editable configuration (skills, agents, MCP config): kept in
+    /// ~/.config/ada so it is easy for users to inspect and share.
+    /// Root of the subagent-session store. Was StoragePaths.configRoot by
+    /// mistake until 2026-08-20 (Codex round 3): SubagentSessionRegistry
+    /// persists under DATA root, so exports silently included no sessions
+    /// and imports restored them into a directory nothing reads. Old
+    /// backups simply lack the folder — restoreDirectory's missing-folder
+    /// path already handles that.
+    private let homeFolder: URL = {
+        let folder = StoragePaths.dataRoot
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }()
+    
+    // MARK: - Export
+
+    /// What an export carries (owner, 2026-08-27). `.full` is everything.
+    /// `.lite` is the MEMORY only — conversation, archives, reminders +
+    /// watcher scripts, calendar, todos, ledger, contacts, subagent
+    /// sessions, persona — skipping the bulky payload folders below, which
+    /// can dwarf the memory by orders of magnitude (user documents,
+    /// original-size images, per-read attachment snapshots, cloned project
+    /// repos). Restoring a lite backup follows the normal replacement
+    /// semantics: the target's payload folders are CLEARED — the import
+    /// warning discloses exactly which areas arrive empty.
+    enum ExportScope: String {
+        case full
+        case lite
+
+        /// The payload folders a lite export skips. Cached file
+        /// DESCRIPTIONS still ride in mind_config, so the restored agent
+        /// remembers what the files were — it just can't re-open them.
+        static let payloadFolderNames = ["images", "documents", "tool_attachments", "projects"]
+    }
+
+    /// Export user data to a ZIP file at the specified destination.
+    func exportMind(to destination: URL, scope: ExportScope = .full) async throws {
+        let fm = FileManager.default
+        
+        // Create a temporary directory for assembly
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+        
+        // 1. Copy app-support files.
+        for fileName in [
+            "conversation.json",
+            "context_usage.json",
+            "contacts.json",
+            "reminders.json",
+            "calendar.json",
+            "files_ledger.json",
+            "documents_last_opened.json",
+            "todos.json"
+        ] {
+            try copyItemIfExists(
+                from: appFolder.appendingPathComponent(fileName),
+                to: tempDir.appendingPathComponent(fileName)
+            )
+        }
+
+        // 2. Copy app-support folders. reminder-scripts (with its state/
+        // subfolder) rides along since 2026-08-27 (Codex): reminders.json
+        // stores only absolute script paths, so a backup without the script
+        // bodies and their $WATCHER_STATE restored nothing runnable.
+        for folderName in [
+            "archive",
+            "images",
+            "documents",
+            "tool_attachments",
+            "projects",
+            "reminder-scripts"
+        ] where scope == .full || !ExportScope.payloadFolderNames.contains(folderName) {
+            try copyItemIfExists(
+                from: appFolder.appendingPathComponent(folderName, isDirectory: true),
+                to: tempDir.appendingPathComponent(folderName, isDirectory: true)
+            )
+        }
+
+        // 3. Copy home-backed memory stores.
+        try copyItemIfExists(
+            from: homeFolder.appendingPathComponent("subagent_sessions", isDirectory: true),
+            to: tempDir.appendingPathComponent("subagent_sessions", isDirectory: true)
+        )
+
+        // 4. Create mind_config.json with Keychain and UserDefaults data.
+        let config = buildMindConfig()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let configData = try encoder.encode(config)
+        try configData.write(to: tempDir.appendingPathComponent("mind_config.json"))
+        
+        // 5. Create ZIP archive using native macOS zip command.
+        // The destination is NOT touched until a complete archive exists
+        // (Codex, 2026-08-27): createZipArchive hands the finished zip over
+        // atomically, so an existing backup survives every failure mode —
+        // zip error, full disk, failed copy. (The old delete-then-copy left
+        // the user with nothing, or a torn file, when a later step failed.)
+        try await createZipArchive(from: tempDir, to: destination)
+        
+        print("[MindExportService] Exported mind to: \(destination.path)")
+    }
+    
+    // MARK: - Import
+
+    /// A validated, extracted Mind archive awaiting application. Producing
+    /// one is READ-ONLY; the caller decides whether to apply (destructive
+    /// replacement) or discard it. Ordering contract (Codex round 3 on the
+    /// Ada.app arc, 2026-08-26): the import flow must stage FIRST — a
+    /// corrupt or non-Mind archive has to reject here, before any
+    /// destructive step (subagent cancellation, pre-import output discard)
+    /// runs against the current Mind.
+    struct StagedMind {
+        let tempDir: URL
+        fileprivate let config: MindConfig
+        /// Surfaced for the /importmind proposal message, so the user
+        /// confirms against the backup's real date rather than a filename.
+        var exportDate: Date { config.exportDate }
+        var exportVersion: String { config.version }
+    }
+
+    /// Phase 1 — extract the archive and validate it is a real Mind
+    /// backup. Touches NO current data; when this throws, nothing anywhere
+    /// has changed.
+    func stageMind(from source: URL) async throws -> StagedMind {
+        let fm = FileManager.default
+
+        // Create a temporary directory for extraction. Ownership passes to
+        // the returned StagedMind — applyStagedMind/discardStagedMind
+        // remove it.
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        do {
+            try await extractZipArchive(from: source, to: tempDir)
+
+            // Validate and decode the config BEFORE anything touches current
+            // data. Every mind export contains mind_config.json; a
+            // random-but-valid zip (e.g. an app bundle) does not. Applying a
+            // backup deletes current files even when the backup lacks them,
+            // so proceeding without this gate would wipe the user's memory
+            // and restore nothing.
+            // Fallback to any *_config.json for backward/forward compatibility.
+            let preferredConfigSource = tempDir.appendingPathComponent("mind_config.json")
+            let configSource: URL?
+            if fm.fileExists(atPath: preferredConfigSource.path) {
+                configSource = preferredConfigSource
+            } else {
+                configSource = try? fm.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil)
+                    .filter { $0.lastPathComponent.hasSuffix("_config.json") }
+                    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                    .first
+            }
+            guard let configSource else {
+                throw MindExportError.notAMindBackup
+            }
+            let config: MindConfig
+            do {
+                let configData = try Data(contentsOf: configSource)
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                config = try decoder.decode(MindConfig.self, from: configData)
+            } catch {
+                throw MindExportError.notAMindBackup
+            }
+            return StagedMind(tempDir: tempDir, config: config)
+        } catch {
+            try? fm.removeItem(at: tempDir)
+            throw error
+        }
+    }
+
+    /// Abandon a staged Mind without applying it (a pre-apply step aborted
+    /// after successful validation, or the /importmind proposal step, which
+    /// stages purely to validate early).
+    func discardStagedMind(_ staged: StagedMind) {
+        try? FileManager.default.removeItem(at: staged.tempDir)
+    }
+
+    /// Phase 2 — apply a validated staged Mind: the destructive replacement
+    /// of current data. Call only once the import is committed (producers
+    /// quiescent, pre-import outputs discarded).
+    func applyStagedMind(_ staged: StagedMind) throws {
+        let tempDir = staged.tempDir
+        let config = staged.config
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // 2. Restore app-support files. Missing files in older backups clear
+        // the current counterpart so import behaves like a real replacement.
+        for fileName in [
+            "conversation.json",
+            "context_usage.json",
+            "contacts.json",
+            "reminders.json",
+            "calendar.json",
+            "files_ledger.json",
+            "documents_last_opened.json",
+            "todos.json"
+        ] {
+            try restoreFile(named: fileName, from: tempDir, to: appFolder)
+        }
+
+        // 3. Restore app-support folders. Older backups without
+        // reminder-scripts clear the current one — correct replacement
+        // semantics (their reminders.json had no runnable watchers anyway).
+        for folderName in [
+            "archive",
+            "images",
+            "documents",
+            "tool_attachments",
+            "projects",
+            "reminder-scripts"
+        ] {
+            try restoreDirectory(named: folderName, from: tempDir, to: appFolder)
+        }
+
+        // 4. Restore home-backed memory stores.
+        try restoreDirectory(named: "subagent_sessions", from: tempDir, to: homeFolder)
+
+        // 5. Apply the config decoded during validation (persona + file descriptions).
+        try restoreMindConfig(config)
+
+        print("[MindExportService] Applied staged mind from: \(tempDir.path)")
+    }
+
+    // MARK: - File Copy Helpers
+
+    private func copyItemIfExists(from source: URL, to destination: URL) throws {
+        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        try FileManager.default.copyItem(at: source, to: destination)
+    }
+
+    private func restoreFile(named fileName: String, from tempDir: URL, to destinationDir: URL) throws {
+        let source = tempDir.appendingPathComponent(fileName)
+        let destination = destinationDir.appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: destination)
+        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: source, to: destination)
+    }
+
+    private func restoreDirectory(named folderName: String, from tempDir: URL, to destinationDir: URL) throws {
+        let source = tempDir.appendingPathComponent(folderName, isDirectory: true)
+        let destination = destinationDir.appendingPathComponent(folderName, isDirectory: true)
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: source.path) {
+            try FileManager.default.copyItem(at: source, to: destination)
+        } else {
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        }
+    }
+    
+    // MARK: - ZIP Operations
+
+    /// Resolve `zip`/`unzip` for the current platform. Hardcoded
+    /// /usr/bin worked while this service was dormant macOS-only code;
+    /// as a live cross-platform feature the binaries may be absent
+    /// (minimal Linux, Ubuntu Touch) — fail with an actionable message
+    /// instead of a bare NSCocoaError. The .mind format stays zip on
+    /// purpose: backups must round-trip with Ada.app.
+    private static func findArchiveTool(_ name: String) throws -> String {
+        var candidates = ["/usr/bin/\(name)", "/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            candidates += path.split(separator: ":").map { "\($0)/\(name)" }
+        }
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+        throw MindExportError.toolMissing(name)
+    }
+
+    /// Test seam: force createZipArchive to fail before writing anything —
+    /// coverage for "a failed export must not destroy the existing backup".
+    private var injectZipFailure = false
+    func _testInjectZipFailure(_ enabled: Bool) { injectZipFailure = enabled }
+
+    private func createZipArchive(from sourceDir: URL, to destination: URL) async throws {
+        let fm = FileManager.default
+
+        if injectZipFailure {
+            throw MindExportError.zipFailed("injected zip failure (test seam)")
+        }
+
+        // Create zip in temp directory first — the destination must not be
+        // touched until a complete archive exists.
+        let tempZip = fm.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).zip")
+        defer { try? fm.removeItem(at: tempZip) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: try Self.findArchiveTool("zip"))
+        process.currentDirectoryURL = sourceDir
+        process.arguments = ["-r", "-q", tempZip.path, "."]
+        
+        let pipe = Pipe()
+        process.standardError = pipe
+        
+        try process.run()
+        process.waitUntilExit()
+        
+        if process.terminationStatus != 0 {
+            let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
+            let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+            throw MindExportError.zipFailed(errorMessage)
+        }
+        
+        // Atomic hand-off (Codex, 2026-08-27): copy the finished zip to a
+        // hidden SIBLING of the destination (same directory → same volume),
+        // then rename(2) it into place — atomic replacement on both Darwin
+        // and Linux, whether or not the destination already exists. The
+        // previous backup survives until a complete replacement is in
+        // place, and no partial file can ever sit at the destination path.
+        let sibling = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(destination.lastPathComponent).tmp-\(UUID().uuidString.prefix(8))")
+        defer { try? fm.removeItem(at: sibling) }
+        try fm.copyItem(at: tempZip, to: sibling)
+        let renamed = sibling.path.withCString { source in
+            destination.path.withCString { dest in rename(source, dest) }
+        }
+        if renamed != 0 {
+            throw MindExportError.zipFailed("could not move the finished archive into place: \(String(cString: strerror(errno)))")
+        }
+    }
+    
+    private func extractZipArchive(from source: URL, to destinationDir: URL) async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: try Self.findArchiveTool("unzip"))
+        process.arguments = ["-q", source.path, "-d", destinationDir.path]
+        
+        let pipe = Pipe()
+        process.standardError = pipe
+        
+        try process.run()
+        process.waitUntilExit()
+        
+        if process.terminationStatus != 0 {
+            let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
+            let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+            throw MindExportError.unzipFailed(errorMessage)
+        }
+    }
+    
+    // MARK: - Mind Config
+    
+    fileprivate struct MindConfig: Codable {
+        let version: String
+        let exportDate: Date
+        let persona: PersonaConfig
+        let fileDescriptions: [String: String]
+    }
+    
+    fileprivate struct PersonaConfig: Codable {
+        let assistantName: String?
+        let userName: String?
+        let userContext: String?
+        let structuredUserContext: String?
+    }
+    
+    private func buildMindConfig() -> MindConfig {
+        // Load persona settings from Keychain
+        let persona = PersonaConfig(
+            assistantName: KeychainHelper.load(key: KeychainHelper.assistantNameKey),
+            userName: KeychainHelper.load(key: KeychainHelper.userNameKey),
+            userContext: KeychainHelper.load(key: KeychainHelper.userContextKey),
+            structuredUserContext: KeychainHelper.load(key: KeychainHelper.structuredUserContextKey)
+        )
+
+        // Load file descriptions
+        var fileDescriptions: [String: String] = [:]
+        if let data = FileDescriptionsStore.loadData(),
+           let descriptions = try? JSONDecoder().decode([String: String].self, from: data) {
+            fileDescriptions = descriptions
+        }
+
+        return MindConfig(
+            version: exportVersion,
+            exportDate: Date(),
+            persona: persona,
+            fileDescriptions: fileDescriptions
+        )
+    }
+
+    private func restoreMindConfig(_ config: MindConfig) throws {
+        // Full replacement: the backup's persona and file descriptions
+        // REPLACE the destination's, absences included — a nil persona field
+        // deletes the old value and an empty description map still overwrites,
+        // so a fresh/lite backup can't inherit the previous Mind's cached
+        // file memories or name.
+        try KeychainHelper.saveBatch([
+            KeychainHelper.assistantNameKey: config.persona.assistantName,
+            KeychainHelper.userNameKey: config.persona.userName,
+            KeychainHelper.userContextKey: config.persona.userContext,
+            KeychainHelper.structuredUserContextKey: config.persona.structuredUserContext,
+        ])
+
+        try FileDescriptionsStore.storeData(try JSONEncoder().encode(config.fileDescriptions))
+    }
+}
+
+// MARK: - Errors
+
+enum MindExportError: LocalizedError {
+    case zipFailed(String)
+    case unzipFailed(String)
+    case notAMindBackup
+    case toolMissing(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .zipFailed(let message):
+            return "Failed to create archive: \(message)"
+        case .unzipFailed(let message):
+            return "Failed to extract archive: \(message)"
+        case .notAMindBackup:
+            return "The selected file is not an Ada memory backup (mind_config.json missing). No data was changed."
+        case .toolMissing(let name):
+            return "`\(name)` is not installed on this machine — install it (Linux: `sudo apt install zip unzip`) and retry. No data was changed."
+        }
+    }
+}

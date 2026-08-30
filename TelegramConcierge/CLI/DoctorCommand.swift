@@ -1,0 +1,225 @@
+import ArgumentParser
+import Foundation
+
+struct Doctor: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Check Ada's configuration, permissions and toolchain."
+    )
+
+    @Flag(name: .long, help: "Also probe the configured services over the network.")
+    var online = false
+
+    func run() async throws {
+        var problems = 0
+        func check(_ label: String, ok: Bool, hint: String? = nil) {
+            print("  \(ok ? "✔" : "✖") \(label)")
+            if !ok {
+                problems += 1
+                if let hint { print("      → \(hint)") }
+            }
+        }
+        func note(_ label: String) { print("  · \(label)") }
+
+        print("\nConfiguration")
+        let provider = LLMProvider.fromStoredValue(KeychainHelper.load(key: KeychainHelper.llmProviderKey))
+        let baseURL: String
+        let model: String
+        let mainKey: String?
+        switch provider {
+        case .lmStudio:
+            baseURL = KeychainHelper.load(key: KeychainHelper.lmStudioBaseURLKey) ?? ""
+            model = KeychainHelper.load(key: KeychainHelper.lmStudioModelKey) ?? ""
+            mainKey = nil
+        default:
+            baseURL = KeychainHelper.load(key: KeychainHelper.openAICompatibleBaseURLKey) ?? ""
+            model = KeychainHelper.load(key: KeychainHelper.openAICompatibleModelKey) ?? ""
+            mainKey = KeychainHelper.load(key: KeychainHelper.openAICompatibleApiKeyKey)
+        }
+        check("main agent endpoint configured (\(model.isEmpty ? "—" : model))",
+              ok: !baseURL.isEmpty && !model.isEmpty && (provider == .lmStudio || !(mainKey ?? "").isEmpty),
+              hint: "run `ada setup`, section 1")
+        let openAIKey = KeychainHelper.load(key: KeychainHelper.openAITranscriptionApiKeyKey) ?? ""
+        check("OpenAI key present", ok: !openAIKey.isEmpty, hint: "run `ada setup`, section 2")
+        let serperKey = KeychainHelper.load(key: KeychainHelper.serperApiKeyKey) ?? ""
+        check("Serper key present", ok: !serperKey.isEmpty, hint: "run `ada setup`, section 3")
+        let jinaKey = KeychainHelper.load(key: KeychainHelper.jinaApiKeyKey) ?? ""
+        check("Jina key present", ok: !jinaKey.isEmpty, hint: "run `ada setup`, section 4")
+        note("Telegram: \(TelegramConfig.isConfigured ? "configured" : "not configured (optional)")")
+        let backendSource = WebSearchBackend.explicitlyStored != nil
+            ? "explicit" : "inferred from keys — set with /websearch"
+        note("web search backend: \(WebSearchBackend.active.rawValue) (\(backendSource))")
+        let ocrBackend = KeychainHelper.load(key: KeychainHelper.visionPreprocessorBackendKey)
+            ?? (openAIKey.isEmpty ? "openrouter (no OpenAI key)" : "openai")
+        note("OCR backend: \(ocrBackend)")
+        note("data: \(StoragePaths.dataRoot.path)")
+        note("config: \(StoragePaths.configRoot.path)")
+
+        print("\nPermissions")
+        #if os(macOS)
+        check("Full Disk Access", ok: PermissionsService.fullDiskAccessGranted(),
+              hint: "grant it to your terminal app: System Settings → Privacy & Security → Full Disk Access")
+        let sleep = PermissionsService.displaySleepMinutes()
+        if let ac = sleep.ac {
+            note("display sleep on power: \(ac == 0 ? "never" : "\(ac) min — make sure the SYSTEM stays awake for unattended use")")
+        }
+        #else
+        note("Full Disk Access: not applicable on Linux (ordinary file permissions)")
+        if AgentServiceSupport.isUbuntuTouch() {
+            // repowerd suspends the phone on screen-off; desktop sleep
+            // settings are irrelevant — the keep-awake unit is what counts.
+            note("Ubuntu Touch detected — suspend is governed by the keep-awake unit (below)")
+        } else {
+            let sleepStatus = PermissionsService.linuxSleepStatus()
+            check("automatic suspend disabled", ok: sleepStatus.neverSuspends,
+                  hint: "run `ada setup`, section 6 — a suspended machine stops Ada completely")
+            if sleepStatus.sleepTargetsMasked {
+                note("systemd sleep targets: masked (machine can never suspend)")
+            }
+        }
+
+        // Background service (ada service): optional, but when installed it
+        // should be healthy — and on Ubuntu Touch the wakelock is essential.
+        let unitPath = AgentServiceSupport.userUnitDirectory(
+            home: FileManager.default.homeDirectoryForCurrentUser.path)
+            + "/" + AgentServiceSupport.userUnitName
+        if FileManager.default.fileExists(atPath: unitPath) {
+            let active = AgentServiceSupport.run(
+                "systemctl", ["--user", "is-active", AgentServiceSupport.userUnitName]).output
+            check("background service active", ok: active == "active",
+                  hint: "ada service status — journalctl --user -u ada.service -n 50")
+            check("linger enabled (service survives logout/boot)",
+                  ok: AgentServiceSupport.lingerEnabled(),
+                  hint: "loginctl enable-linger \(NSUserName()) (sudo may be needed)")
+        } else {
+            note("background service: not installed (optional — ada service install)")
+        }
+        if AgentServiceSupport.isUbuntuTouch() {
+            if AgentServiceSupport.wakelockUnitInstalled() {
+                let wl = AgentServiceSupport.run(
+                    "systemctl", ["is-active", AgentServiceSupport.wakelockUnitName]).output
+                check("keep-awake wakelock unit active", ok: wl == "active",
+                      hint: "sudo systemctl restart \(AgentServiceSupport.wakelockUnitName)")
+            } else {
+                check("keep-awake unit installed (phone must not suspend)", ok: false,
+                      hint: "ada service install — an OTA update may also have removed it")
+            }
+        }
+        #endif
+
+        print("\nToolchain")
+        if let report = ToolchainService.runDoctor() {
+            for entry in report.present { print("  ✔ \(ToolchainService.displayName(for: entry))") }
+            for entry in report.missing {
+                note("missing: \(ToolchainService.displayName(for: entry)) — \(entry.impact)")
+            }
+            note("LibreOffice: \(ToolchainService.libreOfficePresent() ? "present" : "not installed (optional)")")
+        } else {
+            #if os(macOS)
+            check("python3", ok: false, hint: "install Xcode Command Line Tools or Homebrew python")
+            #else
+            check("python3", ok: false, hint: "install it with your package manager, e.g. sudo apt install python3")
+            #endif
+        }
+        #if os(Linux)
+        // On Linux the media pipeline (PDF page counts, slicing, OCR
+        // rasterization, image downscaling) runs on these two suites.
+        let mediaHint = AgentServiceSupport.isUbuntuTouch()
+            ? "ada toolchain install — installs to userdata, no sudo, survives OS updates"
+            : "sudo apt install poppler-utils — without it Ada cannot read or OCR PDFs"
+        check("poppler-utils (pdfinfo/pdftotext/pdftoppm/pdfseparate/pdfunite)",
+              ok: ["pdfinfo", "pdftotext", "pdftoppm", "pdfseparate", "pdfunite"]
+                  .allSatisfy { PlatformBinary.find($0) != nil },
+              hint: mediaHint)
+        check("ImageMagick (identify/convert)",
+              ok: PlatformBinary.find("magick") != nil
+                  || (PlatformBinary.find("identify") != nil && PlatformBinary.find("convert") != nil),
+              hint: AgentServiceSupport.isUbuntuTouch()
+                  ? "ada toolchain install — installs to userdata, no sudo, survives OS updates"
+                  : "sudo apt install imagemagick — without it Ada cannot inspect or resize images")
+        // Attribute prefix-sourced tools so it's visible which survive OTA.
+        let prefixTools = UserdataToolchain.status().filter { $0.source == "prefix" }
+        if !prefixTools.isEmpty {
+            note("userdata toolchain: \(prefixTools.map { $0.name }.joined(separator: ", ")) (OTA-safe prefix)")
+        }
+        // Dangling system apt-state symlinks (seen on a UT device
+        // 2026-08-28: /var/cache/apt → deleted /userdata/apt/…): every
+        // rootfs apt run fails with confusing errors. Ada's own installer
+        // is unaffected (fully redirected) — just surface the repair.
+        let fmDoctor = FileManager.default
+        for path in ["/var/cache/apt", "/var/lib/apt/lists"] {
+            guard let target = try? fmDoctor.destinationOfSymbolicLink(atPath: path),
+                  !fmDoctor.fileExists(atPath: path) else { continue }
+            note("system apt state is a dangling symlink: \(path) → \(target) — "
+                 + "system apt/apt-get commands will fail until the target is "
+                 + "recreated (sudo mkdir -p \(target)/partial \(target)/archives/partial). Ada's userdata "
+                 + "toolchain installer is unaffected")
+        }
+        #endif
+        switch EmailCalendarProvider.current {
+        case .none:
+            note("email/calendar: none (default) — enable AgentMail or gws via `ada setup`, toolchain step")
+        case .agentmail:
+            if AgentMailService.isConfigured() {
+                let inbox = EmailCalendarProvider.agentMailInboxAddress
+                note("email/calendar: AgentMail\(inbox.isEmpty ? "" : " (\(inbox))") + local calendar — key configured")
+            } else {
+                note("email/calendar: AgentMail selected but NO API key stored — rerun `ada setup`, toolchain step")
+            }
+            if !AgentMailService.agentMailBrokerInstalled() {
+                note("agentmail CLI (key broker) not installed — inbox context/alerts still work; email ACTIONS need it (`ada setup`, toolchain step). A bare agentmail binary from npm/brew cannot authenticate: Ada never puts the key in bash environments")
+            }
+            let foreign = AgentMailService.foreignAgentMailInstalls()
+            if !foreign.isEmpty {
+                note("foreign agentmail install at \(foreign.joined(separator: ", ")) — no access to Ada's key; may shadow Ada's wrapper depending on PATH order")
+            }
+        case .gws:
+            if !GoogleWorkspaceService.gwsInstalled() {
+                note("email/calendar: gws selected but the binary is not installed — `ada setup`, toolchain step")
+            } else if await GoogleWorkspaceService.shared.gwsUsable() {
+                note("gws (Google Workspace) installed and authorized — email/calendar context enabled")
+            } else {
+                note("gws (Google Workspace) installed but NOT authorized — email/calendar context stays disabled until `gws auth login` + Ada restart")
+            }
+        }
+
+        if online {
+            print("\nOnline probes")
+            if !baseURL.isEmpty && !model.isEmpty {
+                let failure = await Probes.chatCompletion(baseURL: baseURL, apiKey: mainKey, model: model)
+                check("main agent responds", ok: failure == nil, hint: failure)
+            }
+            if !openAIKey.isEmpty {
+                let failure = await Probes.openAI(apiKey: openAIKey)
+                check("OpenAI key valid", ok: failure == nil, hint: failure)
+            }
+            if !serperKey.isEmpty {
+                let failure = await Probes.serper(apiKey: serperKey)
+                check("Serper key valid", ok: failure == nil, hint: failure)
+            }
+            if !jinaKey.isEmpty {
+                let failure = await Probes.jina(apiKey: jinaKey)
+                check("Jina key valid", ok: failure == nil, hint: failure)
+            }
+            if TelegramConfig.isConfigured {
+                let token = KeychainHelper.load(key: KeychainHelper.telegramBotTokenKey) ?? ""
+                let failure = await Probes.telegram(token: token)
+                check("Telegram bot reachable", ok: failure == nil, hint: failure)
+            }
+            switch EmailCalendarProvider.current {
+            case .gws where GoogleWorkspaceService.gwsInstalled():
+                let authorized = await GoogleWorkspaceService.shared.verifyGwsAccess()
+                check("gws authorized", ok: authorized,
+                      hint: "run `gws auth login` — until then email/calendar context is empty")
+            case .agentmail where AgentMailService.isConfigured():
+                let reachable = await AgentMailService.shared.verifyAccess()
+                check("AgentMail key valid", ok: reachable,
+                      hint: "check the key at agentmail.to (rerun `ada setup`, toolchain step) — until then email context is empty")
+            default:
+                break
+            }
+        }
+
+        print(problems == 0 ? "\nAll good." : "\n\(problems) problem(s) found.")
+        if problems > 0 { throw ExitCode(1) }
+    }
+}

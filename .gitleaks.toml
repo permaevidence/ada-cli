@@ -1,0 +1,20 @@
+# Gitleaks config for ada-cli. Extends the default ruleset; the allowlist
+# names the exact synthetic fixture values used by selftests, value-scoped
+# on purpose — a real credential pasted into a selftest must still fail
+# the scan. Add new fixture values here explicitly when writing tests.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Deliberate synthetic fixtures in selftests"
+regexes = [
+    '''^SECRET_ABCDEFGH_1234567$''',
+    '''^oc-key-1234567890$''',
+    '''^sk-or-v1-1234567890abcdef$''',
+    '''^cust-key-1234567890$''',
+    '''^sk-test-0123456789abcdef$''',
+    '''^jina-test-key-1234$''',
+    '''^am-test-key-123456$''',
+    '''^12345:test-token-abcdef$''',
+]

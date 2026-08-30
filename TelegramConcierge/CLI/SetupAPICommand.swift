@@ -1,0 +1,1038 @@
+import ArgumentParser
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Glibc)
+import Glibc
+#endif
+
+// MARK: - `ada setup-api` — machine-readable setup surface for GUI frontends
+//
+// Hidden JSON-over-stdio counterpart of the interactive wizard, built for the
+// Ubuntu Touch companion app. Contract:
+//
+//   • argv carries ONLY the verb (status | probe | apply | service). Request
+//     documents — and any secrets in them — arrive as one JSON object on
+//     stdin: argv is visible in /proc/*/cmdline and `ps` even for an
+//     unconfined caller, so a key on argv would leak.
+//   • stdout carries exactly one JSON response object; every human-readable
+//     progress line from reused wizard/service code goes to stderr.
+//   • Every response has {"schema": 1, "ok": Bool}. Failures add
+//     "error": {"code", "message"}; probe verdicts use "reason" instead
+//     (a failed probe is a result, not an API error). Exit code is 0
+//     whenever a response was produced; 64 only for transport-level
+//     failures (argv payload, unparseable stdin, unknown verb).
+//   • Validation, probing and persistence are the wizard's own code paths
+//     (Probes, KeychainHelper, ProviderProfiles), so GUI setup can never
+//     drift from `ada setup`. Where the wizard would exit(1) on a failed
+//     save, this returns {"error": {"code": "save_failed"}} instead.
+//   • Every apply section is re-applicable at any time — there are no
+//     "first run only" semantics (this backs the app's Settings screen).
+
+struct SetupAPI: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "setup-api",
+        abstract: "Internal: machine-readable setup (JSON on stdin/stdout) for GUI frontends.",
+        shouldDisplay: false
+    )
+
+    @Argument(help: "status | probe | apply | service")
+    var verb: String
+
+    @Argument(parsing: .remaining, help: .hidden)
+    var extra: [String] = []
+
+    func run() async throws {
+        AdaCLI.prepareIO()
+        // stdout purity: reused wizard/service code prints progress lines
+        // (Probes' fallback notice, installUserService, AgentMail install).
+        // Redirect fd 1 → stderr for the whole run and write the JSON
+        // response to the ORIGINAL stdout at the end, so callers always
+        // read exactly one JSON object no matter what the internals print.
+        fflush(stdout)
+        let realStdout = dup(1)
+        dup2(2, 1)
+        func respond(_ payload: [String: Any], exitCode: Int32 = 0) -> Never {
+            fflush(stdout)
+            SetupAPICore.emit(payload, toFileDescriptor: realStdout)
+            Foundation.exit(exitCode)
+        }
+
+        guard extra.isEmpty else {
+            respond(SetupAPICore.transportError(SetupAPICore.argvRefusalMessage), exitCode: 64)
+        }
+        switch verb {
+        case "status":
+            respond(await SetupAPICore.status())
+        case "probe", "apply", "service":
+            let data = FileHandle.standardInput.readDataToEndOfFile()
+            guard !data.isEmpty,
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                respond(SetupAPICore.transportError(
+                    "stdin must carry exactly one JSON request object"), exitCode: 64)
+            }
+            switch verb {
+            case "probe": respond(await SetupAPICore.probe(object))
+            case "apply": respond(await SetupAPICore.apply(object))
+            default: respond(await SetupAPICore.service(object))
+            }
+        default:
+            respond(SetupAPICore.transportError(
+                "unknown verb '\(verb)' — expected status | probe | apply | service"), exitCode: 64)
+        }
+    }
+}
+
+// MARK: - Core (selftest-callable, no process I/O of its own)
+
+enum SetupAPICore {
+    static let schemaVersion = 1
+
+    static let argvRefusalMessage =
+        "unexpected extra arguments — requests (and any secrets in them) must arrive "
+        + "as JSON on stdin, never on argv (argv is world-readable via /proc)"
+
+    /// UserDefaults seam: the selftest points this at a throwaway suite so
+    /// web-search-backend and legacy-flag reads/writes never touch the
+    /// machine's real preferences (the FileDescriptionsStore lesson —
+    /// defer-based restore of real keys does not survive a watchdog exit).
+    nonisolated(unsafe) static var defaults: UserDefaults = .standard
+
+    /// gws-directory seam: EmailCredentialWipe deletes ~/.config/gws, which
+    /// is HOME-derived — the selftest's XDG redirect does NOT cover it, so
+    /// without this seam a selftest run would wipe the machine's REAL gws
+    /// tokens. Production leaves it nil (canonical directory).
+    nonisolated(unsafe) static var gwsConfigDirectoryOverride: URL?
+
+    struct APIError: Error {
+        let code: String
+        let message: String
+    }
+
+    // MARK: Response plumbing
+
+    private static func base(ok: Bool) -> [String: Any] {
+        ["schema": schemaVersion, "ok": ok]
+    }
+
+    static func errorResponse(code: String, message: String) -> [String: Any] {
+        var payload = base(ok: false)
+        payload["error"] = ["code": code, "message": message]
+        return payload
+    }
+
+    static func transportError(_ message: String) -> [String: Any] {
+        errorResponse(code: "transport", message: message)
+    }
+
+    private static func saveFailed(_ error: Error) -> APIError {
+        APIError(code: "save_failed",
+                 message: "could not write \(StoragePaths.configRootDisplay)/secrets.json: "
+                 + "\(error.localizedDescription) — fix directory permissions or free disk "
+                 + "space; nothing from this section was saved")
+    }
+
+    static func emit(_ payload: [String: Any], toFileDescriptor fd: Int32) {
+        let data = (try? JSONSerialization.data(
+            withJSONObject: payload, options: [.sortedKeys, .withoutEscapingSlashes]))
+            ?? Data("""
+                {"schema":\(schemaVersion),"ok":false,"error":{"code":"encode_failed",\
+                "message":"response was not JSON-encodable"}}
+                """.utf8)
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        try? handle.write(contentsOf: data)
+        try? handle.write(contentsOf: Data("\n".utf8))
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        guard let text = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        return text
+    }
+
+    // MARK: status
+
+    static var platformKey: String {
+        #if os(Linux)
+        #if arch(arm64)
+        return "linux-arm64"
+        #else
+        return "linux-x64"
+        #endif
+        #else
+        return "macos-arm64"
+        #endif
+    }
+
+    /// Non-destructive probe of the chat/daemon instance lock. There is a
+    /// microsecond window where holding the probe lock could make a daemon
+    /// starting at that exact instant fail its acquire — it exits and
+    /// systemd restarts it 5 s later, acceptable for a status read.
+    static func daemonRunning() -> Bool {
+        let url = StoragePaths.dataRoot.appendingPathComponent("instance.lock")
+        let fd = open(url.path, O_RDWR)
+        guard fd >= 0 else { return false }  // never created ⇒ no daemon ever ran
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            flock(fd, LOCK_UN)
+            return false
+        }
+        return true
+    }
+
+    static func status() async -> [String: Any] {
+        ProviderProfiles.ensureMigrated()
+        var payload = base(ok: true)
+        payload["version"] = adaCLIVersion
+        payload["platform"] = platformKey
+        payload["is_ubuntu_touch"] = AgentServiceSupport.isUbuntuTouch()
+        payload["wakelock_supported"] = AgentServiceSupport.wakeLockSupported()
+        payload["paths"] = ["config": StoragePaths.configRootDisplay,
+                            "data": StoragePaths.dataRootDisplay]
+        payload["daemon_running"] = daemonRunning()
+        // Where a running agent serves the companion-app chat protocol.
+        // Existence of the socket file ≠ liveness (a crashed process leaves
+        // it behind); the app must treat a failed connect as "not running".
+        payload["chat_socket"] = [
+            "path": AppChatSocketServer.socketURL.path,
+            "protocol": AppChatSocketServer.protocolVersion,
+        ] as [String: Any]
+
+        var setup: [String: Any] = ["complete": SetupWizard.setupComplete(legacyDefaults: defaults)]
+        if let step = KeychainHelper.load(key: SetupWizard.progressKey), !step.isEmpty {
+            setup["step_in_progress"] = step
+        }
+        payload["setup"] = setup
+
+        var profiles: [String: Any] = [:]
+        for profile in ProviderProfiles.Profile.allCases {
+            var entry: [String: Any] = ["configured": ProviderProfiles.isConfigured(profile)]
+            if let model = ProviderProfiles.configuredModel(profile) { entry["model"] = model }
+            if let endpoint = ProviderProfiles.configuredEndpoint(profile) { entry["endpoint"] = endpoint }
+            if let effort = ProviderProfiles.configuredEffort(profile) { entry["effort"] = effort }
+            if let masked = ProviderProfiles.maskedKey(profile) { entry["masked_key"] = masked }
+            if let textOnly = ProviderProfiles.textOnly(profile) { entry["text_only"] = textOnly }
+            profiles[profile.rawValue] = entry
+        }
+        var providers: [String: Any] = ["profiles": profiles]
+        if let active = ProviderProfiles.activeProfile() { providers["active"] = active.rawValue }
+        payload["providers"] = providers
+
+        // Catalog served here so no GUI ever hardcodes the model list.
+        payload["opencode_catalog"] = OpenCodeGo.choices.map {
+            ["id": $0.id, "label": $0.label, "text_only": $0.textOnly] as [String: Any]
+        }
+        payload["opencode_default_model"] = OpenCodeGo.defaultModel
+
+        func keyStatus(_ storageKey: String) -> [String: Any] {
+            guard let value = KeychainHelper.load(key: storageKey), !value.isEmpty else {
+                return ["set": false]
+            }
+            return ["set": true, "masked": WizardIO.masked(value)]
+        }
+        payload["keys"] = [
+            "openai": keyStatus(KeychainHelper.openAITranscriptionApiKeyKey),
+            "serper": keyStatus(KeychainHelper.serperApiKeyKey),
+            "jina": keyStatus(KeychainHelper.jinaApiKeyKey),
+            "agentmail": keyStatus(KeychainHelper.agentMailApiKeyKey),
+        ]
+
+        payload["identity"] = [
+            "user_name": KeychainHelper.load(key: KeychainHelper.userNameKey) ?? "",
+            "assistant_name": KeychainHelper.load(key: KeychainHelper.assistantNameKey) ?? "Ada",
+        ]
+
+        var email: [String: Any] = ["provider": EmailCalendarProvider.current.rawValue]
+        let inbox = EmailCalendarProvider.agentMailInboxAddress
+        if !inbox.isEmpty { email["agentmail_inbox"] = inbox }
+        email["agentmail_broker_installed"] = AgentMailService.agentMailBrokerInstalled()
+        let foreign = AgentMailService.foreignAgentMailInstalls()
+        if !foreign.isEmpty { email["agentmail_foreign_installs"] = foreign }
+        email["gws_installed"] = GoogleWorkspaceService.gwsInstalled()
+        email["gws_client_secret_present"] = FileManager.default.fileExists(
+            atPath: GoogleWorkspaceService.clientSecretFileURL.path)
+        payload["email_calendar"] = email
+
+        var telegram: [String: Any] = ["configured": TelegramConfig.isConfigured]
+        if let token = KeychainHelper.load(key: KeychainHelper.telegramBotTokenKey), !token.isEmpty {
+            telegram["masked_token"] = WizardIO.masked(token)
+        }
+        if let chatId = KeychainHelper.load(key: KeychainHelper.telegramChatIdKey), !chatId.isEmpty {
+            telegram["chat_id"] = chatId
+        }
+        payload["telegram"] = telegram
+
+        let storedBackend = defaults.string(forKey: WebSearchBackend.selectionKey)
+        let resolvedBackend = WebSearchBackend.resolve(
+            override: nil,
+            stored: storedBackend,
+            hasOpenAIKey: !WebSearchBackend.storedKey(for: .openai).isEmpty,
+            hasLegacyOpenRouterKey: !(KeychainHelper.load(key: KeychainHelper.openRouterApiKeyKey) ?? "").isEmpty)
+        payload["web_search"] = [
+            "active": resolvedBackend.rawValue,
+            "explicit": storedBackend.flatMap(WebSearchBackend.init(rawValue:)) != nil,
+        ] as [String: Any]
+        payload["text_only_mode"] = KeychainHelper.load(key: KeychainHelper.textOnlyModelEnabledKey) == "true"
+        payload["toolchain"] = [
+            "tools": UserdataToolchain.status().map {
+                ["name": $0.name, "package": $0.package,
+                 "present": $0.present, "source": $0.source,
+                 "optional": $0.optional] as [String: Any]
+            },
+            // capability marker for the app: this CLI accepts
+            // {toolchain: {upgrade: true}}
+            "upgrade_supported": true,
+        ] as [String: Any]
+
+        #if os(Linux)
+        payload["service"] = serviceStatusBlock()
+        #else
+        payload["service"] = ["supported": false]
+        #endif
+        return payload
+    }
+
+    // MARK: probe
+
+    static func probe(_ request: [String: Any]) async -> [String: Any] {
+        guard let kind = nonEmptyString(request["kind"]) else {
+            return errorResponse(code: "missing_field", message: "probe needs a 'kind'")
+        }
+        func require(_ field: String) throws -> String {
+            guard let value = nonEmptyString(request[field]) else {
+                throw APIError(code: "missing_field", message: "probe kind '\(kind)' needs '\(field)'")
+            }
+            return value
+        }
+        func verdict(_ failure: String?) -> [String: Any] {
+            var payload = base(ok: failure == nil)
+            if let failure { payload["reason"] = failure }
+            return payload
+        }
+        do {
+            switch kind {
+            case "opencode":
+                let key = try require("api_key")
+                return verdict(await Probes.chatCompletion(
+                    baseURL: OpenCodeGo.baseURL, apiKey: key,
+                    model: OpenCodeGo.defaultModel, fallbackModels: OpenCodeGo.probeFallbacks))
+            case "openrouter":
+                let key = try require("api_key")
+                let model = nonEmptyString(request["model"]) ?? "google/gemini-3-flash-preview"
+                return verdict(await Probes.chatCompletion(
+                    baseURL: "https://openrouter.ai/api/v1", apiKey: key, model: model))
+            case "custom":
+                let base = try require("base_url")
+                let model = try require("model")
+                let key = try require("api_key")
+                return verdict(await Probes.chatCompletion(baseURL: base, apiKey: key, model: model))
+            case "local":
+                let base = try require("base_url")
+                let model = try require("model")
+                return verdict(await Probes.chatCompletion(baseURL: base, apiKey: nil, model: model))
+            case "openai":
+                return verdict(await Probes.openAI(apiKey: try require("api_key")))
+            case "serper":
+                return verdict(await Probes.serper(apiKey: try require("api_key")))
+            case "jina":
+                return verdict(await Probes.jina(apiKey: try require("api_key")))
+            case "telegram":
+                let token = try require("token")
+                let failure = await Probes.telegram(token: token)
+                var payload = verdict(failure)
+                // Best-effort enrichment so the GUI can show which bot the
+                // token belongs to; the verdict itself is the shared probe's.
+                if failure == nil, let username = await telegramBotUsername(token: token) {
+                    payload["bot_username"] = username
+                }
+                return payload
+            case "agentmail":
+                let key = try require("api_key")
+                let (failure, inboxes) = await AgentMailService.probeKey(key)
+                var payload = verdict(failure)
+                if failure == nil { payload["inboxes"] = inboxes }
+                return payload
+            default:
+                return errorResponse(code: "unknown_kind", message: "unknown probe kind '\(kind)'")
+            }
+        } catch let error as APIError {
+            return errorResponse(code: error.code, message: error.message)
+        } catch {
+            return errorResponse(code: "internal", message: error.localizedDescription)
+        }
+    }
+
+    private static func telegramBotUsername(token: String) async -> String? {
+        guard let url = URL(string: "https://api.telegram.org/bot\(token)/getMe") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let result = json["result"] as? [String: Any] else { return nil }
+        return result["username"] as? String
+    }
+
+    // MARK: apply
+
+    /// Sections process in a fixed order; each commits independently (its own
+    /// atomic batch), so a failure aborts the REMAINING sections and reports
+    /// what already committed via "applied".
+    static func apply(_ request: [String: Any]) async -> [String: Any] {
+        ProviderProfiles.ensureMigrated()
+        var applied: [String] = []
+        var warnings: [String] = []
+        do {
+            if let section = request["provider"] as? [String: Any] {
+                try applyProvider(section)
+                applied.append("provider")
+            }
+            if let section = request["openai"] as? [String: Any] {
+                try applyOpenAI(section)
+                applied.append("openai")
+            }
+            if let section = request["serper"] as? [String: Any] {
+                try applySimpleKey(section, storageKey: KeychainHelper.serperApiKeyKey, sectionName: "serper")
+                applied.append("serper")
+            }
+            if let section = request["jina"] as? [String: Any] {
+                try applySimpleKey(section, storageKey: KeychainHelper.jinaApiKeyKey, sectionName: "jina")
+                applied.append("jina")
+            }
+            if let section = request["identity"] as? [String: Any] {
+                try applyIdentity(section)
+                applied.append("identity")
+            }
+            if let section = request["telegram"] as? [String: Any] {
+                try applyTelegram(section)
+                applied.append("telegram")
+            }
+            if let section = request["email_calendar"] as? [String: Any] {
+                try await applyEmailCalendar(section, warnings: &warnings)
+                applied.append("email_calendar")
+            }
+            if let backend = request["web_search_backend"] {
+                guard let raw = nonEmptyString(backend),
+                      let parsed = WebSearchBackend(rawValue: raw) else {
+                    throw APIError(code: "invalid_value",
+                                   message: "web_search_backend must be openrouter|openai|opencode")
+                }
+                defaults.set(parsed.rawValue, forKey: WebSearchBackend.selectionKey)
+                applied.append("web_search_backend")
+            }
+            if let section = request["toolchain"] as? [String: Any] {
+                let wantsInstall = section["install"] as? Bool == true
+                let wantsUpgrade = section["upgrade"] as? Bool == true
+                guard wantsInstall != wantsUpgrade else {
+                    throw APIError(code: "invalid_value",
+                                   message: "toolchain section supports {install: true, pandoc: bool, libreoffice: bool} OR {upgrade: true}")
+                }
+                // Long-running (apt on phone networks) — progress to stderr,
+                // stdout stays reserved for the single JSON response.
+                func stderrProgress(_ line: String) {
+                    FileHandle.standardError.write(Data(("toolchain: \(line)\n").utf8))
+                }
+                let report: UserdataToolchain.InstallReport
+                if wantsUpgrade {
+                    report = await Task.detached(priority: .userInitiated) {
+                        UserdataToolchain.upgradeSync(progress: stderrProgress)
+                    }.value
+                } else {
+                    let pandoc = section["pandoc"] as? Bool == true
+                    let libreoffice = section["libreoffice"] as? Bool == true
+                    report = await Task.detached(priority: .userInitiated) {
+                        UserdataToolchain.installSync(includePandoc: pandoc,
+                                                      includeLibreOffice: libreoffice,
+                                                      progress: stderrProgress)
+                    }.value
+                }
+                guard report.ok else {
+                    throw APIError(code: wantsUpgrade ? "toolchain_upgrade_failed"
+                                                      : "toolchain_install_failed",
+                                   message: report.failures.joined(separator: "; "))
+                }
+                if !report.wrappers.isEmpty {
+                    warnings.append((wantsUpgrade ? "toolchain rebuilt on userdata: "
+                                                  : "toolchain installed to userdata: ")
+                                    + report.wrappers.joined(separator: ", "))
+                }
+                if wantsUpgrade {
+                    // the outcome lives in the notes ("everything up to
+                    // date…" / "upgraded: …") — surface them to the app
+                    warnings.append(contentsOf: report.notes.filter {
+                        !$0.contains("cleaned up")
+                    })
+                }
+                applied.append("toolchain")
+            }
+            if request["mark_complete"] as? Bool == true {
+                do {
+                    try KeychainHelper.delete(key: SetupWizard.progressKey)
+                    try KeychainHelper.save(key: SetupWizard.completeKey, value: "true")
+                } catch { throw saveFailed(error) }
+                applied.append("mark_complete")
+            }
+            guard !applied.isEmpty else {
+                throw APIError(code: "empty_request",
+                               message: "no recognized sections — expected any of: provider, openai, "
+                               + "serper, jina, identity, telegram, email_calendar, "
+                               + "web_search_backend, toolchain, mark_complete")
+            }
+        } catch let error as APIError {
+            var payload = errorResponse(code: error.code, message: error.message)
+            payload["applied"] = applied  // sections committed before the failure
+            return payload
+        } catch {
+            var payload = errorResponse(code: "internal", message: error.localizedDescription)
+            payload["applied"] = applied
+            return payload
+        }
+        var payload = base(ok: true)
+        payload["applied"] = applied
+        if !warnings.isEmpty { payload["warnings"] = warnings }
+        let running = daemonRunning()
+        payload["daemon_running"] = running
+        payload["restart_needed"] = running
+        return payload
+    }
+
+    private static func applyProvider(_ section: [String: Any]) throws {
+        guard let raw = nonEmptyString(section["profile"]),
+              let profile = ProviderProfiles.Profile(rawValue: raw.lowercased()) else {
+            throw APIError(code: "invalid_value",
+                           message: "provider.profile must be opencode|openrouter|custom|local")
+        }
+        if section["remove"] as? Bool == true {
+            try removeProvider(profile)
+            return
+        }
+        guard let model = nonEmptyString(section["model"]) else {
+            throw APIError(code: "missing_field", message: "provider.model is required")
+        }
+
+        // Omitted api_key mirrors the wizard's "Enter keeps the saved key":
+        // reuse the stored profile key, which was validated when stored.
+        var apiKey = nonEmptyString(section["api_key"])
+        if apiKey == nil {
+            switch profile {
+            case .opencode: apiKey = nonEmptyString(KeychainHelper.load(key: ProviderProfiles.opencodeApiKeyKey))
+            case .openrouter: apiKey = nonEmptyString(KeychainHelper.load(key: KeychainHelper.openRouterApiKeyKey))
+            case .custom: apiKey = nonEmptyString(KeychainHelper.load(key: ProviderProfiles.customApiKeyKey))
+            case .local: break
+            }
+        }
+        if profile != .local, apiKey == nil {
+            throw APIError(code: "missing_field",
+                           message: "provider.api_key is required (no stored key to keep)")
+        }
+
+        var baseURL = nonEmptyString(section["base_url"])
+        switch profile {
+        case .custom:
+            if baseURL == nil {
+                baseURL = nonEmptyString(KeychainHelper.load(key: ProviderProfiles.customBaseURLKey))
+            }
+            guard baseURL != nil else {
+                throw APIError(code: "missing_field", message: "provider.base_url is required")
+            }
+        case .local:
+            if baseURL == nil {
+                baseURL = nonEmptyString(KeychainHelper.load(key: KeychainHelper.lmStudioBaseURLKey))
+            }
+            guard baseURL != nil else {
+                throw APIError(code: "missing_field", message: "provider.base_url is required")
+            }
+        case .opencode, .openrouter:
+            baseURL = nil  // fixed endpoints
+        }
+
+        // Vision state: explicit wins; the OpenCode catalog fills it for
+        // known models; anything else must say so — a silently-guessed
+        // wrong value would break image handling until noticed.
+        let textOnly: Bool
+        if let explicit = section["text_only"] as? Bool {
+            textOnly = explicit
+        } else if profile == .opencode,
+                  let entry = OpenCodeGo.choices.first(where: { $0.id == model }) {
+            textOnly = entry.textOnly
+        } else {
+            throw APIError(code: "missing_field",
+                           message: profile == .opencode
+                           ? "provider.text_only is required for a model outside the OpenCode catalog"
+                           : "provider.text_only is required (can the model see images?)")
+        }
+
+        let effort: String? = profile == .local ? nil : (nonEmptyString(section["effort"]) ?? "high")
+        do {
+            try ProviderProfiles.saveProfile(profile, apiKey: profile == .local ? nil : apiKey,
+                                             baseURL: baseURL, model: model,
+                                             effort: effort, textOnly: textOnly)
+        } catch { throw saveFailed(error) }
+
+        // Default mirrors the wizard's activateAfterConfiguring: the first
+        // configured provider becomes active automatically, and re-saving
+        // the ACTIVE profile re-activates so edits reach the runtime slots.
+        // A Settings edit of a non-active profile does not hijack the
+        // runtime unless it asks (activate: true).
+        let current = ProviderProfiles.activeProfile()
+        let activate = (section["activate"] as? Bool) ?? (current == nil || current == profile)
+        if activate {
+            do { try ProviderProfiles.activate(profile) } catch {
+                throw APIError(code: "activation_failed",
+                               message: ProviderProfiles.describeActivationError(error))
+            }
+        }
+    }
+
+    /// The companion app Settings screen's delete path:
+    /// forget a profile's stored configuration. The ACTIVE profile is
+    /// refused — Ada cannot run without a main agent, so the caller must
+    /// activate another profile first.
+    private static func removeProvider(_ profile: ProviderProfiles.Profile) throws {
+        guard ProviderProfiles.activeProfile() != profile else {
+            throw APIError(code: "profile_active",
+                           message: "\(profile.rawValue) is the active provider — activate "
+                           + "another profile before removing it")
+        }
+        var changes: [String: String?] = [:]
+        switch profile {
+        case .opencode:
+            changes[ProviderProfiles.opencodeApiKeyKey] = String?.none
+            changes[ProviderProfiles.opencodeModelKey] = String?.none
+            changes[ProviderProfiles.opencodeReasoningEffortKey] = String?.none
+            changes[ProviderProfiles.opencodeTextOnlyKey] = String?.none
+        case .openrouter:
+            changes[KeychainHelper.openRouterApiKeyKey] = String?.none
+            changes[KeychainHelper.openRouterModelKey] = String?.none
+            changes[KeychainHelper.openRouterReasoningEffortKey] = String?.none
+            changes[ProviderProfiles.openrouterTextOnlyKey] = String?.none
+        case .custom:
+            changes[ProviderProfiles.customBaseURLKey] = String?.none
+            changes[ProviderProfiles.customApiKeyKey] = String?.none
+            changes[ProviderProfiles.customModelKey] = String?.none
+            changes[ProviderProfiles.customReasoningEffortKey] = String?.none
+            changes[ProviderProfiles.customTextOnlyKey] = String?.none
+        case .local:
+            changes[KeychainHelper.lmStudioBaseURLKey] = String?.none
+            changes[KeychainHelper.lmStudioModelKey] = String?.none
+            changes[ProviderProfiles.localTextOnlyKey] = String?.none
+        }
+        do { try KeychainHelper.saveBatch(changes) } catch { throw saveFailed(error) }
+    }
+
+    /// Wizard step 2's exact fan-out, as one atomic batch: a single OpenAI
+    /// key powers web research, voice, image generation and OCR.
+    /// remove:true deletes the key from all three slots it fans out to; the
+    /// provider selections stay (harmless without a key — the web-search
+    /// resolver and voice/image paths degrade to their keyless behavior).
+    private static func applyOpenAI(_ section: [String: Any]) throws {
+        if section["remove"] as? Bool == true {
+            do {
+                try KeychainHelper.saveBatch([
+                    KeychainHelper.webSearchOpenAIApiKeyKey: String?.none,
+                    KeychainHelper.openAITranscriptionApiKeyKey: String?.none,
+                    KeychainHelper.openAIImageApiKeyKey: String?.none,
+                ])
+            } catch { throw saveFailed(error) }
+            return
+        }
+        guard let key = nonEmptyString(section["api_key"]) else {
+            throw APIError(code: "missing_field", message: "openai.api_key is required")
+        }
+        do {
+            try KeychainHelper.saveBatch([
+                KeychainHelper.webSearchOpenAIApiKeyKey: key,
+                KeychainHelper.voiceTranscriptionProviderKey: VoiceTranscriptionProvider.openAI.rawValue,
+                KeychainHelper.openAITranscriptionApiKeyKey: key,
+                KeychainHelper.imageGenerationProviderKey: ImageGenerationProvider.openAI.rawValue,
+                KeychainHelper.openAIImageApiKeyKey: key,
+                KeychainHelper.visionPreprocessorBackendKey: "openai",
+            ])
+        } catch { throw saveFailed(error) }
+        defaults.set(WebSearchBackend.openai.rawValue, forKey: WebSearchBackend.selectionKey)
+    }
+
+    private static func applySimpleKey(
+        _ section: [String: Any], storageKey: String, sectionName: String
+    ) throws {
+        if section["remove"] as? Bool == true {
+            do { try KeychainHelper.delete(key: storageKey) } catch { throw saveFailed(error) }
+            return
+        }
+        guard let key = nonEmptyString(section["api_key"]) else {
+            throw APIError(code: "missing_field", message: "\(sectionName).api_key is required")
+        }
+        do { try KeychainHelper.save(key: storageKey, value: key) } catch { throw saveFailed(error) }
+    }
+
+    private static func applyIdentity(_ section: [String: Any]) throws {
+        if section["remove"] as? Bool == true {
+            do { try KeychainHelper.delete(key: KeychainHelper.userNameKey) } catch {
+                throw saveFailed(error)
+            }
+            return
+        }
+        guard let name = nonEmptyString(section["user_name"]) else {
+            throw APIError(code: "missing_field", message: "identity.user_name is required")
+        }
+        do {
+            try KeychainHelper.saveBatch([
+                KeychainHelper.userNameKey: name,
+                KeychainHelper.assistantNameKey: "Ada",  // fixed, same as the wizard
+            ])
+        } catch { throw saveFailed(error) }
+    }
+
+    private static func applyTelegram(_ section: [String: Any]) throws {
+        if section["remove"] as? Bool == true {
+            do {
+                try KeychainHelper.saveBatch([
+                    KeychainHelper.telegramBotTokenKey: String?.none,
+                    KeychainHelper.telegramChatIdKey: String?.none,
+                ])
+            } catch { throw saveFailed(error) }
+            return
+        }
+        guard let token = nonEmptyString(section["token"]) else {
+            throw APIError(code: "missing_field", message: "telegram.token is required")
+        }
+        guard let chatId = nonEmptyString(section["chat_id"]) else {
+            throw APIError(code: "missing_field", message: "telegram.chat_id is required")
+        }
+        guard Int64(chatId) != nil else {
+            throw APIError(code: "invalid_chat_id",
+                           message: "chat_id must be numeric (letters mean it's a username — "
+                           + "use @userinfobot to get the numeric ID)")
+        }
+        do {
+            try KeychainHelper.saveBatch([
+                KeychainHelper.telegramBotTokenKey: token,
+                KeychainHelper.telegramChatIdKey: chatId,
+            ])
+        } catch { throw saveFailed(error) }
+    }
+
+    private static func applyEmailCalendar(
+        _ section: [String: Any], warnings: inout [String]
+    ) async throws {
+        guard let raw = nonEmptyString(section["provider"]),
+              let provider = EmailCalendarProvider(rawValue: raw) else {
+            throw APIError(code: "invalid_value",
+                           message: "email_calendar.provider must be none|agentmail|gws")
+        }
+        switch provider {
+        case .none:
+            // remove_credentials severs email ACCESS via the canonical
+            // /deleteuserdata wipe (EmailCredentialWipe): AgentMail key +
+            // inbox, gws OAuth client fields, AND the whole ~/.config/gws
+            // directory (client_secret.json + gws's OAuth token store —
+            // Codex, 2026-08-27: deleting only Ada's stored fields left the
+            // live Google tokens behind). Plain provider:none keeps
+            // credentials so re-enabling is one tap.
+            if section["remove_credentials"] as? Bool == true {
+                let failures = EmailCredentialWipe.execute(
+                    gwsConfigDir: gwsConfigDirectoryOverride
+                        ?? GoogleWorkspaceService.gwsConfigDirectory)
+                guard failures.isEmpty else {
+                    throw APIError(code: "remove_failed",
+                                   message: "credential removal incomplete: "
+                                   + failures.joined(separator: "; "))
+                }
+            } else {
+                do {
+                    try KeychainHelper.save(key: KeychainHelper.emailCalendarProviderKey,
+                                            value: EmailCalendarProvider.none.rawValue)
+                } catch { throw saveFailed(error) }
+            }
+
+        case .agentmail:
+            var key = nonEmptyString(section["api_key"])
+            if key == nil {
+                key = nonEmptyString(KeychainHelper.load(key: KeychainHelper.agentMailApiKeyKey))
+            }
+            guard let key else {
+                throw APIError(code: "missing_field",
+                               message: "email_calendar.api_key is required for agentmail "
+                               + "(no stored key to keep)")
+            }
+            // Same as the wizard: capture the inbox address from a live
+            // probe when reachable; an offline probe is nonfatal.
+            let (failure, inboxes) = await AgentMailService.probeKey(key)
+            var changes: [String: String?] = [
+                KeychainHelper.agentMailApiKeyKey: key,
+                KeychainHelper.emailCalendarProviderKey: EmailCalendarProvider.agentmail.rawValue,
+            ]
+            if let inbox = inboxes.first {
+                changes[KeychainHelper.agentMailInboxAddressKey] = inbox
+            }
+            do { try KeychainHelper.saveBatch(changes) } catch { throw saveFailed(error) }
+            if let failure {
+                warnings.append("agentmail: could not list inboxes (\(failure)) — continuing; "
+                                + "Ada retries at runtime")
+            }
+            if section["install_cli"] as? Bool == true, !AgentMailService.agentMailBrokerInstalled() {
+                if let installFailure = await AgentMailService.installAgentMailBinary() {
+                    warnings.append("agentmail CLI install failed: \(installFailure) — inbox "
+                                    + "alerts and context still work; retry the install later")
+                }
+            }
+
+        case .gws:
+            let providedID = nonEmptyString(section["gws_client_id"])
+            let providedSecret = nonEmptyString(section["gws_client_secret"])
+            if let providedID, let providedSecret {
+                do {
+                    try KeychainHelper.saveBatch([
+                        KeychainHelper.gwsOAuthClientIDKey: providedID,
+                        KeychainHelper.gwsOAuthClientSecretKey: providedSecret,
+                    ])
+                } catch { throw saveFailed(error) }
+            }
+            let secretFilePresent = FileManager.default.fileExists(
+                atPath: GoogleWorkspaceService.clientSecretFileURL.path)
+            let storedID = nonEmptyString(KeychainHelper.load(key: KeychainHelper.gwsOAuthClientIDKey))
+            if !secretFilePresent && storedID == nil {
+                throw APIError(code: "missing_field",
+                               message: "gws needs your own Google OAuth client — provide "
+                               + "gws_client_id and gws_client_secret")
+            }
+            if !secretFilePresent {
+                do { try GoogleWorkspaceService.installAdaClientSecretIfMissing() } catch {
+                    warnings.append("could not write ~/.config/gws/client_secret.json "
+                                    + "(\(error.localizedDescription)) — `gws auth login` will "
+                                    + "fail until it exists")
+                }
+            }
+            if section["install_cli"] as? Bool == true, !GoogleWorkspaceService.gwsInstalled() {
+                if let failure = await GoogleWorkspaceService.installGwsBinary() {
+                    warnings.append("gws install failed: \(failure)")
+                }
+            }
+            do {
+                try KeychainHelper.save(key: KeychainHelper.emailCalendarProviderKey,
+                                        value: EmailCalendarProvider.gws.rawValue)
+            } catch { throw saveFailed(error) }
+        }
+    }
+
+    // MARK: service
+
+    static func service(_ request: [String: Any]) async -> [String: Any] {
+        #if os(Linux)
+        let action = nonEmptyString(request["action"])
+        let wantScripts = request["keepawake_script"] as? Bool == true
+        var payload: [String: Any]
+        switch action {
+        case "install":
+            guard TelegramConfig.isConfigured else {
+                return errorResponse(code: "telegram_required",
+                                     message: "the service runs `ada daemon`, which needs the "
+                                     + "Telegram channel — apply the telegram section first")
+            }
+            // Non-interactive: a GUI has no terminal to lend sudo, so the
+            // linger root-fallback is skipped; the response carries the
+            // exact command for the caller to run under its own sudo.
+            let ok = AgentServiceSupport.installUserService(interactiveSudoFallback: false)
+            payload = ok ? base(ok: true)
+                : errorResponse(code: "install_failed",
+                                message: "service installation failed — see the stderr log")
+            if ok, AgentServiceSupport.systemdUserSessionAvailable(),
+               !AgentServiceSupport.lingerEnabled() {
+                payload["linger_command"] = "sudo loginctl enable-linger \(NSUserName())"
+            }
+        case "uninstall":
+            // Checked, best-effort, and RETRY-SAFE: none of the steps is
+            // gated on the unit FILE existing (Codex, 2026-08-27 round 2 —
+            // if a first attempt removed the file but disable/daemon-reload
+            // failed, a file-gated retry skipped the remaining cleanup and
+            // reported success while a stale unit stayed loaded). Every
+            // step always runs; "unit doesn't exist" answers count as the
+            // step's idempotent success, real failures are named.
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let unitPath = AgentServiceSupport.userUnitDirectory(home: home)
+                + "/" + AgentServiceSupport.userUnitName
+            // No unit file and no reachable systemd user bus: we cannot
+            // confirm whether a previously loaded service was stopped and
+            // unloaded (Codex round 3 — a retry in this state after a
+            // partial first attempt would otherwise claim success over a
+            // possibly still-loaded unit). Report unverified, not success;
+            // a genuinely never-installed container gets the same honest
+            // answer, and the message says why it is safe there.
+            if !FileManager.default.fileExists(atPath: unitPath),
+               !AgentServiceSupport.systemdUserSessionAvailable() {
+                payload = errorResponse(
+                    code: "unverified",
+                    message: "no unit file remains, but no systemd user bus is reachable "
+                    + "from here, so a previously loaded service (if any) could not be "
+                    + "verified stopped — re-run from a normal login session; if the "
+                    + "service was never installed there is nothing left to do")
+                payload["service"] = serviceStatusBlock()
+                if wantScripts { attachWakelockScripts(&payload) }
+                return payload
+            }
+            var stepFailures: [String] = []
+            let disable = AgentServiceSupport.run(
+                "systemctl", ["--user", "disable", "--now", AgentServiceSupport.userUnitName])
+            let disableUnknownUnit = disable.output.contains("does not exist")
+                || disable.output.contains("not-found")
+                || disable.output.contains("not loaded")
+            if disable.status != 0 && !disableUnknownUnit {
+                stepFailures.append("disable --now: \(disable.output.isEmpty ? "exit \(disable.status)" : disable.output)")
+            }
+            if FileManager.default.fileExists(atPath: unitPath) {
+                do { try FileManager.default.removeItem(atPath: unitPath) } catch {
+                    stepFailures.append("remove \(unitPath): \(error.localizedDescription)")
+                }
+            }
+            let reload = AgentServiceSupport.run("systemctl", ["--user", "daemon-reload"])
+            if reload.status != 0 {
+                stepFailures.append("daemon-reload: \(reload.output.isEmpty ? "exit \(reload.status)" : reload.output)")
+            }
+            payload = stepFailures.isEmpty ? base(ok: true)
+                : errorResponse(code: "uninstall_failed",
+                                message: stepFailures.joined(separator: "; "))
+            // wakelock is script-only (root) — see keepawake_script
+        case "restart":
+            let result = AgentServiceSupport.run(
+                "systemctl", ["--user", "restart", AgentServiceSupport.userUnitName])
+            guard result.status == 0 else {
+                return errorResponse(code: "restart_failed",
+                                     message: result.output.isEmpty
+                                     ? "systemctl --user restart failed" : result.output)
+            }
+            // `systemctl restart` returning 0 only means the start job was
+            // queued (Type=simple: "started" = exec'd) — a daemon that dies
+            // immediately still reported success here. Settle, then verify
+            // the unit is actually active; anything else is an honest
+            // failure, not a success with a broken daemon behind it.
+            Thread.sleep(forTimeInterval: 2.0)
+            let state = AgentServiceSupport.run(
+                "systemctl", ["--user", "is-active", AgentServiceSupport.userUnitName]).output
+            if !restartLeftUnitHealthy(isActiveOutput: state) {
+                var unhealthy = errorResponse(
+                    code: "restart_unhealthy",
+                    message: "the service restarted but is '\(state)' instead of 'active' — "
+                    + "the daemon likely crashed on startup; check "
+                    + "`journalctl --user -u \(AgentServiceSupport.userUnitName) -n 40`")
+                unhealthy["service"] = serviceStatusBlock()
+                if wantScripts { attachWakelockScripts(&unhealthy) }
+                return unhealthy
+            }
+            payload = base(ok: true)
+        case nil:
+            guard wantScripts else {
+                return errorResponse(code: "missing_field",
+                                     message: "service needs an 'action' (install|uninstall|restart) "
+                                     + "or keepawake_script:true")
+            }
+            payload = base(ok: true)
+        default:
+            return errorResponse(code: "invalid_value",
+                                 message: "unknown service action '\(action!)'")
+        }
+        payload["service"] = serviceStatusBlock()
+        if wantScripts { attachWakelockScripts(&payload) }
+        return payload
+        #else
+        _ = request
+        return errorResponse(code: "unsupported_platform",
+                             message: "`ada setup-api service` manages a systemd service — Linux "
+                             + "only; on macOS run `ada daemon` in a terminal")
+        #endif
+    }
+
+    /// Pure verdict for the post-restart health probe, selftest-covered on
+    /// every platform. Only a settled "active" counts: "activating" two
+    /// seconds after a restart means the first exec already died and
+    /// systemd is cycling (RestartSec=5), "failed"/"inactive" speak for
+    /// themselves.
+    static func restartLeftUnitHealthy(isActiveOutput: String) -> Bool {
+        isActiveOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+    }
+
+    #if os(Linux)
+    static func serviceStatusBlock() -> [String: Any] {
+        var block: [String: Any] = ["supported": true]
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let unitPath = AgentServiceSupport.userUnitDirectory(home: home)
+            + "/" + AgentServiceSupport.userUnitName
+        let installed = FileManager.default.fileExists(atPath: unitPath)
+        block["unit_installed"] = installed
+        let session = AgentServiceSupport.systemdUserSessionAvailable()
+        block["systemd_user_session"] = session
+        if installed && session {
+            block["enabled"] = AgentServiceSupport.run(
+                "systemctl", ["--user", "is-enabled", AgentServiceSupport.userUnitName]).output
+            block["active"] = AgentServiceSupport.run(
+                "systemctl", ["--user", "is-active", AgentServiceSupport.userUnitName]).output
+        }
+        if session {
+            let linger = AgentServiceSupport.lingerEnabled()
+            block["linger"] = linger
+            // Served on EVERY status so a GUI can offer "enable start at
+            // boot" at any time — not only in the moment right after
+            // install (an interrupted first attempt must be resumable).
+            if !linger {
+                block["linger_command"] = "sudo loginctl enable-linger \(NSUserName())"
+            }
+        }
+        if AgentServiceSupport.isUbuntuTouch() {
+            let wlInstalled = AgentServiceSupport.wakelockUnitInstalled()
+            block["wakelock_unit_installed"] = wlInstalled
+            if wlInstalled {
+                block["wakelock_active"] = AgentServiceSupport.run(
+                    "systemctl", ["is-active", AgentServiceSupport.wakelockUnitName]).output
+            }
+        }
+        return block
+    }
+    #endif
+
+    static func attachWakelockScripts(_ payload: inout [String: Any]) {
+        payload["wakelock_supported"] = AgentServiceSupport.wakeLockSupported()
+        payload["wakelock_unit_text"] = AgentServiceSupport.wakelockUnitText()
+        payload["wakelock_install_script"] = wakelockInstallScript()
+        payload["wakelock_uninstall_script"] = wakelockUninstallScript()
+    }
+
+    // MARK: wakelock scripts (root steps the caller runs under its own sudo)
+    //
+    // The command sequence mirrors AgentServiceSupport.installWakelockService()
+    // step for step and embeds the SAME unit text, so the two paths can never
+    // drift. Emitted as scripts because a GUI collects the passcode itself
+    // and runs `sudo -S sh <file>` — piping a password through ada into sudo
+    // would add a process hop for zero benefit.
+
+    // The read-only remount lives in an EXIT/signal trap installed right
+    // after the rw remount succeeds: with `set -e`, a failing middle step
+    // would otherwise exit the script with / left writable (the interactive
+    // installWakelockService() already restores unconditionally).
+
+    static func wakelockInstallScript() -> String {
+        """
+        #!/bin/sh
+        # Ada keep-awake unit installer (Ubuntu Touch). Run as root: sudo sh <this-file>
+        set -e
+        mount -o remount,rw /
+        trap 'mount -o remount,ro / || echo "note: / stays read-write until reboot (busy)"' EXIT INT TERM HUP
+        cat > \(AgentServiceSupport.wakelockUnitPath) <<'ADA_UNIT'
+        \(AgentServiceSupport.wakelockUnitText())ADA_UNIT
+        chmod 644 \(AgentServiceSupport.wakelockUnitPath)
+        systemctl daemon-reload
+        systemctl enable --now \(AgentServiceSupport.wakelockUnitName)
+        """
+    }
+
+    static func wakelockUninstallScript() -> String {
+        """
+        #!/bin/sh
+        # Ada keep-awake unit removal (Ubuntu Touch). Run as root: sudo sh <this-file>
+        set -e
+        mount -o remount,rw /
+        trap 'mount -o remount,ro / || echo "note: / stays read-write until reboot (busy)"' EXIT INT TERM HUP
+        systemctl disable --now \(AgentServiceSupport.wakelockUnitName) || true
+        rm -f \(AgentServiceSupport.wakelockUnitPath)
+        systemctl daemon-reload
+        """
+    }
+}

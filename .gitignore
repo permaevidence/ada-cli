@@ -1,0 +1,19 @@
+.build/
+.build-linux/
+.DS_Store
+__pycache__/
+
+# Never commit credentials, signing material, or exported user data.
+.env
+.env.*
+*.env
+secrets.json
+credentials.json
+auth.json
+*.key
+*.pem
+*.p12
+*_ed25519*
+*.minisig
+*.mind
+dist/

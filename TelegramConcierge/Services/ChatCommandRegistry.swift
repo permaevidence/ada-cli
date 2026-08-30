@@ -1,0 +1,101 @@
+import Foundation
+
+/// Single source of truth for the PUBLIC chat command catalog.
+///
+/// Three surfaces derive from this one table so they can never drift again:
+/// the Telegram "/" menu (`menuCommands`), the `/commands` listing
+/// (`commandsListText`), and the shared block of the terminal `/help`
+/// screen (`terminalHelpLines`).
+///
+/// Deliberately ABSENT from this table: the power/owner commands — /spend,
+/// /more1|5|10, /hide, /show, /transcribe_local, /transcribe_openai — and
+/// the /pulisci and /riavvia aliases. They keep working (this table controls
+/// visibility, not dispatch) but stay out of `/commands` on purpose: the
+/// listing is for regular users, and those were never meant for the menu.
+struct ChatCommand {
+    let name: String        // without the leading slash
+    let description: String // shown in the Telegram menu and /commands
+    let usage: String?      // argument hint for the terminal /help column
+    let inMenu: Bool        // include in the trimmed Telegram "/" menu
+    let category: String
+}
+
+enum ChatCommandRegistry {
+    /// Grouping order for the /commands listing.
+    static let categories = ["Control", "Models", "System", "Account"]
+
+    static let commands: [ChatCommand] = [
+        ChatCommand(name: "stop", description: "Stop the current work immediately",
+                    usage: nil, inMenu: true, category: "Control"),
+        ChatCommand(name: "status", description: "Show what Ada is doing right now",
+                    usage: nil, inMenu: true, category: "Control"),
+        ChatCommand(name: "prune", description: "Free up Ada's working memory",
+                    usage: nil, inMenu: true, category: "Control"),
+        ChatCommand(name: "continue", description: "Show the rest of a long reply",
+                    usage: nil, inMenu: false, category: "Control"),
+        ChatCommand(name: "model", description: "Show or switch the main model",
+                    usage: "[id]", inMenu: false, category: "Models"),
+        ChatCommand(name: "provider", description: "List or hop between configured LLM providers",
+                    usage: "[name]", inMenu: false, category: "Models"),
+        ChatCommand(name: "effort", description: "Set the reasoning effort",
+                    usage: "[level]", inMenu: false, category: "Models"),
+        ChatCommand(name: "websearch", description: "Show or switch the web research backend",
+                    usage: "[name]", inMenu: false, category: "Models"),
+        ChatCommand(name: "subagentmodels", description: "Show or set the cheap subagent model lanes",
+                    usage: nil, inMenu: false, category: "Models"),
+        ChatCommand(name: "subagents", description: "Turn the Agent delegation tools on or off",
+                    usage: "[on|off]", inMenu: false, category: "Models"),
+        ChatCommand(name: "upgrade", description: "Update Ada to the latest release",
+                    usage: nil, inMenu: true, category: "System"),
+        ChatCommand(name: "restart", description: "Restart Ada (reloads mcp.json and skills)",
+                    usage: nil, inMenu: false, category: "System"),
+        ChatCommand(name: "commands", description: "List standard Ada commands",
+                    usage: nil, inMenu: true, category: "System"),
+        ChatCommand(name: "setname", description: "Set or change your name (asks for confirmation)",
+                    usage: "[name]", inMenu: false, category: "Account"),
+        ChatCommand(name: "deleteuserdata", description: "Erase all memory and user data (asks for confirmation)",
+                    usage: nil, inMenu: false, category: "Account"),
+        ChatCommand(name: "exportmind", description: "Save a memory backup (.mind) to this computer (add 'lite' to skip files)",
+                    usage: "[lite]", inMenu: false, category: "Account"),
+        ChatCommand(name: "importmind", description: "Restore a memory backup (asks for confirmation)",
+                    usage: "[path]", inMenu: false, category: "Account"),
+        ChatCommand(name: "resumewatcher", description: "Review and re-arm watchers quarantined by a memory import",
+                    usage: "[id]", inMenu: false, category: "Account"),
+        ChatCommand(name: "switchbot", description: "Move Ada to a different Telegram bot (guided, asks for confirmation)",
+                    usage: "[token]", inMenu: false, category: "Account"),
+    ]
+
+    /// The trimmed Telegram "/" menu: only the everyday commands a regular
+    /// user needs, plus /commands as the discoverable index to the rest.
+    static var menuCommands: [(command: String, description: String)] {
+        commands.filter(\.inMenu).map { ($0.name, $0.description) }
+    }
+
+    /// Body of the /commands reply: every public command, grouped.
+    static func commandsListText() -> String {
+        var lines = ["Ada commands:"]
+        for category in categories {
+            let members = commands.filter { $0.category == category }
+            guard !members.isEmpty else { continue }
+            lines.append("")
+            lines.append("\(category):")
+            for cmd in members {
+                lines.append("/\(cmd.name) — \(cmd.description)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Shared block of the terminal /help screen; TerminalSession appends
+    /// its terminal-only commands (/attach, /quit) and the power commands.
+    static func terminalHelpLines() -> [String] {
+        commands.map { cmd in
+            var invocation = "/" + cmd.name
+            if let usage = cmd.usage { invocation += " " + usage }
+            let padded = invocation.count < 18
+                ? invocation + String(repeating: " ", count: 18 - invocation.count)
+                : invocation + "  "
+            return "  " + padded + cmd.description
+        }
+    }
+}

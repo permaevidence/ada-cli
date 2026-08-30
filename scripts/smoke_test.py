@@ -1,0 +1,1881 @@
+#!/usr/bin/env python3
+"""Ada CLI smoke test — runs on macOS and Linux (CI runs both).
+
+Usage: python3 scripts/smoke_test.py [path/to/ada]
+
+Checks, in order:
+  1. `ada --version` prints the version string
+  2. `ada doctor` on a pristine home: exits 1, prints all report sections
+  3. `ada media-selftest`: the cross-platform PDF/image pipeline is healthy
+     (poppler/ImageMagick on Linux, PDFKit/ImageIO on macOS)
+  4. `ada bundle-check`: passes next to the build bundle; a binary copied
+     WITHOUT the resource bundle fails with a readable error (not SIGTRAP)
+  5. A real chat session against a local mock OpenAI-compatible server:
+     chat turn, single-instance lock, /hide privacy mode, quoted /attach
+  6. Setup wizard interruption: an interrupted first run (the Full Disk
+     Access terminal-relaunch shape) saves its progress, offers to resume
+     at the interrupted step, and never forces re-entering saved values
+  7. /upgrade from chat against a mock release CDN: download, checksum
+     verify, in-place swap, exec self-restart (instance lock released
+     across exec), post-restart confirmation, downgrade refusal,
+     corrupt-build rejection, and a mid-swap fault injection proving
+     rollback restores both components
+  8. Telegram poller against a mock Bot API: same-batch and cross-batch
+     duplicate updates dropped, offset persisted across restart (no
+     re-delivery, polling resumes at the right offset), and the
+     documented week-of-silence id reset adopted instead of dropped
+  9. `ada __setsid-exec` trampoline (every bash tool child runs through
+     it): a child given a real controlling pty ends up with NO
+     controlling terminal — so sudo-style /dev/tty password prompts fail
+     fast instead of writing `Password:` into Ada's own terminal and
+     blocking the turn — and exit codes pass through unchanged
+ 10. TerminalHandoff (the trampoline's inverse, for wizard/upgrade
+     children that MUST prompt on the terminal — sudo, apt): a
+     Foundation-spawned child lands in a background process group, so
+     its tty read would SIGTTIN-freeze without the foreground handoff
+"""
+
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ADA = sys.argv[1] if len(sys.argv) > 1 else ".build/debug/ada"
+# Repo root for selftests that scan the source tree (midturn invariant scan).
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MOCK_REPLY = "Hello from the mock model! Smoke test says hi."
+
+passed = 0
+failed = 0
+
+
+def check(label, ok, detail=""):
+    global passed, failed
+    print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f" — {detail}" if detail and not ok else ""))
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+
+
+def isolated_env(home):
+    env = dict(os.environ)
+    env["HOME"] = home
+    env["XDG_CONFIG_HOME"] = os.path.join(home, ".config")
+    env["XDG_DATA_HOME"] = os.path.join(home, ".local", "share")
+    return env
+
+
+class MockOpenAIHandler(BaseHTTPRequestHandler):
+    # HTTP/1.1 + Content-Length: FoundationNetworking on Linux mishandles
+    # HTTP/1.0 close-per-request at high request rates (hangs + duplicate
+    # sends); proper keep-alive removes the ambiguity.
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        _ = self.rfile.read(length)
+        body = json.dumps({
+            "id": "gen-smoke-1",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": MOCK_REPLY},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 22},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def main():
+    print(f"Ada binary: {ADA}")
+
+    # 1. --version
+    result = subprocess.run([ADA, "--version"], capture_output=True, text=True, timeout=60)
+    check("--version", result.returncode == 0 and result.stdout.strip() != "",
+          f"rc={result.returncode} out={result.stdout!r}")
+
+    # 2. doctor on a pristine home
+    with tempfile.TemporaryDirectory() as home:
+        env = isolated_env(home)
+        result = subprocess.run([ADA, "doctor"], capture_output=True, text=True,
+                                timeout=180, env=env)
+        sections_ok = all(s in result.stdout for s in ["Configuration", "Permissions", "Toolchain"])
+        check("doctor: prints all sections", sections_ok, result.stdout[-500:])
+        check("doctor: unconfigured exits 1", result.returncode == 1,
+              f"rc={result.returncode}")
+
+    # 3. media pipeline
+    result = subprocess.run([ADA, "media-selftest"], capture_output=True, text=True, timeout=300)
+    check("media-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-800:])
+
+    # 3b. streaming bash output pipeline: pipe back-pressure, orphan writers,
+    # split UTF-8/secrets, spill integrity, timeouts. The 300s ceiling is
+    # generous — the suite itself proves the deadlock fix by finishing in
+    # seconds where the old implementation burned a 120s timeout per big test.
+    try:
+        result = subprocess.run([ADA, "__bash-pipeline-selftest"], capture_output=True, text=True, timeout=300)
+        check("bash-pipeline-selftest", result.returncode == 0,
+              (result.stdout + result.stderr)[-1500:])
+    except subprocess.TimeoutExpired as e:
+        # The selftest line-buffers and has its own 240s watchdog, so the
+        # partial output pinpoints the hang. Never let this kill the suite.
+        partial = ((e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")) + \
+                  ((e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
+        check("bash-pipeline-selftest", False,
+              "TIMEOUT after 300s; partial output:\n" + partial[-1500:])
+
+    # 3b2. bash payload goldens (BASH_V2_PLAN Phase 0): the exact JSON
+    # contract of every bash/bash_manage response — key sets, sorted order,
+    # static values — frozen before the managed-jobs lifecycle refactor.
+    # Any drift here is a compatibility break.
+    try:
+        result = subprocess.run([ADA, "__bash-golden-selftest"], capture_output=True, text=True, timeout=240)
+        check("bash-golden-selftest", result.returncode == 0,
+              (result.stdout + result.stderr)[-1500:])
+    except subprocess.TimeoutExpired as e:
+        partial = ((e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")) + \
+                  ((e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
+        check("bash-golden-selftest", False,
+              "TIMEOUT after 240s; partial output:\n" + partial[-1500:])
+
+    # 3b3. managed bash jobs v2 machinery: completion-acknowledgement
+    # receipts (settle → receipt → durable-save-gated withdrawal, stale-UUID
+    # safety, idempotence) and receipt exclusion from persisted/encoded JSON.
+    result = subprocess.run([ADA, "__bash-jobs-selftest"], capture_output=True, text=True, timeout=240)
+    check("bash-jobs-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c. external-trigger watcher pipeline: spool intake, leading-edge fire,
+    # cooldown queueing, trailing batch, orphan/delete cleanup, batch capping.
+    # Self-isolates into a temp XDG_DATA_HOME and shortens the cooldown to 2s.
+    result = subprocess.run([ADA, "__trigger-selftest"], capture_output=True, text=True, timeout=120)
+    check("trigger-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c1a. secret store cross-process durability (field incident
+    # 2026-08-29): a warm-cached writer must not revert another process's
+    # keys, keys saved externally must be visible without restart, and the
+    # sidecar flock must genuinely serialize writers. Isolated XDG roots.
+    result = subprocess.run([ADA, "__secretstore-selftest"], capture_output=True, text=True, timeout=120)
+    check("secretstore-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c1b. userdata toolchain installer: fake-apt/dpkg-backed prefix
+    # install, alternatives-aware wrappers, probe enforcement, cleanup.
+    result = subprocess.run([ADA, "__toolchain-selftest"], capture_output=True, text=True, timeout=180)
+    check("toolchain-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c2. watcher triage machinery (WATCHER_TRIAGE_PLAN phase 0-4
+    # deterministic layers): durable fire-outbox produce/verdict/ack and
+    # crash-window dedup against the spool, per-batch verdict parsing,
+    # funnel-counter telemetry + runaway backstop thresholds, triage
+    # instruction hash verification, session pinning vs LRU, per-session
+    # FIFO run lock. Self-isolates into a temp XDG_DATA_HOME.
+    result = subprocess.run([ADA, "__watcher-selftest"], capture_output=True, text=True, timeout=180)
+    check("watcher-triage-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c3. cheap subagent model lanes (/subagentmodels): per-provider
+    # storage, hint resolution, dynamic Agent-tool enum, the loud unset-lane
+    # gate, watcher triage_model round-trips, FireRecord lane snapshots and
+    # the legacy cheapFast frontmatter mapping. Self-isolates into temp XDG
+    # roots.
+    result = subprocess.run([ADA, "__lane-selftest"], capture_output=True, text=True, timeout=120)
+    check("lane-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c4. main-agent provider profiles (/provider): legacy-install
+    # migration into per-provider profiles, activation slot copies,
+    # per-profile vision restore, /model + /effort mirrors, the loud
+    # unconfigured-hop guard and masked-key listings. Self-isolates into
+    # temp XDG roots.
+    result = subprocess.run([ADA, "__provider-selftest"], capture_output=True, text=True, timeout=120)
+    check("provider-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c5. Filesystem tool JSON fidelity: tool results show file content with
+    # plain slashes (no Foundation \/ escaping the model would copy into
+    # old_string), the escape-mismatch hint covers \/, and the read-before-edit
+    # error explains the cross-restart ledger reset. Temp-dir isolated.
+    result = subprocess.run([ADA, "__fstools-selftest"], capture_output=True, text=True, timeout=120)
+    check("fstools-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c5-bis. Typed mid-turn annotation hardening (MIDTURN_NONCE_PLAN v2):
+    # nonce/validator/neutralizer/renderer goldens, provider wire text,
+    # persistence round-trips, adversarial fixtures, fail-closed paths, and
+    # the repository no-contiguous-prefix invariant (runs from the repo cwd).
+    result = subprocess.run([os.path.abspath(ADA), "__midturn-selftest"], capture_output=True,
+                            text=True, timeout=120, cwd=REPO_ROOT)
+    check("midturn-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c6. /deleteuserdata confirmation barrier: bare command teaches, only
+    # the stored name (or CONFIRM when none) wipes, everything else refuses.
+    # Isolated config root — never touches a real secrets.json.
+    result = subprocess.run([ADA, "__deleteuserdata-selftest"], capture_output=True, text=True, timeout=120)
+    check("deleteuserdata-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c6-bis. /exportmind–/importmind arc: pre-import disclosure text,
+    # staged read-only validation (junk rejects with all current work
+    # intact), quiescence barrier over all three producer classes, the
+    # wipe's triage abort, pre-import output discard, and a full
+    # export → mutate → apply round trip. XDG-isolated.
+    result = subprocess.run([ADA, "__mind-selftest"], capture_output=True, text=True, timeout=180)
+    check("mind-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c7. Chat command catalog: the Telegram menu stays trimmed to the five
+    # everyday commands, /commands lists every public command and none of the
+    # power/owner commands, terminal /help derives from the same registry.
+    result = subprocess.run([ADA, "__command-menu-selftest"], capture_output=True, text=True, timeout=60)
+    check("command-menu-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c8. /switchbot flow: decision matrix (only confirm-after-discovery
+    # cuts over), token-shape gate, one-time code format, tolerant
+    # getUpdates parsing, private-human-only code discovery, and the
+    # behind-/commands visibility contract. Pure, no storage or network.
+    result = subprocess.run([ADA, "__botswitch-selftest"], capture_output=True, text=True, timeout=60)
+    check("botswitch-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c9. Email/calendar providers: resolution (explicit choice wins, unset
+    # falls back to legacy gws-if-installed inference), the manage_calendar
+    # tool gate (agentmail only), provider-aware prompt strings (guidance
+    # bullet + new-mail envelope hint never name an absent CLI), AgentMail
+    # wire parsing/formatting, and the local calendar store roundtrip with
+    # short-id resolution. XDG-isolated; provider reads use test seams.
+    result = subprocess.run([ADA, "__emailcal-selftest"], capture_output=True, text=True, timeout=120)
+    check("emailcal-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c-bis. Web agent plumbing: tool-calling request/response encoding for
+    # all three backends, backend resolution (stored choice > OpenAI-key
+    # inference > legacy OpenRouter > opencode, plus the live-test process
+    # override), Responses API replay fidelity, cap enforcement, cross-round
+    # dedup, and strict-schema validity. Pure in-memory.
+    result = subprocess.run([ADA, "__web-agent-selftest"], capture_output=True, text=True, timeout=120)
+    check("web-agent-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3d. `ada trigger` CLI surface: unknown watcher fails at the caller;
+    # a valid external watcher gets a spooled event file.
+    with tempfile.TemporaryDirectory() as home:
+        env = isolated_env(home)
+        result = subprocess.run([ADA, "trigger", "11111111-2222-3333-4444-555555555555", "x"],
+                                capture_output=True, text=True, timeout=60, env=env)
+        unknown_ok = result.returncode == 1 and "no watcher" in result.stdout
+        data_dir = os.path.join(env["XDG_DATA_HOME"], "ada")
+        os.makedirs(data_dir, exist_ok=True)
+        wid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        with open(os.path.join(data_dir, "reminders.json"), "w") as f:
+            f.write('[{"id":"%s","triggerDate":"4001-01-01T00:00:00Z","prompt":"t",'
+                    '"createdAt":"2026-01-01T00:00:00Z","triggered":false,"externalTrigger":true}]' % wid)
+        result = subprocess.run([ADA, "trigger", wid, "front", "door"],
+                                capture_output=True, text=True, timeout=60, env=env)
+        spool = os.path.join(data_dir, "trigger-events")
+        event_files = [n for n in os.listdir(spool)] if os.path.isdir(spool) else []
+        event_files = [n for n in event_files if n.endswith(".json")]  # ignore .spool.lock
+        spooled = result.returncode == 0 and len(event_files) == 1
+        payload_ok = False
+        if spooled:
+            with open(os.path.join(spool, event_files[0])) as f:
+                payload_ok = '"front door"' in f.read()
+        check("trigger CLI: unknown watcher refused, valid event spooled",
+              unknown_ok and spooled and payload_ok,
+              f"unknown_ok={unknown_ok} spooled={spooled} payload_ok={payload_ok} out={result.stdout!r}")
+
+    # 3e. Service unit generation + Ubuntu Touch detection (pure checks,
+    # both platforms), and the `ada service` platform gate: real systemd
+    # management on Linux, a readable refusal on macOS. On Linux the status
+    # subcommand must stay exit-0 with no unit installed AND with no
+    # reachable systemd user bus (the CI container case).
+    result = subprocess.run([ADA, "__service-selftest"], capture_output=True, text=True, timeout=120)
+    check("service-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+    with tempfile.TemporaryDirectory() as home:
+        env = isolated_env(home)
+        result = subprocess.run([ADA, "service", "status"],
+                                capture_output=True, text=True, timeout=60, env=env)
+        if sys.platform == "darwin":
+            check("service status: macOS refuses readably",
+                  result.returncode == 1 and "Linux only" in result.stdout,
+                  f"rc={result.returncode} out={result.stdout!r}")
+        else:
+            check("service status: not-installed is informational (exit 0)",
+                  result.returncode == 0 and "not installed" in result.stdout,
+                  f"rc={result.returncode} out={result.stdout!r}")
+            # install must refuse without Telegram configured (daemon needs it)
+            result = subprocess.run([ADA, "service", "install"],
+                                    capture_output=True, text=True, timeout=60, env=env)
+            check("service install: refuses without Telegram",
+                  result.returncode == 1 and "Telegram" in result.stdout,
+                  f"rc={result.returncode} out={result.stdout!r}")
+
+    # 3f. setup-api: the machine-readable setup surface for GUI frontends.
+    # Selftest covers the contract; the end-to-end
+    # checks here prove the real binary keeps stdout pure JSON, applies an
+    # offline provider config, reads it back, and fails transport errors
+    # with exit 64.
+    result = subprocess.run([ADA, "__setup-api-selftest"], capture_output=True, text=True, timeout=180)
+    check("setup-api-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3g. companion-app chat socket: the selftest
+    # covers rendering rules, the live protocol, privacy withhold/replay,
+    # and socket hygiene; poller phase 10 later proves the same wire on a
+    # fully configured daemon end-to-end.
+    result = subprocess.run([ADA, "__chat-socket-selftest"],
+                            capture_output=True, text=True, timeout=300)
+    check("chat-socket-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+    with tempfile.TemporaryDirectory() as home:
+        env = isolated_env(home)
+        env["ADA_IGNORE_LEGACY_SETUP_FLAG"] = "1"
+        result = subprocess.run([ADA, "setup-api", "status"], capture_output=True,
+                                text=True, timeout=60, env=env)
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            payload = None
+        check("setup-api status: pure JSON on stdout, virgin install",
+              result.returncode == 0 and payload is not None
+              and payload.get("schema") == 1 and payload.get("ok") is True
+              and payload.get("setup", {}).get("complete") is False,
+              f"rc={result.returncode} out={result.stdout[:300]!r}")
+        req = json.dumps({"provider": {"profile": "local", "base_url": "http://localhost:9/v1",
+                                       "model": "smoke-model", "text_only": True}})
+        result = subprocess.run([ADA, "setup-api", "apply"], input=req, capture_output=True,
+                                text=True, timeout=60, env=env)
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            payload = {}
+        check("setup-api apply: offline local-provider config accepted",
+              result.returncode == 0 and payload.get("ok") is True
+              and payload.get("applied") == ["provider"],
+              f"rc={result.returncode} out={result.stdout[:300]!r}")
+        result = subprocess.run([ADA, "setup-api", "status"], capture_output=True,
+                                text=True, timeout=60, env=env)
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            payload = {}
+        local = payload.get("providers", {}).get("profiles", {}).get("local", {})
+        check("setup-api status: reflects the applied provider",
+              payload.get("providers", {}).get("active") == "local"
+              and local.get("configured") is True and local.get("model") == "smoke-model",
+              f"out={result.stdout[:300]!r}")
+        result = subprocess.run([ADA, "setup-api", "apply"], input="not json",
+                                capture_output=True, text=True, timeout=60, env=env)
+        check("setup-api: malformed stdin exits 64 with a JSON error",
+              result.returncode == 64 and '"transport"' in result.stdout,
+              f"rc={result.returncode} out={result.stdout[:200]!r}")
+        result = subprocess.run([ADA, "setup-api", "status", "sk-oops-on-argv"],
+                                capture_output=True, text=True, timeout=60, env=env)
+        check("setup-api: argv payload refused (secrets must use stdin)",
+              result.returncode == 64 and "stdin" in result.stdout,
+              f"rc={result.returncode} out={result.stdout[:200]!r}")
+
+    # 4. bundle-check: healthy next to the build bundle, readable failure without it
+    result = subprocess.run([ADA, "bundle-check"], capture_output=True, text=True, timeout=60)
+    check("bundle-check: passes next to build bundle", result.returncode == 0,
+          result.stdout + result.stderr)
+    with tempfile.TemporaryDirectory() as bindir:
+        shutil.copy2(ADA, os.path.join(bindir, "ada"))
+        result = subprocess.run([os.path.join(bindir, "ada"), "bundle-check"],
+                                capture_output=True, text=True, timeout=60, cwd="/")
+        check("bundle-check: missing bundle fails readably",
+              result.returncode == 1 and "resource bundle missing" in result.stdout,
+              f"rc={result.returncode} out={result.stdout!r}")
+
+    # 5. mock chat session
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    home = tempfile.mkdtemp(prefix="ada-smoke-")
+    try:
+        env = isolated_env(home)
+        config_dir = os.path.join(home, ".config", "ada")
+        os.makedirs(config_dir, exist_ok=True)
+        secrets = {
+            "llm_provider": "openai_compatible",
+            "openai_compatible_base_url": f"http://127.0.0.1:{port}/v1",
+            "openai_compatible_model": "mock-model",
+            "openai_compatible_api_key": "smoke-test-key",
+            "openai_compatible_reasoning_effort": "high",
+            "assistant_name": "Ada",
+            "user_name": "Smoke",
+        }
+        with open(os.path.join(config_dir, "secrets.json"), "w") as f:
+            json.dump(secrets, f)
+        os.chmod(os.path.join(config_dir, "secrets.json"), 0o600)
+
+        # Raw-byte reader: the REPL prompt ("› ") is printed WITHOUT a
+        # trailing newline, so a line-based reader never sees it and the
+        # driver can only sequence on fixed timeouts — which flakes on slow
+        # or loaded machines. Reading raw chunks lets every step wait for
+        # the prompt to reappear (true idle) before sending the next command.
+        proc = subprocess.Popen(
+            [ADA], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, env=env,
+        )
+        buf = bytearray()
+        lock = threading.Lock()
+
+        def reader():
+            while True:
+                chunk = proc.stdout.read1(4096)
+                if not chunk:
+                    break
+                with lock:
+                    buf.extend(chunk)
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        def output_text():
+            with lock:
+                return buf.decode("utf-8", errors="replace")
+
+        def output_count(needle):
+            return output_text().count(needle)
+
+        def output_reaches(needle, count, timeout_s):
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                if output_count(needle) >= count:
+                    return True
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+            return output_count(needle) >= count
+
+        def output_contains(needle, timeout_s):
+            return output_reaches(needle, 1, timeout_s)
+
+        PROMPT = "› "
+
+        def send(cmd, idle_timeout_s=120):
+            """Write one command and wait for the REPL to return to the
+            prompt (idle) — the sequencing hardening from Codex's review."""
+            before = output_count(PROMPT)
+            proc.stdin.write((cmd + "\n").encode())
+            proc.stdin.flush()
+            output_reaches(PROMPT, before + 1, idle_timeout_s)
+
+        try:
+            output_contains(PROMPT, 60)  # wait for the welcome prompt
+            send("Say hello")
+            got_reply = output_contains(MOCK_REPLY, 120)
+            check("chat: mock reply rendered", got_reply,
+                  output_text()[-1200:])
+
+            # Single-instance lock: a second process on the same state dir
+            # must refuse to start while the first is alive.
+            second = subprocess.run([ADA], capture_output=True, text=True,
+                                    timeout=60, env=env, stdin=subprocess.DEVNULL)
+            check("lock: second instance refused",
+                  second.returncode == 1 and "another Ada instance" in second.stdout,
+                  f"rc={second.returncode} out={second.stdout!r}")
+
+            # /hide: replies must not render while privacy mode is on…
+            send("/hide", idle_timeout_s=30)
+            output_contains("Privacy mode", 30)
+            send("Say hello again")
+            hid = output_contains("message hidden (privacy mode", 120)
+            leaked = output_count(MOCK_REPLY) > 1
+            check("hide: reply suppressed while private", hid and not leaked,
+                  output_text()[-1200:])
+            # …and /show replays what was hidden.
+            send("/show", idle_timeout_s=30)
+            revealed = output_contains("revealing ", 60) \
+                and output_reaches(MOCK_REPLY, 2, 60)
+            check("show: hidden reply revealed", revealed,
+                  output_text()[-1200:])
+
+            # /attach with a quoted path containing spaces must find the file.
+            spaced = os.path.join(home, "attach me.txt")
+            with open(spaced, "w") as f:
+                f.write("attachment content\n")
+            send(f'/attach "{spaced}" describe this')
+            attached_ok = output_reaches(MOCK_REPLY, 3, 120) \
+                and output_count("no such file") == 0
+            check("attach: quoted spaced path accepted", attached_ok,
+                  output_text()[-1200:])
+            send("/attach /definitely/not/here.txt", idle_timeout_s=30)
+            check("attach: missing path rejected",
+                  output_contains("no such file", 30), output_text()[-600:])
+
+            # /websearch: listing renders through the shared dispatcher, and
+            # switching to a backend with no configured key is refused loudly
+            # (this env has no OpenAI key in its isolated secrets store).
+            send("/websearch", idle_timeout_s=30)
+            check("websearch: backend listing rendered",
+                  output_contains("Web research backend", 30), output_text()[-800:])
+            send("/websearch openai", idle_timeout_s=30)
+            check("websearch: keyless switch refused",
+                  output_contains("No key configured for OpenAI", 30), output_text()[-600:])
+
+            proc.stdin.write(b"/quit\n")
+            proc.stdin.flush()
+            try:
+                rc = proc.wait(timeout=60)
+                check("chat: /quit exits cleanly", rc == 0, f"rc={rc}")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                check("chat: /quit exits cleanly", False, "timeout waiting for exit")
+        except BrokenPipeError:
+            check("chat: mock reply rendered", False, "stdin pipe broke — process died early:\n" + output_text()[-1200:])
+            check("chat: /quit exits cleanly", False, "")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    finally:
+        server.shutdown()
+        shutil.rmtree(home, ignore_errors=True)
+
+    # 6. setup wizard: interrupted first run resumes at the saved step
+    with tempfile.TemporaryDirectory() as home:
+        env = isolated_env(home)
+        # macOS UserDefaults ignores the HOME override — without this, a real
+        # completed install on the host machine routes setup to the rerun menu.
+        env["ADA_IGNORE_LEGACY_SETUP_FLAG"] = "1"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            # The wizard has one extra Linux-only step (always-on service),
+            # so the step totals in its headers differ per platform.
+            total_steps = 8 if sys.platform == "darwin" else 9
+            # Complete step 1 (custom-endpoint profile, menu option 3,
+            # against the mock server; vision=y; Enter declines "configure
+            # another provider"), then close stdin at step 2 — the
+            # FDA-relaunch shape of interruption.
+            step1 = f"3\nhttp://127.0.0.1:{port}/v1\nmock-model\nsk-mock-main\ny\n\n"
+            result = subprocess.run([ADA, "setup"], input=step1, capture_output=True,
+                                    text=True, timeout=120, env=env)
+            interrupted_ok = (result.returncode == 1
+                              and f"[2/{total_steps}]" in result.stdout
+                              and "Input closed" in result.stdout)
+            check("setup: EOF mid-run exits cleanly with progress saved", interrupted_ok,
+                  f"rc={result.returncode} out={result.stdout[-800:]!r}")
+
+            # Rerun: offers to resume at step 2; Enter accepts, and the OpenAI
+            # step (not the main-agent step) is what runs next.
+            result = subprocess.run([ADA, "setup"], input="\n", capture_output=True,
+                                    text=True, timeout=120, env=env)
+            resumed_ok = ("stopped at step 2" in result.stdout
+                          and "Resume from step 2" in result.stdout
+                          and f"[2/{total_steps}]" in result.stdout
+                          and f"[1/{total_steps}]" not in result.stdout)
+            check("setup: rerun offers resume at interrupted step", resumed_ok,
+                  result.stdout[-800:])
+
+            # Declining resume starts over, but step 1 offers to keep the
+            # already-configured main agent instead of forcing re-entry.
+            result = subprocess.run([ADA, "setup"], input="n\n\n", capture_output=True,
+                                    text=True, timeout=120, env=env)
+            keep_ok = ("Main agent already configured" in result.stdout
+                       and "keeping the current main agent" in result.stdout
+                       and f"[2/{total_steps}]" in result.stdout)
+            check("setup: restart offers to keep configured main agent", keep_ok,
+                  result.stdout[-800:])
+        finally:
+            server.shutdown()
+
+    # 7. /upgrade from chat: mock CDN → swap → exec restart → confirmation
+    import hashlib
+    import platform as platform_mod
+
+    if sys.platform == "darwin":
+        cdn_platform = "macos-arm64"
+        bundle_name = "ada-cli_ada.bundle"
+    else:
+        cdn_platform = "linux-arm64" if platform_mod.machine() in ("arm64", "aarch64") else "linux-x64"
+        bundle_name = "ada-cli_ada.resources"
+
+    build_dir = os.path.dirname(os.path.abspath(ADA))
+    bundle_src = os.path.join(build_dir, bundle_name)
+    if not os.path.isdir(bundle_src):
+        check("upgrade: build bundle present for packaging", False, f"missing {bundle_src}")
+    else:
+        home = tempfile.mkdtemp(prefix="ada-smoke-upgrade-")
+        try:
+            # A user-writable "install": the exact layout install.sh produces.
+            install_dir = os.path.join(home, "bin")
+            os.makedirs(install_dir)
+            shutil.copy2(ADA, os.path.join(install_dir, "ada"))
+            shutil.copytree(bundle_src, os.path.join(install_dir, bundle_name))
+
+            # Release tarball with the same binary, served by a mock CDN as 9.9.9.
+            tar_path = os.path.join(home, "ada.tar.gz")
+            subprocess.run(["tar", "-czf", tar_path, "-C", build_dir,
+                            "ada", bundle_name], check=True)
+            with open(tar_path, "rb") as f:
+                tar_bytes = f.read()
+            tar_sha = hashlib.sha256(tar_bytes).hexdigest()
+
+            # Mutable so later checks can re-point the mock CDN at a
+            # downgrade version or a corrupted build.
+            cdn_state = {"version": "9.9.9", "tar": tar_bytes, "sha": tar_sha}
+
+            class MockCDNHandler(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def do_GET(self):
+                    if self.path.endswith("/manifest.json"):
+                        body = json.dumps({
+                            "version": cdn_state["version"],
+                            "platforms": {cdn_platform: {
+                                "url": f"http://127.0.0.1:{cdn_port}/ada.tar.gz",
+                                "sha256": cdn_state["sha"],
+                            }},
+                        }).encode()
+                        ctype = "application/json"
+                    elif self.path.endswith("/ada.tar.gz"):
+                        body = cdn_state["tar"]
+                        ctype = "application/gzip"
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    pass
+
+            cdn = ThreadingHTTPServer(("127.0.0.1", 0), MockCDNHandler)
+            cdn_port = cdn.server_address[1]
+            threading.Thread(target=cdn.serve_forever, daemon=True).start()
+            llm = ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
+            llm_port = llm.server_address[1]
+            threading.Thread(target=llm.serve_forever, daemon=True).start()
+
+            env = isolated_env(home)
+            env["ADA_BASE_URL"] = f"http://127.0.0.1:{cdn_port}"
+            config_dir = os.path.join(home, ".config", "ada")
+            os.makedirs(config_dir, exist_ok=True)
+            with open(os.path.join(config_dir, "secrets.json"), "w") as f:
+                json.dump({
+                    "llm_provider": "openai_compatible",
+                    "openai_compatible_base_url": f"http://127.0.0.1:{llm_port}/v1",
+                    "openai_compatible_model": "mock-model",
+                    "openai_compatible_api_key": "smoke-test-key",
+                    "assistant_name": "Ada",
+                }, f)
+            os.chmod(os.path.join(config_dir, "secrets.json"), 0o600)
+
+            proc = subprocess.Popen(
+                [os.path.join(install_dir, "ada")],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, env=env,
+            )
+            buf = bytearray()
+            lock = threading.Lock()
+
+            def reader():
+                while True:
+                    chunk = proc.stdout.read1(4096)
+                    if not chunk:
+                        break
+                    with lock:
+                        buf.extend(chunk)
+
+            threading.Thread(target=reader, daemon=True).start()
+
+            def out():
+                with lock:
+                    return buf.decode("utf-8", errors="replace")
+
+            def wait_for(needle, timeout_s, count=1):
+                deadline = time.time() + timeout_s
+                while time.time() < deadline:
+                    if out().count(needle) >= count:
+                        return True
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                return out().count(needle) >= count
+
+            try:
+                wait_for("› ", 60)
+                proc.stdin.write(b"/upgrade\n")
+                proc.stdin.flush()
+                swapped = wait_for("installed — restarting now", 180)
+                check("upgrade: mock release downloaded and swapped", swapped, out()[-1200:])
+
+                # The process must survive its own exec: banner again, marker
+                # announcement, and a live REPL — all in the SAME pid.
+                restarted = wait_for("Update 9.9.9 installed — Ada restarted.", 120)
+                check("upgrade: exec restart announced", restarted, out()[-1200:])
+                wait_for("Ada CLI", 60, count=2)
+                wait_for("› ", 60, count=2)
+                proc.stdin.write(b"/status\n")
+                proc.stdin.flush()
+                alive = wait_for("status:", 60)
+                check("upgrade: REPL functional after exec (lock reacquired)", alive,
+                      out()[-1200:])
+
+                # Downgrade refusal: the CDN briefly serving an OLDER version
+                # (concurrent-release race) must never be installed.
+                cdn_state["version"] = "0.0.1"
+                proc.stdin.write(b"/upgrade\n")
+                proc.stdin.flush()
+                refused = wait_for("Not downgrading", 60)
+                check("upgrade: older manifest refused (downgrade guard)", refused,
+                      out()[-1200:])
+
+                # Corrupt release: a build that fails validation must be
+                # rejected BEFORE the installed files are touched.
+                corrupt_dir = os.path.join(home, "corrupt")
+                os.makedirs(os.path.join(corrupt_dir, bundle_name))
+                with open(os.path.join(corrupt_dir, bundle_name, "stub"), "w") as f:
+                    f.write("not a real bundle\n")
+                with open(os.path.join(corrupt_dir, "ada"), "w") as f:
+                    f.write("#!/bin/sh\nexit 1\n")
+                os.chmod(os.path.join(corrupt_dir, "ada"), 0o755)
+                corrupt_tar = os.path.join(home, "corrupt.tar.gz")
+                subprocess.run(["tar", "-czf", corrupt_tar, "-C", corrupt_dir,
+                                "ada", bundle_name], check=True)
+                with open(corrupt_tar, "rb") as f:
+                    corrupt_bytes = f.read()
+                cdn_state.update(version="8.8.8", tar=corrupt_bytes,
+                                 sha=hashlib.sha256(corrupt_bytes).hexdigest())
+                proc.stdin.write(b"/upgrade\n")
+                proc.stdin.flush()
+                rejected = wait_for("failed verification", 120)
+                with open(os.path.join(install_dir, "ada"), "rb") as f:
+                    intact = f.read(64) != b"#!/bin/sh\nexit 1\n"[:64]
+                check("upgrade: corrupt build rejected, install untouched",
+                      rejected and intact, out()[-1200:])
+
+                proc.stdin.write(b"/quit\n")
+                proc.stdin.flush()
+                try:
+                    rc = proc.wait(timeout=60)
+                    check("upgrade: clean exit after restart", rc == 0, f"rc={rc}")
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    check("upgrade: clean exit after restart", False, "timeout waiting for exit")
+
+                # Fault injection: fail the swap AFTER the new binary is
+                # placed (the exact hole Codex found — a mixed install of new
+                # binary + old bundle). Rollback must restore BOTH originals.
+                def sha256_of(path):
+                    with open(path, "rb") as f:
+                        return hashlib.sha256(f.read()).hexdigest()
+                pre_hash = sha256_of(os.path.join(install_dir, "ada"))
+                cdn_state.update(version="7.7.7", tar=tar_bytes, sha=tar_sha)
+                env2 = dict(env)
+                env2["ADA_UPGRADE_FAULT"] = "bundle-move"
+                proc2 = subprocess.Popen(
+                    [os.path.join(install_dir, "ada")],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, env=env2,
+                )
+                buf2 = bytearray()
+                lock2 = threading.Lock()
+
+                def reader2():
+                    while True:
+                        chunk = proc2.stdout.read1(4096)
+                        if not chunk:
+                            break
+                        with lock2:
+                            buf2.extend(chunk)
+
+                threading.Thread(target=reader2, daemon=True).start()
+
+                def out2():
+                    with lock2:
+                        return buf2.decode("utf-8", errors="replace")
+
+                def wait2(needle, timeout_s):
+                    deadline = time.time() + timeout_s
+                    while time.time() < deadline:
+                        if needle in out2():
+                            return True
+                        if proc2.poll() is not None:
+                            break
+                        time.sleep(0.2)
+                    return needle in out2()
+
+                try:
+                    wait2("› ", 60)
+                    proc2.stdin.write(b"/upgrade\n")
+                    proc2.stdin.flush()
+                    rolled_back = wait2("previous version restored", 120)
+                    post_hash = sha256_of(os.path.join(install_dir, "ada"))
+                    bundle_ok = os.path.isdir(os.path.join(install_dir, bundle_name))
+                    leftovers = [n for n in os.listdir(install_dir)
+                                 if n.startswith(".ada-upgrade-")]
+                    check("upgrade: mid-swap fault rolls back both components",
+                          rolled_back and post_hash == pre_hash and bundle_ok
+                          and not leftovers,
+                          f"rolled_back={rolled_back} hash_same={post_hash == pre_hash} "
+                          f"bundle_ok={bundle_ok} leftovers={leftovers}\n" + out2()[-800:])
+                    proc2.stdin.write(b"/status\n")
+                    proc2.stdin.flush()
+                    alive2 = wait2("status:", 60)
+                    proc2.stdin.write(b"/quit\n")
+                    proc2.stdin.flush()
+                    try:
+                        rc2 = proc2.wait(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        proc2.kill()
+                        rc2 = -1
+                    check("upgrade: process healthy after rollback",
+                          alive2 and rc2 == 0, f"alive={alive2} rc={rc2}\n" + out2()[-600:])
+                finally:
+                    if proc2.poll() is None:
+                        proc2.kill()
+            except BrokenPipeError:
+                check("upgrade: mock release downloaded and swapped", False,
+                      f"stdin pipe broke — process died early (poll={proc.poll()}):\n"
+                      + out())
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                cdn.shutdown()
+                llm.shutdown()
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    # 8. Telegram poller: dedup, offset persistence, week-reset adoption
+    # Short /tmp home, NOT the platform temp dir: macOS's per-user temp root
+    # is long enough that <home>/.local/share/ada/app-chat.sock overflows
+    # sockaddr_un's 104-byte path cap and phase 10's chat socket can't bind.
+    home = tempfile.mkdtemp(prefix="ada-smoke-poller-", dir="/tmp")
+    try:
+        tg_state = {"updates": [], "force": [], "offsets": [], "timeline": [],
+                    "sent": [], "t0": time.time()}
+        tg_lock = threading.Lock()
+
+        def tg_timeline():
+            with tg_lock:
+                return f"getUpdates timeline (s,offset): {tg_state['timeline'][-40:]}"
+
+        def tg_update(uid, text):
+            return {"update_id": uid, "message": {
+                "message_id": uid, "date": 0, "text": text,
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 12345, "is_bot": False, "first_name": "T"},
+            }}
+
+        class MockTelegramHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _reply(self, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if "/getUpdates" in self.path:
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    offset = int(q.get("offset", ["0"])[0])
+                    with tg_lock:
+                        tg_state["offsets"].append(offset)
+                        tg_state["timeline"].append(
+                            (round(time.time() - tg_state["t0"], 1), offset))
+                        # Idempotent by design: identical offsets get identical
+                        # answers (Swift's Linux networking duplicates GETs, and
+                        # a pop-once queue let the phantom twin eat batches).
+                        # "updates" serves normally (id >= offset); "force"
+                        # serves regardless of offset — re-delivery and reset
+                        # scenarios — and relies on Ada's dedup to ignore
+                        # repeats.
+                        batch = [u for u in tg_state["updates"]
+                                 if u["update_id"] >= offset]
+                        batch += [u for u in tg_state["force"]
+                                  if u["update_id"] < offset]
+                    self._reply({"ok": True, "result": batch})
+                else:
+                    self._reply({"ok": True, "result": True})
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                if "/sendMessage" in self.path:
+                    try:
+                        with tg_lock:
+                            tg_state["sent"].append(json.loads(body))
+                    except ValueError:
+                        pass
+                    self._reply({"ok": True, "result": {
+                        "message_id": 1, "date": 0,
+                        "chat": {"id": 12345, "type": "private"}}})
+                else:
+                    self._reply({"ok": True, "result": True})
+
+            def log_message(self, *args):
+                pass
+
+        tg = ThreadingHTTPServer(("127.0.0.1", 0), MockTelegramHandler)
+        tg_port = tg.server_address[1]
+        threading.Thread(target=tg.serve_forever, daemon=True).start()
+
+        # Slowable + recording LLM mock: a request whose body contains the
+        # marker stalls (long enough to pin a turn "active" while the kill
+        # scenario runs); every body is recorded so tests can assert which
+        # messages actually reached the model.
+        llm_state = {"bodies": [], "marker": "sleep-now", "delay": 20,
+                     "tool_call_marker": ""}
+
+        class SlowableOpenAIHandler(MockOpenAIHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8", errors="replace")
+                with tg_lock:
+                    llm_state["bodies"].append(body)
+                    tool_marker = llm_state["tool_call_marker"]
+                if llm_state["marker"] in body:
+                    time.sleep(llm_state["delay"])
+                # Scriptable tool round (mid-turn integration test): the first
+                # request containing the tool marker gets a real bash tool
+                # call; the follow-up request (recognizable by the echoed
+                # tool_call id) gets the normal text reply.
+                if tool_marker and tool_marker in body and "call_mt1" not in body:
+                    message = {"role": "assistant", "content": None,
+                               "tool_calls": [{"id": "call_mt1", "type": "function",
+                                               "function": {"name": "bash",
+                                                            "arguments": json.dumps({"command": "sleep 6"})}}]}
+                    finish = "tool_calls"
+                else:
+                    message = {"role": "assistant", "content": MOCK_REPLY}
+                    finish = "stop"
+                reply = json.dumps({
+                    "id": "gen-smoke-1", "object": "chat.completion",
+                    "model": "mock-model",
+                    "choices": [{"index": 0, "finish_reason": finish,
+                                 "message": message}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 12,
+                              "total_tokens": 22},
+                }).encode()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(reply)))
+                    self.end_headers()
+                    self.wfile.write(reply)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # client killed mid-stall — expected in the kill test
+
+        llm = ThreadingHTTPServer(("127.0.0.1", 0), SlowableOpenAIHandler)
+        llm_port = llm.server_address[1]
+        threading.Thread(target=llm.serve_forever, daemon=True).start()
+
+        def llm_bodies():
+            with tg_lock:
+                return list(llm_state["bodies"])
+
+        env = isolated_env(home)
+        env["ADA_TELEGRAM_API_BASE"] = f"http://127.0.0.1:{tg_port}/bot"
+        config_dir = os.path.join(home, ".config", "ada")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "secrets.json"), "w") as f:
+            json.dump({
+                "llm_provider": "openai_compatible",
+                "openai_compatible_base_url": f"http://127.0.0.1:{llm_port}/v1",
+                "openai_compatible_model": "mock-model",
+                "openai_compatible_api_key": "smoke-test-key",
+                "assistant_name": "Ada",
+                "telegram_bot_token": "TESTTOKEN",
+                "telegram_chat_id": "12345",
+            }, f)
+        os.chmod(os.path.join(config_dir, "secrets.json"), 0o600)
+
+        def run_poller_phase(extra_env, actions, timeout_s=90, binary=None,
+                             keep_marker=False):
+            """Spawn ada, run `actions(wait_fn, push_fn, out_fn, proc)`, /quit,
+            return (full output, exit code)."""
+            # Force entries are per-phase: leaking them across phases poisons
+            # the reset scenario (the reset fires on a stale forced id first,
+            # refreshing activity, and the real reset id then reads as a
+            # duplicate — exactly what the macOS CI timeline showed).
+            with tg_lock:
+                tg_state["force"].clear()
+            # Phase hermeticity: an active-turn marker carried over from a
+            # previous phase makes THIS phase's process resume a stale turn
+            # at startup — mid-turn guards then fire instead of the guards
+            # the phase actually tests (seen on slow CI runners). Only the
+            # marker-resume phase (6b) legitimately inherits one. Loudly
+            # report what leaked — the trigger id and startedAt pin down the
+            # phase that wrote it — then remove it.
+            stale_marker = os.path.join(
+                home, ".local", "share", "ada", "active_turn.json")
+            if not keep_marker and os.path.exists(stale_marker):
+                try:
+                    with open(stale_marker) as f:
+                        content = f.read()
+                except OSError as e:
+                    content = f"<unreadable: {e}>"
+                print(f"  [harness] stale active_turn.json leaked from a "
+                      f"previous phase, removing: {content}")
+                os.remove(stale_marker)
+            phase_env = dict(env)
+            phase_env.update(extra_env)
+            p = subprocess.Popen(
+                [binary or ADA], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, env=phase_env,
+            )
+            pbuf = bytearray()
+            plock = threading.Lock()
+
+            def preader():
+                while True:
+                    chunk = p.stdout.read1(4096)
+                    if not chunk:
+                        break
+                    with plock:
+                        pbuf.extend(chunk)
+
+            threading.Thread(target=preader, daemon=True).start()
+
+            def pout():
+                with plock:
+                    return pbuf.decode("utf-8", errors="replace")
+
+            def pwait(needle, timeout_n=30, count=1):
+                deadline = time.time() + timeout_n
+                while time.time() < deadline:
+                    if pout().count(needle) >= count:
+                        return True
+                    if p.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                return pout().count(needle) >= count
+
+            def push(batch, force=False):
+                with tg_lock:
+                    tg_state["force" if force else "updates"].extend(batch)
+
+            rc = -1
+            try:
+                pwait("› ", 60)
+                actions(pwait, push, pout, p)
+                if p.poll() is None:  # a kill-scenario action may have ended it
+                    # A text turn may still be mid-flight when the phase's
+                    # last offset check passes (the offset confirms durable
+                    # intake, not the answer). /quit mid-turn legitimately
+                    # leaves the power-failure resume marker behind, and the
+                    # NEXT phase's process would resume that stale turn and
+                    # poison its scenario — on slow CI runners phase 5b
+                    # resumed phase 5's tail turn and correctly refused
+                    # /restart mid-turn (no exec, no announcement). Wait for
+                    # the marker to clear before the graceful quit;
+                    # kill-scenario phases never reach this path.
+                    marker = os.path.join(
+                        home, ".local", "share", "ada", "active_turn.json")
+                    mdeadline = time.time() + 15
+                    while time.time() < mdeadline and os.path.exists(marker):
+                        time.sleep(0.2)
+                    p.stdin.write(b"/quit\n")
+                    p.stdin.flush()
+                rc = p.wait(timeout=60)
+            except (subprocess.TimeoutExpired, BrokenPipeError):
+                p.kill()
+            finally:
+                if p.poll() is None:
+                    p.kill()
+            return pout(), rc
+
+        def tg_mark(label):
+            with tg_lock:
+                tg_state["timeline"].append((round(time.time() - tg_state["t0"], 1), label))
+
+        # Phase 1: same-batch and cross-batch duplicates.
+        def phase1(pwait, push, pout, proc):
+            push([tg_update(100, "hello one"), tg_update(100, "hello one")])
+            pwait("hello one", 30)
+            pwait("Dropping re-delivered update 100", 15)
+            push([tg_update(100, "hello one")], force=True)
+            pwait("Dropping re-delivered update 100", 15, count=2)
+            push([tg_update(101, "hello two")])
+            pwait("hello two", 30)
+
+        tg_mark("phase1-start")
+        out1, rc1 = run_poller_phase({}, phase1)
+        check("poller: same-batch duplicate dropped",
+              out1.count("[Telegram] hello one") == 1
+              and "Dropping re-delivered update 100" in out1,
+              tg_timeline() + "\n" + out1[-2500:])
+        check("poller: cross-batch duplicate dropped",
+              out1.count("Dropping re-delivered update 100") >= 2 and rc1 == 0,
+              tg_timeline() + f"\nrc={rc1}\n" + out1[-2500:])
+
+        state_path = os.path.join(home, ".local", "share", "ada",
+                                  "telegram_offset.json")
+        persisted = {}
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                persisted = json.load(f)
+
+        # Phase 2 (default reset window): the restarted process must resume
+        # at offset 102 and drop a re-delivery of 101.
+        with tg_lock:
+            tg_state["offsets"].clear()
+        def phase2(pwait, push, pout, proc):
+            push([tg_update(101, "hello two")], force=True)
+            pwait("Dropping re-delivered update 101", 20)
+
+        tg_mark("phase2-start")
+        out2, rc2 = run_poller_phase({}, phase2)
+        with tg_lock:
+            first_offset = tg_state["offsets"][0] if tg_state["offsets"] else None
+        check("poller: offset persisted across restart, re-delivery dropped",
+              persisted.get("lastUpdateId") == 101 and first_offset == 102
+              and "Dropping re-delivered update 101" in out2
+              and out2.count("[Telegram] hello two") == 0 and rc2 == 0,
+              tg_timeline() + f"\npersisted={persisted} first_offset={first_offset} rc={rc2}\n" + out2[-2500:])
+
+        # Phase 3 (1s reset window): a lower id after "a week" of silence is
+        # a legitimate reset — adopted and processed, not dropped.
+        def phase3(pwait, push, pout, proc):
+            time.sleep(1.5)  # let the last real activity age past the window
+            push([tg_update(50, "after reset")], force=True)
+            pwait("after reset", 30)
+            # Adoption is proven by the NEXT poll asking for offset 51 — give
+            # the 1s-interval loop time to issue it before quitting.
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with tg_lock:
+                    if 51 in tg_state["offsets"]:
+                        return
+                time.sleep(0.3)
+
+        tg_mark("phase3-start")
+        out3, rc3 = run_poller_phase({"ADA_TELEGRAM_RESET_WINDOW_SECONDS": "1"}, phase3)
+        with tg_lock:
+            saw_51 = 51 in tg_state["offsets"]
+        check("poller: week-reset id adopted, polling follows new sequence",
+              "sequence reset detected" in out3
+              and "[Telegram] after reset" in out3
+              and saw_51 and rc3 == 0,
+              tg_timeline() + f"\nsaw_51={saw_51} rc={rc3}\n" + out3[-2500:])
+
+        # Phase 4: SIGKILL while a message sits in the mid-turn queue. The
+        # queued update is already confirmed to Telegram (never re-served), so
+        # only the durable queue file can save it. Kill -9 mid-turn, restart,
+        # and require the message to be recovered and actually answered.
+        data_dir = os.path.join(home, ".local", "share", "ada")
+        midturn_path = os.path.join(data_dir, "pending_midturn.json")
+        with tg_lock:
+            tg_state["updates"].clear()  # retire phase 1-3 ids for good
+
+        phase4_state = {"queued_on_disk": False, "confirmed_401": False}
+
+        def phase4(pwait, push, pout, proc):
+            push([tg_update(400, "please sleep-now and think hard")])
+            # Wait until the slow LLM call is in flight (turn pinned active).
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if any("sleep-now" in b for b in llm_bodies()):
+                    break
+                time.sleep(0.2)
+            push([tg_update(401, "queued while busy")])
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if os.path.exists(midturn_path):
+                    phase4_state["queued_on_disk"] = True
+                    try:
+                        with open(state_path) as f:
+                            phase4_state["confirmed_401"] = \
+                                json.load(f).get("lastUpdateId") == 401
+                    except (OSError, ValueError):
+                        pass
+                    if phase4_state["confirmed_401"]:
+                        break
+                time.sleep(0.2)
+            proc.kill()  # SIGKILL: no cleanup, the crash case
+
+        tg_mark("phase4-start")
+        out4, _ = run_poller_phase({}, phase4)
+        check("poller: mid-turn queue persisted + offset confirmed per update",
+              phase4_state["queued_on_disk"] and phase4_state["confirmed_401"],
+              f"{phase4_state}\n" + tg_timeline() + "\n" + out4[-2500:])
+
+        # Phase 4b: the restarted process must recover the queued message
+        # from disk (Telegram won't re-serve it) and run a turn for it.
+        # The stall marker is retired first — the recovery turn's request
+        # carries the full history, which still contains the marker text.
+        with tg_lock:
+            tg_state["offsets"].clear()
+            llm_state["marker"] = "-- no stalls in phase 4b --"
+            llm_state["bodies"].clear()
+
+        def phase4b(pwait, push, pout, proc):
+            pwait("Recovered 1 queued mid-turn message(s)", 30)
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if any("queued while busy" in b for b in llm_bodies()):
+                    return
+                time.sleep(0.2)
+
+        tg_mark("phase4b-start")
+        out4b, rc4b = run_poller_phase({}, phase4b)
+        with tg_lock:
+            resumed_at = tg_state["offsets"][0] if tg_state["offsets"] else None
+        reached_llm = any("queued while busy" in b for b in llm_bodies())
+        check("poller: killed process's queued message recovered after restart",
+              "Recovered 1 queued mid-turn message(s)" in out4b
+              and reached_llm and not os.path.exists(midturn_path)
+              and resumed_at == 402 and rc4b == 0,
+              f"reached_llm={reached_llm} resumed_at={resumed_at} rc={rc4b} "
+              f"file_gone={not os.path.exists(midturn_path)}\n" + out4b[-2500:])
+
+        # Phase 5: /upgrade with a second message in the SAME getUpdates
+        # batch. /upgrade must confirm only its own update id before the
+        # exec-restart; the restarted process must then receive and answer
+        # the tail message instead of skipping it forever.
+        import hashlib as hashlib5
+        import platform as platform5
+        if sys.platform == "darwin":
+            p5_platform, p5_bundle = "macos-arm64", "ada-cli_ada.bundle"
+        else:
+            p5_platform = ("linux-arm64" if platform5.machine() in ("arm64", "aarch64")
+                           else "linux-x64")
+            p5_bundle = "ada-cli_ada.resources"
+        p5_build_dir = os.path.dirname(os.path.abspath(ADA))
+        p5_install = os.path.join(home, "bin")
+        os.makedirs(p5_install, exist_ok=True)
+        shutil.copy2(ADA, os.path.join(p5_install, "ada"))
+        shutil.copytree(os.path.join(p5_build_dir, p5_bundle),
+                        os.path.join(p5_install, p5_bundle))
+        p5_tar = os.path.join(home, "p5.tar.gz")
+        subprocess.run(["tar", "-czf", p5_tar, "-C", p5_build_dir,
+                        "ada", p5_bundle], check=True)
+        with open(p5_tar, "rb") as f:
+            p5_tar_bytes = f.read()
+        p5_sha = hashlib5.sha256(p5_tar_bytes).hexdigest()
+
+        class P5CDNHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path.endswith("/manifest.json"):
+                    body = json.dumps({"version": "9.9.9", "platforms": {
+                        p5_platform: {
+                            "url": f"http://127.0.0.1:{p5_cdn_port}/p5.tar.gz",
+                            "sha256": p5_sha}}}).encode()
+                    ctype = "application/json"
+                elif self.path.endswith("/p5.tar.gz"):
+                    body, ctype = p5_tar_bytes, "application/gzip"
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        p5_cdn = ThreadingHTTPServer(("127.0.0.1", 0), P5CDNHandler)
+        p5_cdn_port = p5_cdn.server_address[1]
+        threading.Thread(target=p5_cdn.serve_forever, daemon=True).start()
+
+        with tg_lock:
+            tg_state["updates"].clear()
+            tg_state["offsets"].clear()
+
+        def phase5(pwait, push, pout, proc):
+            # One batch: /upgrade first, a normal message right behind it.
+            # Progress replies ("restarting now") go to Telegram, not the
+            # terminal — the first terminal evidence of the upgrade is the
+            # restarted process's own announcement.
+            push([tg_update(500, "/upgrade"),
+                  tg_update(501, "tail message survives")])
+            pwait("Update 9.9.9 installed — Ada restarted", 240)
+            # The tail message must arrive at the RESTARTED process.
+            pwait("[Telegram] tail message survives", 60)
+            # ...and be confirmed by a poll at 502.
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with tg_lock:
+                    if 502 in tg_state["offsets"]:
+                        return
+                time.sleep(0.3)
+
+        tg_mark("phase5-start")
+        try:
+            out5, rc5 = run_poller_phase(
+                {"ADA_BASE_URL": f"http://127.0.0.1:{p5_cdn_port}"}, phase5,
+                binary=os.path.join(p5_install, "ada"))
+        finally:
+            p5_cdn.shutdown()
+        tail_pos = out5.find("[Telegram] tail message survives")
+        restart_pos = out5.find("Update 9.9.9 installed — Ada restarted")
+        with tg_lock:
+            p5_offsets = list(tg_state["offsets"])
+        check("poller: /upgrade confirms only its own update; same-batch tail survives restart",
+              restart_pos != -1 and tail_pos > restart_pos
+              and 501 in p5_offsets and 502 in p5_offsets and rc5 == 0,
+              f"restart_pos={restart_pos} tail_pos={tail_pos} rc={rc5} "
+              f"offsets={p5_offsets[-12:]}\n" + tg_timeline() + "\n" + out5[-3000:])
+
+        # Phase 5b: /restart — plain in-place re-exec (no install swap, no
+        # CDN). Same per-update-ack contract as /upgrade: a same-batch tail
+        # message must survive the exec, and the restarted process announces
+        # itself as a restart, NOT an update.
+        with tg_lock:
+            tg_state["updates"].clear()
+            tg_state["offsets"].clear()
+
+        def phase5b(pwait, push, pout, proc):
+            push([tg_update(550, "/restart"),
+                  tg_update(551, "restart tail survives")])
+            pwait("✔ Ada restarted.", 120)
+            pwait("[Telegram] restart tail survives", 60)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with tg_lock:
+                    if 552 in tg_state["offsets"]:
+                        return
+                time.sleep(0.3)
+
+        tg_mark("phase5b-start")
+        out5b, rc5b = run_poller_phase({}, phase5b)
+        restart5b = out5b.find("✔ Ada restarted.")
+        tail5b = out5b.find("[Telegram] restart tail survives")
+        with tg_lock:
+            p5b_offsets = list(tg_state["offsets"])
+        check("poller: /restart re-execs in place; same-batch tail survives, no update announce",
+              restart5b != -1 and tail5b > restart5b
+              and "installed — Ada restarted" not in out5b
+              and 551 in p5b_offsets and 552 in p5b_offsets and rc5b == 0,
+              f"restart_pos={restart5b} tail_pos={tail5b} rc={rc5b} "
+              f"offsets={p5b_offsets[-12:]}\n" + tg_timeline() + "\n" + out5b[-3000:])
+
+        # Phase 6: power failure during a SINGLE idle-start turn, no later
+        # message. The trigger is in history and its update confirmed, so
+        # nothing re-delivers — only the active-turn marker lets the restart
+        # notice the unanswered question and resume it unprompted.
+        marker_path = os.path.join(data_dir, "active_turn.json")
+        with tg_lock:
+            tg_state["updates"].clear()
+            llm_state["marker"] = "resume-me-stall"
+            llm_state["bodies"].clear()
+
+        phase6_state = {"marker_on_disk": False, "confirmed_600": False}
+
+        def phase6(pwait, push, pout, proc):
+            push([tg_update(600, "please resume-me-stall and ponder")])
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                in_flight = any("resume-me-stall" in b for b in llm_bodies())
+                phase6_state["marker_on_disk"] = os.path.exists(marker_path)
+                try:
+                    with open(state_path) as f:
+                        phase6_state["confirmed_600"] = \
+                            json.load(f).get("lastUpdateId") == 600
+                except (OSError, ValueError):
+                    pass
+                if in_flight and phase6_state["marker_on_disk"] \
+                        and phase6_state["confirmed_600"]:
+                    break
+                time.sleep(0.2)
+            proc.kill()  # power failure mid-model-call
+
+        tg_mark("phase6-start")
+        out6, _ = run_poller_phase({}, phase6)
+        check("poller: active-turn marker on disk while turn runs, update confirmed",
+              phase6_state["marker_on_disk"] and phase6_state["confirmed_600"],
+              f"{phase6_state}\n" + out6[-2000:])
+
+        # Phase 6b: restart with NO new message — the turn must resume by
+        # itself, answer, and clear the marker.
+        with tg_lock:
+            llm_state["marker"] = "-- no stalls in phase 6b --"
+            llm_state["bodies"].clear()
+
+        def phase6b(pwait, push, pout, proc):
+            pwait("Resuming turn interrupted by shutdown", 30)
+            pwait("Ada ▸", 60)
+
+        tg_mark("phase6b-start")
+        out6b, rc6b = run_poller_phase({}, phase6b, keep_marker=True)
+        resumed_reached_llm = any("resume-me-stall" in b for b in llm_bodies())
+        check("poller: interrupted single-message turn auto-resumes after restart",
+              "Resuming turn interrupted by shutdown" in out6b
+              and resumed_reached_llm and "Ada ▸" in out6b
+              and not os.path.exists(marker_path) and rc6b == 0,
+              f"resumed_reached_llm={resumed_reached_llm} rc={rc6b} "
+              f"marker_gone={not os.path.exists(marker_path)}\n" + out6b[-2500:])
+
+        # Phase 7: durable-write failure must PAUSE polling entirely. The
+        # offset of any getUpdates request is itself the acknowledgment —
+        # if Ada keeps polling at fetchedThroughId+1 while "not confirming",
+        # Telegram deletes the supposedly protected updates anyway.
+        fault_flag = os.path.join(home, "durability_fault_flag")
+        with open(fault_flag, "w") as f:
+            f.write("x")
+        with tg_lock:
+            tg_state["updates"].clear()
+            tg_state["offsets"].clear()
+            llm_state["bodies"].clear()
+
+        phase7_state = {"premature_701": None, "confirmed_during_stall": None}
+
+        def phase7(pwait, push, pout, proc):
+            push([tg_update(700, "durability stall probe")])
+            pwait("NOT confirming update 700", 30)
+            pwait("Telegram polling PAUSED", 15)
+            # Stall window: several ticks must pass with NO poll at 701 and
+            # NO offset persistence of 700.
+            time.sleep(4)
+            with tg_lock:
+                phase7_state["premature_701"] = 701 in tg_state["offsets"]
+            try:
+                with open(state_path) as f:
+                    phase7_state["confirmed_during_stall"] = \
+                        json.load(f).get("lastUpdateId", 0) >= 700
+            except (OSError, ValueError):
+                phase7_state["confirmed_during_stall"] = False
+            # Disk "recovers": the retry must confirm and resume polling.
+            os.remove(fault_flag)
+            pwait("Durable writes recovered — confirmed update 700", 30)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with tg_lock:
+                    if 701 in tg_state["offsets"]:
+                        return
+                time.sleep(0.3)
+
+        tg_mark("phase7-start")
+        out7, rc7 = run_poller_phase(
+            {"ADA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase7)
+        with tg_lock:
+            resumed_701 = 701 in tg_state["offsets"]
+        persisted7 = {}
+        try:
+            with open(state_path) as f:
+                persisted7 = json.load(f)
+        except (OSError, ValueError):
+            pass
+        check("poller: durability failure pauses polling (no confirming offset leaks)",
+              phase7_state["premature_701"] is False
+              and phase7_state["confirmed_during_stall"] is False
+              and "Telegram polling PAUSED" in out7,
+              f"{phase7_state}\n" + tg_timeline() + "\n" + out7[-2500:])
+        check("poller: write recovery confirms stalled update and resumes polling",
+              "Durable writes recovered — confirmed update 700" in out7
+              and resumed_701 and persisted7.get("lastUpdateId") == 700
+              and rc7 == 0,
+              f"resumed_701={resumed_701} persisted={persisted7} rc={rc7}\n"
+              + out7[-2500:])
+
+        # Phase 8: /upgrade behind a stalled update in the SAME batch must be
+        # refused — its own confirmProcessed(higher id) would implicitly
+        # confirm the stalled update, bypassing the whole stall. /status as
+        # the stall trigger keeps Ada idle so the refusal exercises the stall
+        # guard, not the turn-running guard.
+        with open(fault_flag, "w") as f:
+            f.write("x")
+        with tg_lock:
+            tg_state["updates"].clear()
+            tg_state["offsets"].clear()
+            tg_state["sent"].clear()
+
+        def phase8(pwait, push, pout, proc):
+            push([tg_update(800, "/status"), tg_update(801, "/upgrade")])
+            pwait("NOT confirming update 801", 30)
+            time.sleep(3)  # stall window: nothing may confirm or restart
+            os.remove(fault_flag)
+            pwait("Durable writes recovered — confirmed update 801", 30)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with tg_lock:
+                    if 802 in tg_state["offsets"]:
+                        return
+                time.sleep(0.3)
+
+        tg_mark("phase8-start")
+        out8, rc8 = run_poller_phase(
+            {"ADA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase8)
+        with tg_lock:
+            sent_texts = [m.get("text", "") for m in tg_state["sent"]]
+            resumed_802 = 802 in tg_state["offsets"]
+        persisted8 = {}
+        try:
+            with open(state_path) as f:
+                persisted8 = json.load(f)
+        except (OSError, ValueError):
+            pass
+        upgrade_refused = any("deferred until storage recovers" in t for t in sent_texts)
+        check("poller: /upgrade refused during durability stall (no implicit confirm)",
+              upgrade_refused and "Ada restarted" not in out8
+              and "Durable writes recovered — confirmed update 801" in out8
+              and resumed_802 and persisted8.get("lastUpdateId") == 801
+              and rc8 == 0,
+              f"refused={upgrade_refused} resumed_802={resumed_802} "
+              f"persisted={persisted8} rc={rc8}\nsent={sent_texts[-6:]}\n"
+              + out8[-2500:])
+
+        # Phase 9: marker recreation on stall recovery. The fault makes the
+        # active-turn marker write fail at turn start (stall); the slow LLM
+        # keeps the turn alive; when the disk "recovers" mid-turn, the retry
+        # must recreate the marker BEFORE confirming — otherwise a power
+        # failure after the confirm couldn't resume this turn.
+        with open(fault_flag, "w") as f:
+            f.write("x")
+        with tg_lock:
+            tg_state["updates"].clear()
+            tg_state["offsets"].clear()
+            llm_state["marker"] = "sleep-now"
+            llm_state["bodies"].clear()
+
+        phase9_state = {"marker_absent_during_stall": None,
+                        "marker_present_after_recovery": None}
+
+        def phase9(pwait, push, pout, proc):
+            push([tg_update(900, "please sleep-now for the marker test")])
+            pwait("Telegram polling PAUSED", 30)
+            phase9_state["marker_absent_during_stall"] = \
+                not os.path.exists(marker_path)
+            os.remove(fault_flag)
+            pwait("Durable writes recovered — confirmed update 900", 30)
+            phase9_state["marker_present_after_recovery"] = \
+                os.path.exists(marker_path)
+            with tg_lock:
+                llm_state["marker"] = "-- done stalling --"
+            pwait("Ada ▸", 60)  # turn finishes normally afterwards
+
+        tg_mark("phase9-start")
+        out9, rc9 = run_poller_phase(
+            {"ADA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase9)
+        check("poller: stall recovery recreates the active-turn marker before confirming",
+              phase9_state["marker_absent_during_stall"] is True
+              and phase9_state["marker_present_after_recovery"] is True
+              and "Durable writes recovered — confirmed update 900" in out9
+              and "Ada ▸" in out9 and rc9 == 0,
+              f"{phase9_state} rc={rc9}\n" + out9[-2500:])
+
+        # Phase 10: companion-app chat socket, end-to-end over the real
+        # binary — hello + snapshot, ping, a full text turn answered by the
+        # mock LLM arriving back as an assistant message event, attachment
+        # intake surfacing on the user event, the shared /command set, and
+        # the honest no-transcription-key voice nack.
+        with tg_lock:
+            tg_state["updates"].clear()
+            llm_state["marker"] = "-- no stall in phase 10 --"
+            llm_state["bodies"].clear()
+
+        sock_path = os.path.join(home, ".local", "share", "ada", "app-chat.sock")
+        chat_state = {}
+
+        def phase10(pwait, push, pout, proc):
+            conn = None
+            deadline = time.time() + 20
+            while time.time() < deadline and conn is None:
+                try:
+                    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    c.connect(sock_path)
+                    conn = c
+                except OSError:
+                    time.sleep(0.3)
+            if conn is None:
+                chat_state["error"] = "could not connect to " + sock_path
+                return
+            conn.settimeout(0.5)
+            buf = bytearray()
+
+            def read_event(want, timeout_s=30, match=None):
+                deadline2 = time.time() + timeout_s
+                while time.time() < deadline2:
+                    nl = buf.find(b"\n")
+                    if nl != -1:
+                        line = bytes(buf[:nl])
+                        del buf[:nl + 1]
+                        try:
+                            ev = json.loads(line)
+                        except ValueError:
+                            continue
+                        if ev.get("type") == want and (match is None or match(ev)):
+                            return ev
+                        continue
+                    try:
+                        chunk = conn.recv(65536)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        return None
+                    if not chunk:
+                        return None
+                    buf.extend(chunk)
+                return None
+
+            def send_req(obj):
+                conn.sendall((json.dumps(obj) + "\n").encode())
+
+            chat_state["hello"] = read_event("hello")
+            send_req({"type": "ping", "ref": "p1"})
+            chat_state["pong"] = read_event("pong")
+
+            send_req({"type": "send", "ref": "s1", "text": "hello from the app"})
+            chat_state["ack"] = read_event(
+                "ack", match=lambda e: e.get("ref") == "s1")
+            chat_state["user_event"] = read_event(
+                "message", match=lambda e: e.get("text") == "hello from the app")
+            chat_state["reply_event"] = read_event(
+                "message", 60, match=lambda e: e.get("role") == "assistant"
+                and MOCK_REPLY in e.get("text", ""))
+
+            attach = os.path.join(home, "attach-note.txt")
+            with open(attach, "w") as f:
+                f.write("attachment content for the chat socket test")
+            send_req({"type": "send", "ref": "s2", "text": "see attached",
+                      "attachments": [attach]})
+            chat_state["attach_event"] = read_event(
+                "message", 60,
+                match=lambda e: "attach-note.txt" in (e.get("documents") or []))
+            # drain s2's reply so /quit isn't racing the turn
+            read_event("message", 60,
+                       match=lambda e: e.get("role") == "assistant")
+
+            send_req({"type": "command", "ref": "c1", "line": "/commands"})
+            chat_state["cmd"] = read_event(
+                "command_result", 30, match=lambda e: e.get("ref") == "c1")
+
+            voice = os.path.join(home, "note.ogg")
+            with open(voice, "wb") as f:
+                f.write(b"OggS")
+            send_req({"type": "voice", "ref": "v1", "path": voice})
+            chat_state["voice_nack"] = read_event(
+                "nack", 30, match=lambda e: e.get("ref") == "v1")
+            conn.close()
+
+        tg_mark("phase10-start")
+        out10, rc10 = run_poller_phase({}, phase10)
+        h10 = chat_state.get("hello") or {}
+        check("app-chat: hello handshake with media dirs, ping answered",
+              chat_state.get("error") is None and h10.get("protocol") == 1
+              and h10.get("images_dir") and h10.get("documents_dir")
+              and (chat_state.get("pong") or {}).get("ref") == "p1",
+              f"{chat_state.get('error')} hello={h10}\n" + out10[-1500:])
+        check("app-chat: text turn — ack, user event, mock-LLM reply event",
+              chat_state.get("ack") is not None
+              and chat_state.get("user_event") is not None
+              and chat_state.get("reply_event") is not None and rc10 == 0,
+              f"ack={chat_state.get('ack')} user={chat_state.get('user_event')} "
+              f"reply={chat_state.get('reply_event')} rc={rc10}\n" + out10[-1500:])
+        check("app-chat: attachment name surfaces on the user message event",
+              chat_state.get("attach_event") is not None,
+              f"{chat_state.get('attach_event')}\n" + out10[-1500:])
+        cmd10 = chat_state.get("cmd") or {}
+        nack10 = chat_state.get("voice_nack") or {}
+        check("app-chat: /commands routed, voice without key nacked honestly",
+              cmd10.get("handled") is True and cmd10.get("lines")
+              and "transcription" in nack10.get("error", ""),
+              f"cmd={cmd10} nack={nack10}\n" + out10[-1500:])
+
+        # Phase 11: typed mid-turn annotation, end-to-end over the real
+        # binary and a recorded mock provider (MIDTURN_NONCE_PLAN §14 /
+        # Codex round-1 request). Request 1 answers the trigger with a real
+        # bash tool call (sleep 6); a second Telegram message lands during
+        # the tool round; request 2 must then carry the harness-rendered
+        # annotation — reserved prefix, 32-hex nonce, BEGIN/END delimiters
+        # with the SAME nonce, the message text inside the block, placed
+        # after the [System Note:] line — and the durable queue must be
+        # empty once the turn completes.
+        with tg_lock:
+            tg_state["updates"].clear()
+            tg_state["offsets"].clear()
+            llm_state["marker"] = "-- no stall in phase 11 --"
+            llm_state["bodies"].clear()
+            llm_state["tool_call_marker"] = "use-the-bash-tool"
+
+        phase11_state = {"saw_request1": False, "pushed_midturn": False,
+                         "saw_request2": False, "queue_empty_at_end": None}
+
+        def phase11(pwait, push, pout, proc):
+            push([tg_update(950, "please use-the-bash-tool now")])
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                if any("use-the-bash-tool" in b for b in llm_bodies()):
+                    phase11_state["saw_request1"] = True
+                    break
+                time.sleep(0.2)
+            # The bash tool is sleeping — deliver the mid-turn message now.
+            push([tg_update(951, "midturn integration message")])
+            phase11_state["pushed_midturn"] = True
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                if any("call_mt1" in b for b in llm_bodies()):
+                    phase11_state["saw_request2"] = True
+                    break
+                time.sleep(0.2)
+            pwait("Ada ▸", 60)  # turn completes with the mock reply
+            phase11_state["queue_empty_at_end"] = not os.path.exists(midturn_path)
+
+        tg_mark("phase11-start")
+        out11, rc11 = run_poller_phase({}, phase11, timeout_s=150)
+        with tg_lock:
+            llm_state["tool_call_marker"] = ""
+
+        # The reserved prefix is assembled here so this file honors the
+        # repository no-contiguous-prefix invariant.
+        needle = "<<<" + "ADA_HARNESS_" + "DIRECT_USER:"
+        body2 = next((b for b in llm_bodies()
+                      if "call_mt1" in b and "[Direct user message" in b), None)
+        annotation_ok = False
+        ordering_ok = False
+        if body2 is not None:
+            m = re.search(re.escape(needle) + r"v1:([0-9a-f]{32}):BEGIN>>>", body2)
+            if m:
+                nonce = m.group(1)
+                end_marker = f"{needle}v1:{nonce}:END>>>"
+                end_idx = body2.find(end_marker)
+                if end_idx > m.end():
+                    block = body2[m.end():end_idx]
+                    annotation_ok = ("[Direct user message 1 of 1]" in block
+                                     and "midturn integration message" in block)
+                note_idx = body2.find("[System Note: Current time is now")
+                ordering_ok = 0 <= note_idx < m.start()
+        check("midturn integration: tool-round delivery carries the typed annotation",
+              phase11_state["saw_request1"] and phase11_state["saw_request2"]
+              and body2 is not None and annotation_ok and ordering_ok
+              and phase11_state["queue_empty_at_end"] is True and rc11 == 0,
+              f"{phase11_state} body2_found={body2 is not None} "
+              f"annotation_ok={annotation_ok} ordering_ok={ordering_ok} rc={rc11}\n"
+              + tg_timeline() + "\n" + out11[-2500:])
+    finally:
+        tg.shutdown()
+        llm.shutdown()
+        shutil.rmtree(home, ignore_errors=True)
+
+    # 9. __setsid-exec trampoline: no controlling terminal, exit passthrough
+    def run_under_pty(argv, timeout=60, send=None):
+        """Run argv with a fresh pty as its controlling terminal (pty.fork
+        also makes the child a session leader, exercising the trampoline's
+        posix_spawn fallback — the hardest detachment case). `send` bytes
+        are written to the pty up front — the line discipline buffers them
+        until something in the child actually reads the terminal."""
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execv(argv[0], argv)
+        if send:
+            os.write(master, send)
+        out = b""
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                out += b"[TEST TIMEOUT]"
+                os.kill(pid, 9)
+                break
+            r, _, _ = select.select([master], [], [], remaining)
+            if not r:
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        _, status = os.waitpid(pid, 0)
+        os.close(master)
+        return out.decode(errors="replace"), status
+
+    tty_probe = 'if ( exec < /dev/tty ) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi'
+    out, _ = run_under_pty(["/bin/sh", "-c", tty_probe])
+    control_ok = "HAS_TTY" in out
+    out, _ = run_under_pty([os.path.abspath(ADA), "__setsid-exec", "--", "/bin/sh", "-c", tty_probe])
+    check("setsid-exec: child detached from controlling pty (sudo can't prompt)",
+          control_ok and "NO_TTY" in out and "HAS_TTY" not in out,
+          f"control_has_tty={control_ok} out={out[-300:]!r}")
+
+    out, status = run_under_pty([os.path.abspath(ADA), "__setsid-exec", "--", "/bin/sh", "-c", "exit 7"])
+    code = os.waitstatus_to_exitcode(status)
+    check("setsid-exec: exit code passes through", code == 7, f"exit={code} out={out[-200:]!r}")
+
+    # TerminalHandoff — the inverse contract of the trampoline: a wizard/
+    # upgrade child that MUST talk to the terminal (sudo password, apt
+    # conffile prompt) gets the foreground slot. Without the handoff,
+    # Foundation's background process group means the child's terminal read
+    # is SIGTTIN-stopped forever (the frozen Raspberry Pi apt-get bug) and
+    # this test times out instead of echoing the line back.
+    out, status = run_under_pty(
+        [os.path.abspath(ADA), "__tty-handoff-selftest"], timeout=30, send=b"hello\n")
+    code = os.waitstatus_to_exitcode(status)
+    check("tty-handoff: prompting child reads the terminal via foreground handoff",
+          "HANDOFF_GOT:hello" in out and code == 0, f"exit={code} out={out[-300:]!r}")
+
+    # Fallback-shim signal forwarding: SIGTERM to the trampoline must reach
+    # the detached child (MCP/LSP registry shutdowns terminate the tracked
+    # PID — an unforwarded signal would orphan the server in its own session).
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execv(os.path.abspath(ADA),
+                 [os.path.abspath(ADA), "__setsid-exec", "--", "/bin/sleep", "300"])
+    time.sleep(1.5)
+    kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
+                          text=True).stdout.split()
+    os.kill(pid, 15)
+    deadline = time.time() + 10
+    reaped = False
+    while time.time() < deadline:
+        rp, status = os.waitpid(pid, os.WNOHANG)
+        if rp:
+            reaped = True
+            break
+        time.sleep(0.2)
+    child_dead = True
+    for k in kids:
+        try:
+            os.kill(int(k), 0)
+            child_dead = False
+            os.kill(int(k), 9)
+        except ProcessLookupError:
+            pass
+    if not reaped:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+    os.close(master)
+    check("setsid-exec: SIGTERM to shim forwarded to detached child",
+          reaped and child_dead and len(kids) == 1,
+          f"reaped={reaped} child_dead={child_dead} kids={kids}")
+
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
