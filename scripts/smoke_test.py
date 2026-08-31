@@ -218,6 +218,16 @@ def main():
     check("toolchain-selftest", result.returncode == 0,
           (result.stdout + result.stderr)[-1500:])
 
+    # 3c1c. identity-migration engine (RENAME_PLAN Stage 3): journaled
+    # capture/move/fixups/commit transaction with typed preimages and
+    # parking, real crash injection after every destructive sub-step,
+    # byte-identical rollback, park-restoring rollback, corruption refusal,
+    # service-state matrix, preferences-domain copy, diagnostics
+    # no-mutation battery. Self-isolates into a temp root + fake systemctl.
+    result = subprocess.run([ADA, "__migration-selftest"], capture_output=True, text=True, timeout=600)
+    check("migration-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
     # 3c2. watcher triage machinery (WATCHER_TRIAGE_PLAN phase 0-4
     # deterministic layers): durable fire-outbox produce/verdict/ack and
     # crash-window dedup against the spool, per-batch verdict parsing,

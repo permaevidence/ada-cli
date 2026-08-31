@@ -1,0 +1,1769 @@
+import ArgumentParser
+import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(Glibc)
+import Glibc
+#else
+import Darwin
+#endif
+
+// MARK: - Rename-migration engine (RENAME_PLAN.md §4.3, Stage 3)
+//
+// Moves an existing installation's persisted state from one product identity
+// to another (config root, data root, landing zone, binary, resource bundle,
+// systemd unit, preferences domain, persona default) as a crash-safe
+// transaction with a byte-identical restore guarantee: after ANY failed or
+// rolled-back migration the old installation is functional and every touched
+// file matches its recorded preimage.
+//
+// The engine is deliberately identity-neutral: every path, unit name, domain
+// and persona string arrives through MigrationSpec, so the same code runs the
+// real rename later and runs hermetically against fixtures today (Stage 3 is
+// built and tested under the current identity per the plan).
+//
+// Transaction shape (journal states):
+//   prepared → moved → fixups → committing → committed → done
+//
+//   • prepared:  pre-state captured (service flags, binary hash); nothing on
+//                disk has changed yet apart from the journal itself.
+//   • moved:     the roots were rename(2)d old → new.
+//   • fixups:    path-embedding files inside and outside the moved roots are
+//                being rewritten; every modified file has a hash-recorded
+//                preimage FIRST, every created artifact an `absent` record.
+//   • committing: written durably BEFORE the first retirement sub-step. From
+//                here recovery completes forward; old assets are PARKED into
+//                the journal area (content, type, mode preserved), never
+//                deleted.
+//   • committed: retirement finished; post-commit verification pending.
+//   • done:      verification passed; cleanup (parked/preimages/journal
+//                deletion) is the only remaining work and costs nothing but
+//                disk if interrupted.
+//
+// Recovery semantics by state (plan §4.3.6): before `committing` recovery may
+// roll back (or complete forward when intact); at or after `committing` it
+// deterministically completes forward — unless forward completion is
+// impossible AND the parked assets verify intact, in which case a defined
+// park-restoring rollback runs. A `committed`/`done` journal always reruns
+// post-commit verification before any cleanup.
+
+struct MigrationSpec: Codable, Equatable {
+    // Roots moved by rename(2). Old and new must live on one filesystem.
+    var oldConfigRoot: String
+    var newConfigRoot: String
+    var oldDataRoot: String
+    var newDataRoot: String
+    var oldLandingZone: String?
+    var newLandingZone: String?
+
+    // The installed product binary and its SwiftPM resource bundle.
+    var oldBinary: String
+    var newBinary: String
+    var oldBundle: String?
+    var newBundle: String?
+
+    // Where the agentmail broker wrapper and toolchain wrappers live.
+    var wrapperBinDir: String
+
+    // systemd user unit management. `systemctl` nil ⇒ no unit management on
+    // this host (macOS): capture records not-installed and unit steps no-op.
+    var unitDir: String?
+    var oldUnitName: String?
+    var newUnitName: String?
+    var newUnitText: String?
+    var systemctl: String?
+
+    // Bounded health probe (plan §4.3.5b): argv that must exit 0 against the
+    // NEW identity before anything old is retired.
+    var healthProbe: [String]
+    var healthProbeTimeout: Double?
+
+    // Journal home — must sit OUTSIDE every old and every moved root.
+    var stateDir: String
+
+    // Persona rewrite: applied only when the stored assistant name is
+    // EXACTLY personaOldName (plan §4.5.1).
+    var personaOldName: String
+    var personaNewName: String
+    var personaMarkerName: String?
+
+    // UserDefaults domain copy (plan §4.5.8). Domain names, not paths — the
+    // copy goes through the persistent-domain API on both platforms.
+    var oldPrefsDomain: String?
+    var newPrefsDomain: String?
+
+    // Detection markers for wrapper ownership and in-flight upgrades.
+    var toolchainWrapperMarker: String?
+    var agentmailWrapperName: String?
+    var upgradeMarkerNames: [String]?
+
+    // The command doctor tells the user to run for recovery.
+    var recoveryCommand: String?
+
+    var probeTimeout: Double { healthProbeTimeout ?? 60 }
+    var markerName: String { personaMarkerName ?? "migrated_from_ada.json" }
+    var toolchainMarker: String { toolchainWrapperMarker ?? UserdataToolchain.wrapperMarker }
+    var agentmailName: String { agentmailWrapperName ?? "agentmail" }
+    var upgradeMarkers: [String] {
+        upgradeMarkerNames ?? [".ada-upgrade-staged-bin", ".ada-upgrade-staged-bundle"]
+    }
+    var recoveryHint: String { recoveryCommand ?? "migrate" }
+
+    /// Root pairs in move order. Only pairs whose old side exists at run
+    /// time are moved; the journal records what was found.
+    var rootPairs: [(old: String, new: String)] {
+        var pairs = [(oldConfigRoot, newConfigRoot), (oldDataRoot, newDataRoot)]
+        if let ol = oldLandingZone, let nl = newLandingZone { pairs.append((ol, nl)) }
+        return pairs
+    }
+}
+
+struct MigrationJournal: Codable {
+    var schema: Int
+    var state: String
+    var createdAt: String
+    var spec: MigrationSpec
+
+    struct UnitCapture: Codable {
+        var name: String
+        var unitPath: String
+        var installed: Bool
+        var enabled: Bool
+        var active: Bool
+    }
+    var oldService: UnitCapture?
+    var stoppedOldService: Bool
+
+    var oldBinaryExists: Bool
+    var oldBinaryIsSymlink: Bool
+    var oldBinarySymlinkTarget: String?
+    var oldBinarySHA256: String?
+
+    struct RootMove: Codable {
+        var old: String
+        var new: String
+        var existed: Bool
+        var moved: Bool
+    }
+    var roots: [RootMove]
+
+    /// Typed preimage manifest (plan v6 correction 4). `file` carries bytes
+    /// under preimages/<id> plus metadata; `symlink` records the target and
+    /// is restored as a symlink, never dereferenced; `absent` marks a path
+    /// the migration CREATED — rollback must delete it. The two prefs types
+    /// cover the UserDefaults domain copy: `prefs-old-domain` stores the
+    /// exported old domain (re-imported by a park-restoring rollback after
+    /// retirement removed it), `prefs-new-domain` marks the created domain
+    /// for deletion on rollback.
+    struct Preimage: Codable {
+        var id: String
+        var type: String   // "file" | "symlink" | "absent" | "prefs-old-domain" | "prefs-new-domain"
+        var path: String   // filesystem path, or the domain name for prefs types
+        var sha256: String?
+        var mode: Int?
+        var uid: Int?
+        var target: String?
+    }
+    var preimages: [Preimage]
+
+    /// Retired assets moved (never deleted) into parked/ at ≥ committing.
+    struct Parked: Codable {
+        var id: String
+        var originalPath: String
+        var kind: String   // "file" | "directory" | "symlink"
+        var sha256: String?
+        var mode: Int?
+        var target: String?
+    }
+    var parked: [Parked]
+
+    var fixupsDone: [String]
+    var newUnitInstalled: Bool
+    var newUnitEnabled: Bool
+    var startedNewUnit: Bool
+    var symlinkCreated: Bool
+    /// §4.6: the file at oldBinary did not hash-match the capture — it was
+    /// left untouched and no compat symlink was created.
+    var binaryParkSkipped: Bool
+    var warnings: [String]
+}
+
+enum MigrationOutcome {
+    case ok(notes: [String])
+    /// Pre-conditions not met; nothing was changed (or everything was
+    /// restored). Safe to retry after addressing the reason.
+    case refused(String)
+    /// The journal (or its recorded paths) failed validation. Nothing was
+    /// touched; the message says exactly what was found.
+    case corrupt(String)
+    /// The migration failed. The message states whether the old install was
+    /// restored (rollback) or everything was held in place for recovery.
+    case failed(String)
+}
+
+enum MigrationMode: String {
+    case auto      // forward by default; rollback only when forward fails
+    case rollback  // explicit rollback request (honored only before committing)
+}
+
+final class MigrationEngine {
+    let spec: MigrationSpec
+    let mode: MigrationMode
+    let log: (String) -> Void
+    let fm = FileManager.default
+    var journal: MigrationJournal
+    var notes: [String] = []
+
+    var stateDirURL: URL { URL(fileURLWithPath: spec.stateDir) }
+    var journalURL: URL { stateDirURL.appendingPathComponent("journal.json") }
+    var preimagesDir: URL { stateDirURL.appendingPathComponent("preimages") }
+    var parkedDir: URL { stateDirURL.appendingPathComponent("parked") }
+
+    struct EngineError: Error { let outcome: MigrationOutcome }
+
+    // ------------------------------------------------------------ entry
+
+    static func run(spec: MigrationSpec, mode: MigrationMode,
+                    log: @escaping (String) -> Void) -> MigrationOutcome {
+        if let why = validateSpec(spec) { return .refused(why) }
+        let journalPath = URL(fileURLWithPath: spec.stateDir)
+            .appendingPathComponent("journal.json")
+        if FileManager.default.fileExists(atPath: journalPath.path) {
+            switch loadJournal(spec: spec) {
+            case .failure(let why): return .corrupt(why.message)
+            case .success(let journal):
+                let engine = MigrationEngine(spec: spec, mode: mode, journal: journal, log: log)
+                return engine.recover()
+            }
+        }
+        let engine = MigrationEngine(spec: spec, mode: mode,
+                                     journal: freshJournal(spec: spec), log: log)
+        return engine.fresh()
+    }
+
+    private init(spec: MigrationSpec, mode: MigrationMode,
+                 journal: MigrationJournal, log: @escaping (String) -> Void) {
+        self.spec = spec
+        self.mode = mode
+        self.journal = journal
+        self.log = log
+    }
+
+    // ---------------------------------------------------- read-only APIs
+
+    struct DetectionStatus {
+        var oldRootsPresent: [String]
+        var newRootsPresent: [String]
+        var journalState: String?
+        var migrationNeeded: Bool {
+            !oldRootsPresent.isEmpty || journalState != nil
+        }
+    }
+
+    /// Strictly read-only (plan §4.2): consulted by diagnostic commands,
+    /// performs zero filesystem writes.
+    static func detect(spec: MigrationSpec) -> DetectionStatus {
+        let fm = FileManager.default
+        var old: [String] = []
+        var new: [String] = []
+        for pair in spec.rootPairs {
+            if fm.fileExists(atPath: pair.old) { old.append(pair.old) }
+            if fm.fileExists(atPath: pair.new) { new.append(pair.new) }
+        }
+        let journalPath = URL(fileURLWithPath: spec.stateDir)
+            .appendingPathComponent("journal.json")
+        var state: String? = nil
+        if let data = try? Data(contentsOf: journalPath),
+           let parsed = try? JSONDecoder().decode(MigrationJournal.self, from: data) {
+            state = parsed.state
+        } else if fm.fileExists(atPath: journalPath.path) {
+            state = "unreadable"
+        }
+        return DetectionStatus(oldRootsPresent: old, newRootsPresent: new,
+                               journalState: state)
+    }
+
+    /// doctor's view (plan §4.3): reports the journal state and prints the
+    /// recovery command. Never mutates, never prompts.
+    static func doctorReport(spec: MigrationSpec) -> String? {
+        let status = detect(spec: spec)
+        guard let state = status.journalState else { return nil }
+        return "an interrupted identity migration was found (journal state: \(state)) — "
+            + "run `\(spec.recoveryHint)` to recover; nothing is changed until you do"
+    }
+
+    // ------------------------------------------------------- validation
+
+    static func validateSpec(_ spec: MigrationSpec) -> String? {
+        var all: [String] = [spec.oldConfigRoot, spec.newConfigRoot,
+                             spec.oldDataRoot, spec.newDataRoot,
+                             spec.oldBinary, spec.newBinary,
+                             spec.wrapperBinDir, spec.stateDir]
+        all += [spec.oldLandingZone, spec.newLandingZone, spec.oldBundle,
+                spec.newBundle, spec.unitDir].compactMap { $0 }
+        for path in all {
+            guard path.hasPrefix("/"), !path.split(separator: "/").contains("..") else {
+                return "spec path is not an absolute, traversal-free path: \(path)"
+            }
+        }
+        for pair in spec.rootPairs where pair.old == pair.new {
+            return "old and new root are the same path: \(pair.old)"
+        }
+        // The journal must survive every root move and every rollback — it
+        // cannot live inside anything it protects (plan §4.3 journal
+        // protocol).
+        let state = spec.stateDir.hasSuffix("/") ? spec.stateDir : spec.stateDir + "/"
+        for root in spec.rootPairs.flatMap({ [$0.old, $0.new] }) {
+            let prefixed = root.hasSuffix("/") ? root : root + "/"
+            if state.hasPrefix(prefixed) {
+                return "the journal directory \(spec.stateDir) lies inside the root \(root) — it must be outside every moved root"
+            }
+        }
+        if spec.healthProbe.isEmpty {
+            return "spec has no health probe command"
+        }
+        return nil
+    }
+
+    /// Journal load with corruption refusal (plan §4.3): unknown schema,
+    /// parse failure, spec mismatch with the invoking spec, or any recorded
+    /// path outside the expected per-user locations refuses — nothing is
+    /// guessed or repaired.
+    struct LoadFailure: Error { let message: String }
+
+    static func loadJournal(spec: MigrationSpec) -> Result<MigrationJournal, LoadFailure> {
+        let url = URL(fileURLWithPath: spec.stateDir).appendingPathComponent("journal.json")
+        guard let data = try? Data(contentsOf: url) else {
+            return .failure(LoadFailure(message: "the migration journal at \(url.path) exists but cannot be read"))
+        }
+        guard let journal = try? JSONDecoder().decode(MigrationJournal.self, from: data) else {
+            return .failure(LoadFailure(message: "the migration journal at \(url.path) is not parseable — refusing to act on it. "
+                + "Inspect it manually; if it is damaged beyond repair and you are certain no migration "
+                + "is in flight, delete the directory \(spec.stateDir) to start over"))
+        }
+        guard journal.schema == 1 else {
+            return .failure(LoadFailure(message: "the migration journal has unknown schema \(journal.schema) — refusing to act on it"))
+        }
+        guard journal.spec == spec else {
+            return .failure(LoadFailure(message: "the migration journal was written for a different spec (paths differ) — refusing to act on it"))
+        }
+        let states = ["prepared", "moved", "fixups", "committing", "committed", "done"]
+        guard states.contains(journal.state) else {
+            return .failure(LoadFailure(message: "the migration journal has unknown state \"\(journal.state)\" — refusing to act on it"))
+        }
+        // Every recorded path must sit under a location the spec names.
+        var allowed = spec.rootPairs.flatMap { [$0.old, $0.new] }
+        allowed += [spec.wrapperBinDir, spec.stateDir,
+                    (spec.oldBinary as NSString).deletingLastPathComponent,
+                    (spec.newBinary as NSString).deletingLastPathComponent]
+        allowed += [spec.unitDir, spec.oldBundle, spec.newBundle].compactMap { $0 }
+        func allowedPath(_ path: String) -> Bool {
+            guard path.hasPrefix("/"), !path.split(separator: "/").contains("..") else {
+                return false
+            }
+            return allowed.contains { root in
+                path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+            }
+        }
+        for pre in journal.preimages where !pre.type.hasPrefix("prefs-") {
+            guard allowedPath(pre.path) else {
+                return .failure(LoadFailure(message: "the migration journal records a path outside the expected locations "
+                    + "(\(pre.path)) — refusing to act on it"))
+            }
+        }
+        for pre in journal.preimages where pre.type.hasPrefix("prefs-") {
+            guard pre.path == spec.oldPrefsDomain || pre.path == spec.newPrefsDomain else {
+                return .failure(LoadFailure(message: "the migration journal records an unexpected preferences domain "
+                    + "(\(pre.path)) — refusing to act on it"))
+            }
+        }
+        for parked in journal.parked {
+            guard allowedPath(parked.originalPath) else {
+                return .failure(LoadFailure(message: "the migration journal records a parked asset outside the expected "
+                    + "locations (\(parked.originalPath)) — refusing to act on it"))
+            }
+        }
+        for root in journal.roots {
+            guard allowedPath(root.old), allowedPath(root.new) else {
+                return .failure(LoadFailure(message: "the migration journal records a root outside the expected locations — refusing to act on it"))
+            }
+        }
+        return .success(journal)
+    }
+
+    static func freshJournal(spec: MigrationSpec) -> MigrationJournal {
+        MigrationJournal(
+            schema: 1, state: "prepared",
+            createdAt: ISO8601DateFormatter().string(from: Date()),
+            spec: spec, oldService: nil, stoppedOldService: false,
+            oldBinaryExists: false, oldBinaryIsSymlink: false,
+            oldBinarySymlinkTarget: nil, oldBinarySHA256: nil,
+            roots: [], preimages: [], parked: [], fixupsDone: [],
+            newUnitInstalled: false, newUnitEnabled: false,
+            startedNewUnit: false, symlinkCreated: false,
+            binaryParkSkipped: false, warnings: [])
+    }
+
+    /// Resolve the default journal home from the environment:
+    /// `$XDG_STATE_HOME/<name>`, default `~/.local/state/<name>`.
+    static func defaultStateDir(name: String,
+                                environment: [String: String] = ProcessInfo.processInfo.environment)
+        -> URL {
+        let base: URL
+        if let xdg = environment["XDG_STATE_HOME"], !xdg.isEmpty {
+            base = URL(fileURLWithPath: xdg, isDirectory: true)
+        } else {
+            base = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".local/state", isDirectory: true)
+        }
+        return base.appendingPathComponent(name, isDirectory: true)
+    }
+
+    // ----------------------------------------------------- crash seams
+
+    /// Test-only crash injection: a REAL process death (no defers, no
+    /// cleanup) at named points after every destructive sub-step, driven by
+    /// the selftest through subprocess runs.
+    static func crashPoint(_ name: String) {
+        if ProcessInfo.processInfo.environment["ADA_MIGRATE_CRASH_POINT"] == name {
+            FileHandle.standardError.write(Data("injected crash at \(name)\n".utf8))
+            _exit(137)
+        }
+    }
+
+    // --------------------------------------------------- durable writes
+
+    static func fsyncPath(_ url: URL) -> String? {
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else {
+            return "could not open \(url.path) for fsync: \(String(cString: strerror(errno)))"
+        }
+        let rc = fsync(fd)
+        close(fd)
+        guard rc == 0 else {
+            return "fsync failed for \(url.path): \(String(cString: strerror(errno)))"
+        }
+        return nil
+    }
+
+    /// temp file → fsync(file) → rename(2) → fsync(directory). The journal
+    /// and every fixup modification ride on this.
+    @discardableResult
+    static func writeDurable(_ data: Data, to url: URL) -> String? {
+        let fm = FileManager.default
+        let dir = url.deletingLastPathComponent()
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            return "could not create \(dir.path): \(error.localizedDescription)"
+        }
+        let tmp = dir.appendingPathComponent(".migrate-tmp-\(UUID().uuidString)")
+        do { try data.write(to: tmp) } catch {
+            return "could not write \(tmp.path): \(error.localizedDescription)"
+        }
+        if let why = fsyncPath(tmp) {
+            try? fm.removeItem(at: tmp)
+            return why
+        }
+        guard rename(tmp.path, url.path) == 0 else {
+            let why = String(cString: strerror(errno))
+            try? fm.removeItem(at: tmp)
+            return "could not move \(tmp.lastPathComponent) into place at \(url.path): \(why)"
+        }
+        return fsyncPath(dir)
+    }
+
+    func persistJournal() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(journal)
+        if let why = Self.writeDurable(data, to: journalURL) {
+            throw EngineError(outcome: .failed("could not persist the migration journal: \(why)"))
+        }
+    }
+
+    func setState(_ state: String) throws {
+        journal.state = state
+        try persistJournal()
+    }
+
+    // ---------------------------------------------------------- hashing
+
+    static func sha256(of data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func sha256(ofFile url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return sha256(of: data)
+    }
+
+    /// Deterministic recursive hash of a directory tree: sorted relative
+    /// paths with per-entry type, mode and content hash. Used to verify
+    /// parked bundles byte-for-byte before a park-restoring rollback.
+    static func treeHash(of root: URL) -> String? {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: root,
+                                             includingPropertiesForKeys: nil,
+                                             options: []) else { return nil }
+        var entries: [String] = []
+        for case let url as URL in enumerator {
+            let rel = url.path.dropFirst(root.path.count)
+            var st = stat()
+            guard lstat(url.path, &st) == 0 else { return nil }
+            let mode = st.st_mode & 0o7777
+            if (st.st_mode & S_IFMT) == S_IFLNK {
+                guard let target = try? fm.destinationOfSymbolicLink(atPath: url.path) else {
+                    return nil
+                }
+                entries.append("\(rel)|link|\(target)")
+            } else if (st.st_mode & S_IFMT) == S_IFDIR {
+                entries.append("\(rel)|dir|\(String(mode, radix: 8))")
+            } else {
+                guard let hash = sha256(ofFile: url) else { return nil }
+                entries.append("\(rel)|file|\(String(mode, radix: 8))|\(hash)")
+            }
+        }
+        return sha256(of: Data(entries.sorted().joined(separator: "\n").utf8))
+    }
+
+    static func fileMode(_ path: String) -> Int? {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return nil }
+        return Int(st.st_mode & 0o7777)
+    }
+
+    // ------------------------------------------------------ subprocesses
+
+    struct RunResult {
+        let exitCode: Int32
+        let output: String
+        var tail: String {
+            output.count <= 400 ? output : "…" + output.suffix(400)
+        }
+    }
+
+    /// Bounded, non-interactive subprocess: stdin from /dev/null, output to
+    /// a temp FILE, SIGKILL past the deadline. Deliberately posix_spawn +
+    /// waitpid(WNOHANG), not Foundation Process: on Linux, corelibs detects
+    /// child exit through an inherited socketpair, and a daemonized
+    /// grandchild (exactly what `systemctl start` leaves behind) keeps that
+    /// socketpair open past the child's exit — the parent then never sees
+    /// the exit (the orphan-hostage trap from the Bash-streaming arc,
+    /// reference_corelibs_process_pipes_linux). waitpid reports the direct
+    /// child's real exit immediately, grandchildren notwithstanding; the
+    /// file-backed output likewise cannot be held hostage the way pipe EOF
+    /// can.
+    static func runBounded(_ argv: [String], timeout: Double,
+                           extraEnv: [String: String] = [:]) -> RunResult {
+        guard let exe = argv.first, exe.hasPrefix("/") else {
+            return RunResult(exitCode: 127, output: "argv[0] must be an absolute path")
+        }
+        let fm = FileManager.default
+        let outURL = fm.temporaryDirectory
+            .appendingPathComponent("migrate-out-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: outURL) }
+
+        var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
+        cargs.append(nil)
+        defer { for arg in cargs { free(arg) } }
+        var environment = ProcessInfo.processInfo.environment
+        for (key, value) in extraEnv { environment[key] = value }
+        var cenv: [UnsafeMutablePointer<CChar>?] = environment.map { strdup("\($0.key)=\($0.value)") }
+        cenv.append(nil)
+        defer { for entry in cenv { free(entry) } }
+
+        #if os(Linux)
+        var fileActions = posix_spawn_file_actions_t()
+        #else
+        var fileActions: posix_spawn_file_actions_t? = nil
+        #endif
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        posix_spawn_file_actions_addopen(&fileActions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addopen(&fileActions, 1, outURL.path,
+                                         O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        posix_spawn_file_actions_adddup2(&fileActions, 1, 2)
+
+        var pid: pid_t = 0
+        let rc = posix_spawn(&pid, exe, &fileActions, nil, cargs, cenv)
+        guard rc == 0 else {
+            return RunResult(exitCode: 127, output: "\(exe): \(String(cString: strerror(rc)))")
+        }
+        var status: Int32 = 0
+        var timedOut = false
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let waited = waitpid(pid, &status, WNOHANG)
+            if waited == pid { break }
+            if waited == -1 && errno != EINTR { break }
+            if Date() >= deadline {
+                timedOut = true
+                kill(pid, SIGKILL)
+                while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        let text = (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
+        if timedOut {
+            return RunResult(exitCode: 124, output: text + "\n(timed out after \(Int(timeout))s)")
+        }
+        let signum = status & 0x7f
+        let code: Int32 = signum != 0 ? 128 + signum : (status >> 8) & 0xff
+        return RunResult(exitCode: code, output: text)
+    }
+
+    func systemctl(_ args: [String]) -> RunResult {
+        guard let path = spec.systemctl else {
+            return RunResult(exitCode: 0, output: "")
+        }
+        return Self.runBounded([path, "--user"] + args, timeout: 60)
+    }
+
+    var unitManaged: Bool { spec.systemctl != nil && spec.unitDir != nil
+        && spec.oldUnitName != nil && spec.newUnitName != nil }
+    var oldUnitPath: String? {
+        guard let dir = spec.unitDir, let name = spec.oldUnitName else { return nil }
+        return dir + "/" + name
+    }
+    var newUnitPath: String? {
+        guard let dir = spec.unitDir, let name = spec.newUnitName else { return nil }
+        return dir + "/" + name
+    }
+
+    // ---------------------------------------------------------- locking
+
+    /// Is the flock at `path` held by someone else? Probes with LOCK_NB and
+    /// releases immediately when it succeeds — never keeps the lock.
+    static func lockHeld(_ path: String) -> Bool {
+        let fd = open(path, O_RDWR)
+        guard fd >= 0 else { return false }   // no lock file ⇒ not held
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            flock(fd, LOCK_UN)
+            return false
+        }
+        return true
+    }
+
+    // ============================================================ fresh
+
+    func fresh() -> MigrationOutcome {
+        do {
+            // Detection: nothing to do is a clean no-op, with zero writes.
+            let existing = spec.rootPairs.filter { fm.fileExists(atPath: $0.old) }
+            if existing.isEmpty {
+                return .ok(notes: ["nothing to migrate — no old roots present"])
+            }
+            // Refusals that must not leave a journal behind.
+            for pair in existing where fm.fileExists(atPath: pair.new) {
+                return .refused("the new root \(pair.new) already exists while \(pair.old) is still present. "
+                    + "A previous partial attempt would have left a journal (none was found), so this "
+                    + "directory was not created by a migration — move it aside, then retry")
+            }
+            let binDir = (spec.oldBinary as NSString).deletingLastPathComponent
+            for marker in spec.upgradeMarkers {
+                if fm.fileExists(atPath: binDir + "/" + marker) {
+                    return .refused("an in-flight upgrade left staged files (\(marker) in \(binDir)) — "
+                        + "finish or clean up that upgrade first, then retry")
+                }
+            }
+            guard fm.fileExists(atPath: spec.newBinary) else {
+                return .refused("the new binary \(spec.newBinary) is not installed — install it first")
+            }
+
+            // 1. Capture (plan §4.3 step 1).
+            try fm.createDirectory(at: stateDirURL, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            try fm.createDirectory(at: preimagesDir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: parkedDir, withIntermediateDirectories: true)
+            try capture(existingRoots: existing)
+            Self.crashPoint("after-prepared")
+
+            // 2. Stop what we manage; refuse an unmanaged holder.
+            if let refusal = try stopManagedAndCheckLock() {
+                try restoreServiceAfterRefusal()
+                cleanupJournalArea()
+                return .refused(refusal)
+            }
+
+            // 3–5. Move, fix up, commit.
+            try moveRoots()
+            try runFixups()
+            Self.crashPoint("after-fixups")
+            try commit()
+            return .ok(notes: notes + journal.warnings.map { "⚠ " + $0 })
+        } catch let error as EngineError {
+            return error.outcome
+        } catch {
+            // Unexpected failure mid-transaction: state decides what recovery
+            // can do; roll back now when we are still before committing.
+            return handleMidTransactionFailure("unexpected error: \(error.localizedDescription)")
+        }
+    }
+
+    func capture(existingRoots: [(old: String, new: String)]) throws {
+        if unitManaged, let unitPath = oldUnitPath, let unitName = spec.oldUnitName {
+            let installed = fm.fileExists(atPath: unitPath)
+            var enabled = false
+            var active = false
+            if installed {
+                enabled = systemctl(["is-enabled", unitName]).output
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == "enabled"
+                active = systemctl(["is-active", unitName]).output
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+            }
+            journal.oldService = MigrationJournal.UnitCapture(
+                name: unitName, unitPath: unitPath,
+                installed: installed, enabled: enabled, active: active)
+        }
+        var st = stat()
+        if lstat(spec.oldBinary, &st) == 0 {
+            journal.oldBinaryExists = true
+            if (st.st_mode & S_IFMT) == S_IFLNK {
+                journal.oldBinaryIsSymlink = true
+                journal.oldBinarySymlinkTarget =
+                    try? fm.destinationOfSymbolicLink(atPath: spec.oldBinary)
+            }
+            journal.oldBinarySHA256 = Self.sha256(ofFile: URL(fileURLWithPath: spec.oldBinary))
+        }
+        journal.roots = spec.rootPairs.map { pair in
+            MigrationJournal.RootMove(old: pair.old, new: pair.new,
+                                      existed: fm.fileExists(atPath: pair.old),
+                                      moved: false)
+        }
+        try persistJournal()
+        log("captured pre-state (journal at \(journalURL.path))")
+    }
+
+    /// Returns a refusal reason, or nil to proceed. Only the MANAGED unit is
+    /// ever stopped; an unmanaged process holding the instance lock is the
+    /// user's to stop (plan §4.3 step 2).
+    func stopManagedAndCheckLock() throws -> String? {
+        if let service = journal.oldService, service.installed, service.active {
+            let stop = systemctl(["stop", service.name])
+            guard stop.exitCode == 0 else {
+                return "could not stop the managed service \(service.name): \(stop.tail)"
+            }
+            journal.stoppedOldService = true
+            try persistJournal()
+            log("stopped \(service.name)")
+        }
+        let lockPath = spec.oldDataRoot + "/instance.lock"
+        if Self.lockHeld(lockPath) {
+            return "an unmanaged process is still running against \(spec.oldDataRoot) "
+                + "(instance.lock is held). Quit it (a terminal chat session, or a manually "
+                + "started daemon), then retry"
+        }
+        return nil
+    }
+
+    func restoreServiceAfterRefusal() throws {
+        if journal.stoppedOldService, let service = journal.oldService, service.active {
+            _ = systemctl(["start", service.name])
+            log("restarted \(service.name) after refusal")
+        }
+    }
+
+    /// Refusal before anything moved: the journal area must not linger — a
+    /// leftover journal would make the next run enter recovery for a
+    /// migration that never started.
+    func cleanupJournalArea() {
+        try? fm.removeItem(at: stateDirURL)
+    }
+
+    func moveRoots() throws {
+        var firstMoveDone = false
+        for index in journal.roots.indices where journal.roots[index].existed {
+            let root = journal.roots[index]
+            guard !root.moved else { continue }
+            // Disk reconciliation for recovery re-entry: a crash between the
+            // rename and the journal write leaves moved=false with the move
+            // already done on disk.
+            if !fm.fileExists(atPath: root.old), fm.fileExists(atPath: root.new) {
+                journal.roots[index].moved = true
+                try persistJournal()
+                continue
+            }
+            let parent = (root.new as NSString).deletingLastPathComponent
+            try fm.createDirectory(atPath: parent, withIntermediateDirectories: true)
+            guard rename(root.old, root.new) == 0 else {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "could not move \(root.old) → \(root.new): \(String(cString: strerror(errno)))"))
+            }
+            _ = Self.fsyncPath(URL(fileURLWithPath: parent))
+            _ = Self.fsyncPath(URL(fileURLWithPath: (root.old as NSString).deletingLastPathComponent))
+            journal.roots[index].moved = true
+            try persistJournal()
+            log("moved \(root.old) → \(root.new)")
+            if firstMoveDone == false {
+                firstMoveDone = true
+                Self.crashPoint("between-root-moves")
+            }
+        }
+        try setState("moved")
+        Self.crashPoint("after-moved")
+    }
+
+    // =========================================================== fixups
+
+    func newPreimageID() -> String {
+        String(format: "pre-%04d", journal.preimages.count)
+    }
+
+    /// Record a file's typed preimage BEFORE modifying it: bytes copied into
+    /// preimages/ and fsynced, then the manifest entry persisted. Idempotent
+    /// per path — the first recorded preimage (the true original) wins.
+    func recordFilePreimage(_ path: String) throws {
+        if journal.preimages.contains(where: { $0.path == path && $0.type != "absent" }) {
+            return
+        }
+        var st = stat()
+        guard lstat(path, &st) == 0 else {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "cannot stat \(path) for its preimage"))
+        }
+        let id = newPreimageID()
+        if (st.st_mode & S_IFMT) == S_IFLNK {
+            let target = try fm.destinationOfSymbolicLink(atPath: path)
+            journal.preimages.append(MigrationJournal.Preimage(
+                id: id, type: "symlink", path: path, sha256: nil,
+                mode: nil, uid: Int(st.st_uid), target: target))
+        } else {
+            let url = URL(fileURLWithPath: path)
+            guard let data = try? Data(contentsOf: url) else {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "cannot read \(path) for its preimage"))
+            }
+            let copy = preimagesDir.appendingPathComponent(id)
+            if let why = Self.writeDurable(data, to: copy) {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "cannot store the preimage of \(path): \(why)"))
+            }
+            journal.preimages.append(MigrationJournal.Preimage(
+                id: id, type: "file", path: path, sha256: Self.sha256(of: data),
+                mode: Int(st.st_mode & 0o7777), uid: Int(st.st_uid), target: nil))
+        }
+        try persistJournal()
+    }
+
+    /// Record a path the migration is ABOUT to create: rollback deletes it.
+    func recordAbsent(_ path: String) throws {
+        if journal.preimages.contains(where: { $0.path == path }) { return }
+        journal.preimages.append(MigrationJournal.Preimage(
+            id: newPreimageID(), type: "absent", path: path, sha256: nil,
+            mode: nil, uid: nil, target: nil))
+        try persistJournal()
+    }
+
+    /// Fixup modification: staged copy + fsync + atomic rename, preserving
+    /// the original mode.
+    func stagedWrite(_ data: Data, to path: String, mode: Int?) throws {
+        if let why = Self.writeDurable(data, to: URL(fileURLWithPath: path)) {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "could not write \(path): \(why)"))
+        }
+        if let mode {
+            try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: path)
+        }
+    }
+
+    func runFixups() throws {
+        try setState("fixups")
+        try fixup("persona") { try self.fixupPersona() }
+        Self.crashPoint("mid-fixups")
+        try fixup("persona-marker") { try self.fixupPersonaMarker() }
+        try fixup("agentmail-wrapper") { try self.fixupAgentmailWrapper() }
+        try fixup("reminders-rebase") { try self.fixupRemindersRebase() }
+        try fixup("toolchain-rebase") { try self.fixupToolchainRebase() }
+        try fixup("preferences") { try self.fixupPreferences() }
+    }
+
+    func fixup(_ name: String, _ body: () throws -> Void) throws {
+        guard !journal.fixupsDone.contains(name) else { return }
+        try body()
+        journal.fixupsDone.append(name)
+        try persistJournal()
+    }
+
+    /// Plan §4.5.1: rewrite the stored assistant name ONLY when it is
+    /// exactly personaOldName; any other value — custom names, deliberate
+    /// case variants — is preserved verbatim.
+    func fixupPersona() throws {
+        let path = spec.newConfigRoot + "/secrets.json"
+        guard fm.fileExists(atPath: path) else {
+            notes.append("no secrets.json — persona fixup skipped")
+            return
+        }
+        let mode = Self.fileMode(path)
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "secrets.json is not readable JSON — refusing to modify it"))
+        }
+        guard let stored = object["assistant_name"] as? String,
+              stored == spec.personaOldName else { return }
+        try recordFilePreimage(path)
+        object["assistant_name"] = spec.personaNewName
+        let out = try JSONSerialization.data(withJSONObject: object,
+                                             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try stagedWrite(out, to: path, mode: mode)
+        notes.append("assistant name \(spec.personaOldName) → \(spec.personaNewName)")
+    }
+
+    /// Plan §4.5.6: the durable persona-migration marker lives in the new
+    /// data root, OUTSIDE the journal, and survives journal deletion.
+    func fixupPersonaMarker() throws {
+        let path = spec.newDataRoot + "/" + spec.markerName
+        guard !fm.fileExists(atPath: path) else { return }
+        var prior: String? = nil
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: spec.newConfigRoot + "/secrets.json")),
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            prior = object["assistant_name"] as? String
+        }
+        try recordAbsent(path)
+        let marker: [String: Any] = [
+            "migratedAt": ISO8601DateFormatter().string(from: Date()),
+            "priorName": spec.personaOldName,
+            "storedNameAtMigration": prior ?? spec.personaOldName,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: marker,
+                                              options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try stagedWrite(data, to: path, mode: 0o600)
+    }
+
+    /// Plan §4.5.2: the broker wrapper embeds the absolute old binary path.
+    /// Regenerated (path-rebased) only when it is OURS — identified by the
+    /// hidden broker subcommand it calls.
+    func fixupAgentmailWrapper() throws {
+        let path = spec.wrapperBinDir + "/" + spec.agentmailName
+        guard fm.fileExists(atPath: path),
+              let text = try? String(contentsOfFile: path, encoding: .utf8),
+              text.contains("__agentmail-key"),
+              text.contains(spec.oldBinary) else { return }
+        let mode = Self.fileMode(path)
+        try recordFilePreimage(path)
+        let rebased = text.replacingOccurrences(of: spec.oldBinary, with: spec.newBinary)
+        try stagedWrite(Data(rebased.utf8), to: path, mode: mode)
+        notes.append("agentmail wrapper re-pointed at \(spec.newBinary)")
+    }
+
+    /// Plan §4.5.7: reminder rows and scripted-watcher STATE records embed
+    /// absolute old-root paths — rebased as JSON string values. Script FILE
+    /// CONTENTS are user-owned, hash-tracked material and are never edited.
+    func fixupRemindersRebase() throws {
+        var targets = [spec.newDataRoot + "/reminders.json"]
+        let stateDir = spec.newDataRoot + "/reminder-scripts/state"
+        if let entries = try? fm.contentsOfDirectory(atPath: stateDir) {
+            targets += entries.sorted().filter { $0.hasSuffix(".json") }
+                .map { stateDir + "/" + $0 }
+        }
+        for path in targets where fm.fileExists(atPath: path) {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let object = try? JSONSerialization.jsonObject(with: data) else {
+                journal.warnings.append("\(path) is not parseable JSON — left unchanged")
+                try persistJournal()
+                continue
+            }
+            let rebased = rebaseJSONValue(object)
+            let out = try JSONSerialization.data(withJSONObject: rebased.value,
+                                                 options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            guard rebased.changed else { continue }
+            let mode = Self.fileMode(path)
+            try recordFilePreimage(path)
+            try stagedWrite(out, to: path, mode: mode)
+        }
+    }
+
+    /// Recursively rebase absolute old-root prefixes inside JSON string
+    /// values (metadata only — never file contents).
+    func rebaseJSONValue(_ value: Any) -> (value: Any, changed: Bool) {
+        var pairs = [(spec.oldDataRoot, spec.newDataRoot),
+                     (spec.oldConfigRoot, spec.newConfigRoot)]
+        if let ol = spec.oldLandingZone, let nl = spec.newLandingZone {
+            pairs.append((ol, nl))
+        }
+        if let text = value as? String {
+            var out = text
+            for (old, new) in pairs {
+                if out == old || out.hasPrefix(old + "/") || out.contains(old + "/") {
+                    out = out.replacingOccurrences(of: old + "/", with: new + "/")
+                    if out == old { out = new }
+                }
+                if out == old { out = new }
+            }
+            return (out, out != text)
+        }
+        if let array = value as? [Any] {
+            var changed = false
+            let mapped = array.map { element -> Any in
+                let r = rebaseJSONValue(element)
+                if r.changed { changed = true }
+                return r.value
+            }
+            return (mapped, changed)
+        }
+        if let dict = value as? [String: Any] {
+            var changed = false
+            var mapped: [String: Any] = [:]
+            for (key, element) in dict {
+                let r = rebaseJSONValue(element)
+                if r.changed { changed = true }
+                mapped[key] = r.value
+            }
+            return (mapped, changed)
+        }
+        return (value, false)
+    }
+
+    /// Plan §4.5.9: toolchain wrappers on PATH and LibreOffice's rc files
+    /// inside the moved prefix embed the absolute old data root. Both are
+    /// path-rebased with preimages (the plan's "toolchain configuration
+    /// files"); wrapper MARKER migration stays with the toolchain code.
+    func fixupToolchainRebase() throws {
+        let marker = spec.toolchainMarker
+        if let entries = try? fm.contentsOfDirectory(atPath: spec.wrapperBinDir) {
+            for name in entries.sorted() {
+                let path = spec.wrapperBinDir + "/" + name
+                guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+                      text.contains(marker), text.contains(spec.oldDataRoot) else { continue }
+                let mode = Self.fileMode(path)
+                try recordFilePreimage(path)
+                let rebased = text.replacingOccurrences(
+                    of: spec.oldDataRoot, with: spec.newDataRoot)
+                try stagedWrite(Data(rebased.utf8), to: path, mode: mode)
+            }
+        }
+        let loProgram = spec.newDataRoot + "/toolchain/prefix/usr/lib/libreoffice/program"
+        if let entries = try? fm.contentsOfDirectory(atPath: loProgram) {
+            for name in entries.sorted() where name.hasSuffix("rc") {
+                let path = loProgram + "/" + name
+                guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+                      text.contains(spec.oldDataRoot) else { continue }
+                let mode = Self.fileMode(path)
+                try recordFilePreimage(path)
+                let rebased = text.replacingOccurrences(
+                    of: spec.oldDataRoot, with: spec.newDataRoot)
+                try stagedWrite(Data(rebased.utf8), to: path, mode: mode)
+            }
+        }
+    }
+
+    /// Plan §4.5.8: copy the complete old UserDefaults domain to the new
+    /// domain through the persistent-domain API (works identically through
+    /// cfprefsd on macOS and corelibs-foundation's file store on Linux —
+    /// deliberately no direct plist-file paths, so cache coherence is the
+    /// framework's problem, not ours). The exported old domain is the
+    /// preimage; the created new domain is rollback-deleted. The OLD domain
+    /// stays until retirement (§4.3.5c).
+    func fixupPreferences() throws {
+        guard let oldDomain = spec.oldPrefsDomain,
+              let newDomain = spec.newPrefsDomain else { return }
+        let defaults = UserDefaults.standard
+        guard let contents = defaults.persistentDomain(forName: oldDomain),
+              !contents.isEmpty else {
+            notes.append("no \(oldDomain) preferences domain — nothing to copy")
+            return
+        }
+        // Export = preimage (plan: "the exported original plist stored as
+        // the preimage") — consumed by the park-restoring rollback after
+        // retirement removes the old domain.
+        let export = try PropertyListSerialization.data(
+            fromPropertyList: contents, format: .xml, options: 0)
+        let id = newPreimageID()
+        if let why = Self.writeDurable(export, to: preimagesDir.appendingPathComponent(id)) {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "cannot export the \(oldDomain) preferences domain: \(why)"))
+        }
+        journal.preimages.append(MigrationJournal.Preimage(
+            id: id, type: "prefs-old-domain", path: oldDomain,
+            sha256: Self.sha256(of: export), mode: nil, uid: nil, target: nil))
+        journal.preimages.append(MigrationJournal.Preimage(
+            id: newPreimageID(), type: "prefs-new-domain", path: newDomain,
+            sha256: nil, mode: nil, uid: nil, target: nil))
+        try persistJournal()
+        defaults.setPersistentDomain(contents, forName: newDomain)
+        defaults.synchronize()
+        notes.append("preferences domain \(oldDomain) copied to \(newDomain)")
+    }
+
+    // =========================================================== commit
+
+    func commit() throws {
+        // 5a. Recreate the captured service topology on the new identity —
+        // installed/enabled/active as three independent flags.
+        if let service = journal.oldService, service.installed, unitManaged,
+           let newUnitPath, let newUnitName = spec.newUnitName {
+            guard let unitText = spec.newUnitText else {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "the old service is installed but the spec provides no new unit text"))
+            }
+            try recordAbsent(newUnitPath)
+            try stagedWrite(Data(unitText.utf8), to: newUnitPath, mode: 0o644)
+            journal.newUnitInstalled = true
+            try persistJournal()
+            let reload = systemctl(["daemon-reload"])
+            guard reload.exitCode == 0 else {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "daemon-reload failed after installing \(newUnitName): \(reload.tail)"))
+            }
+            if service.enabled {
+                let enable = systemctl(["enable", newUnitName])
+                guard enable.exitCode == 0 else {
+                    throw EngineError(outcome: handleMidTransactionFailure(
+                        "could not enable \(newUnitName): \(enable.tail)"))
+                }
+                journal.newUnitEnabled = true
+                try persistJournal()
+            }
+            if service.active {
+                let start = systemctl(["start", newUnitName])
+                guard start.exitCode == 0 else {
+                    throw EngineError(outcome: handleMidTransactionFailure(
+                        "could not start \(newUnitName): \(start.tail)"))
+                }
+                journal.startedNewUnit = true
+                try persistJournal()
+                log("started \(newUnitName)")
+            }
+        }
+
+        // 5b. Verify the new install actually works BEFORE retiring
+        // anything: bounded health probe, plus the new instance lock when a
+        // daemon was started.
+        let probe = Self.runBounded(spec.healthProbe, timeout: spec.probeTimeout)
+        guard probe.exitCode == 0 else {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "the new install failed its health probe (exit \(probe.exitCode)): \(probe.tail)"))
+        }
+        if journal.startedNewUnit {
+            let lockPath = spec.newDataRoot + "/instance.lock"
+            let deadline = Date().addingTimeInterval(spec.probeTimeout)
+            var held = Self.lockHeld(lockPath)
+            while !held && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.2)
+                held = Self.lockHeld(lockPath)
+            }
+            guard held else {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "the started daemon never acquired \(lockPath) — it is not actually running"))
+            }
+        }
+        log("new install verified healthy")
+
+        // 5c. The durable committing marker, then retirement by PARKING —
+        // nothing old is deleted until post-`done` cleanup (plan v6).
+        try setState("committing")
+        Self.crashPoint("after-committing-marker")
+        try retire()
+
+        // 5d/5e. Committed, verified, cleaned.
+        try setState("committed")
+        Self.crashPoint("after-committed")
+        try verifyAndCleanup()
+    }
+
+    /// Move one filesystem object into parked/ with its identity recorded.
+    /// Resumable: the record is persisted BEFORE the move, so recovery can
+    /// tell "recorded + parked present" (done) from "recorded + original
+    /// still present" (redo the move).
+    func park(_ originalPath: String, id: String) throws {
+        if let existing = journal.parked.first(where: { $0.id == id }) {
+            if fm.fileExists(atPath: parkedDir.appendingPathComponent(id).path)
+                || !fm.fileExists(atPath: existing.originalPath) {
+                return  // already parked (or original legitimately gone)
+            }
+        } else {
+            var st = stat()
+            guard lstat(originalPath, &st) == 0 else { return }
+            let kind: String
+            var hash: String? = nil
+            var target: String? = nil
+            if (st.st_mode & S_IFMT) == S_IFLNK {
+                kind = "symlink"
+                target = try? fm.destinationOfSymbolicLink(atPath: originalPath)
+            } else if (st.st_mode & S_IFMT) == S_IFDIR {
+                kind = "directory"
+                hash = Self.treeHash(of: URL(fileURLWithPath: originalPath))
+            } else {
+                kind = "file"
+                hash = Self.sha256(ofFile: URL(fileURLWithPath: originalPath))
+            }
+            journal.parked.append(MigrationJournal.Parked(
+                id: id, originalPath: originalPath, kind: kind, sha256: hash,
+                mode: Int(st.st_mode & 0o7777), target: target))
+            try persistJournal()
+        }
+        let dest = parkedDir.appendingPathComponent(id)
+        try? fm.removeItem(at: dest)
+        guard rename(originalPath, dest.path) == 0 else {
+            throw EngineError(outcome: .failed(
+                "could not park \(originalPath): \(String(cString: strerror(errno))) — "
+                + "the journal is at \(journalURL.path); re-run `\(spec.recoveryHint)` to resume"))
+        }
+        _ = Self.fsyncPath(parkedDir)
+        _ = Self.fsyncPath(URL(fileURLWithPath: (originalPath as NSString).deletingLastPathComponent))
+    }
+
+    /// Retirement sub-steps, each idempotent for forward recovery.
+    func retire() throws {
+        // Old unit: disable (reversible from captured flags), park the unit
+        // file, reload.
+        if let service = journal.oldService, service.installed, unitManaged {
+            if service.enabled, fm.fileExists(atPath: service.unitPath) {
+                _ = systemctl(["disable", service.name])
+            }
+            if fm.fileExists(atPath: service.unitPath) {
+                try park(service.unitPath, id: "unit")
+                _ = systemctl(["daemon-reload"])
+            }
+        }
+        Self.crashPoint("after-unit-retirement")
+
+        // Old binary: park ONLY a verified installation (plan §4.6) — the
+        // content hash must match the capture. Anything else stays untouched
+        // and the migration warns instead of replacing it.
+        var binaryParked = journal.parked.contains { $0.id == "binary" }
+        if !binaryParked, journal.oldBinaryExists, !journal.binaryParkSkipped {
+            var st = stat()
+            if lstat(spec.oldBinary, &st) == 0 {
+                let isLink = (st.st_mode & S_IFMT) == S_IFLNK
+                let linkTarget = isLink
+                    ? (try? fm.destinationOfSymbolicLink(atPath: spec.oldBinary)) : nil
+                if isLink && linkTarget == spec.newBinary {
+                    // Already this migration's own compat symlink (a prior
+                    // completed attempt) — nothing to park.
+                    journal.symlinkCreated = true
+                    try persistJournal()
+                } else if Self.sha256(ofFile: URL(fileURLWithPath: spec.oldBinary))
+                            == journal.oldBinarySHA256 {
+                    try park(spec.oldBinary, id: "binary")
+                    binaryParked = true
+                } else {
+                    journal.binaryParkSkipped = true
+                    journal.warnings.append(
+                        "\(spec.oldBinary) does not match the binary captured at the start of the "
+                        + "migration — it was left untouched and NO compatibility symlink was "
+                        + "created. Remove or rename it manually if it should not be there")
+                    try persistJournal()
+                }
+            }
+        }
+        Self.crashPoint("after-binary-park")
+
+        // Old resource bundle.
+        if let bundle = spec.oldBundle, fm.fileExists(atPath: bundle) {
+            try park(bundle, id: "bundle")
+        }
+        Self.crashPoint("after-bundle-park")
+
+        // Old preferences domain — removed here (retirement), NOT during
+        // fixups; the exported preimage is kept until cleanup so a
+        // park-restoring rollback can re-import it (plan §4.5.8).
+        if let oldDomain = spec.oldPrefsDomain,
+           journal.preimages.contains(where: { $0.type == "prefs-old-domain" }) {
+            let defaults = UserDefaults.standard
+            defaults.removePersistentDomain(forName: oldDomain)
+            defaults.synchronize()
+        }
+
+        // Compat symlink (plan §4.6): only over the just-parked verified
+        // binary, never over a foreign file.
+        if binaryParked, !journal.binaryParkSkipped, !journal.symlinkCreated {
+            try recordAbsent(spec.oldBinary)
+            try? fm.removeItem(atPath: spec.oldBinary)
+            try fm.createSymbolicLink(atPath: spec.oldBinary,
+                                      withDestinationPath: spec.newBinary)
+            journal.symlinkCreated = true
+            try persistJournal()
+            log("compatibility symlink \(spec.oldBinary) → \(spec.newBinary)")
+        }
+        Self.crashPoint("after-symlink")
+    }
+
+    /// 5e + recovery at committed/done: verification ALWAYS reruns before
+    /// any cleanup; a failure reports and holds everything in place.
+    func verifyAndCleanup() throws {
+        Self.crashPoint("during-post-verify")
+        var problems: [String] = []
+        for root in journal.roots where root.moved {
+            if !fm.fileExists(atPath: root.new) {
+                problems.append("moved root missing: \(root.new)")
+            }
+        }
+        let probe = Self.runBounded(spec.healthProbe, timeout: spec.probeTimeout)
+        if probe.exitCode != 0 {
+            problems.append("health probe failed (exit \(probe.exitCode)): \(probe.tail)")
+        }
+        if journal.startedNewUnit,
+           !Self.lockHeld(spec.newDataRoot + "/instance.lock") {
+            problems.append("the new daemon no longer holds the instance lock")
+        }
+        if journal.symlinkCreated {
+            let target = try? fm.destinationOfSymbolicLink(atPath: spec.oldBinary)
+            if target != spec.newBinary {
+                problems.append("compat symlink does not resolve to \(spec.newBinary)")
+            }
+        }
+        if let service = journal.oldService, service.installed,
+           fm.fileExists(atPath: service.unitPath) {
+            problems.append("old unit file still present: \(service.unitPath)")
+        }
+        guard problems.isEmpty else {
+            throw EngineError(outcome: .failed(
+                "post-commit verification failed: " + problems.joined(separator: "; ")
+                + " — NOTHING was cleaned up; parked assets, preimages and the journal are intact "
+                + "at \(spec.stateDir). Re-run `\(spec.recoveryHint)` after addressing this"))
+        }
+        try setState("done")
+        // Cleanup: parked assets and preimages first, the journal last —
+        // its deletion is what marks the migration finished.
+        try? fm.removeItem(at: parkedDir)
+        try? fm.removeItem(at: preimagesDir)
+        if fm.fileExists(atPath: journalURL.path) {
+            guard unlink(journalURL.path) == 0 else {
+                notes.append("migration complete, but the journal could not be deleted "
+                    + "(\(String(cString: strerror(errno)))) — the next run re-verifies and retries")
+                return
+            }
+            _ = Self.fsyncPath(stateDirURL)
+        }
+        try? fm.removeItem(at: stateDirURL)
+        notes.append("migration committed and verified")
+    }
+
+    // ========================================================= recovery
+
+    func recover() -> MigrationOutcome {
+        log("recovering from journal state \"\(journal.state)\"")
+        do {
+            // A crash — or a reboot, which restarts an enabled unit — can
+            // leave the managed OLD service running again. Stop it before
+            // touching anything, whatever direction recovery takes; the
+            // captured flags still decide what gets restored or recreated.
+            if let service = journal.oldService, service.installed {
+                let active = systemctl(["is-active", service.name]).output
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+                if active {
+                    _ = systemctl(["stop", service.name])
+                    journal.stoppedOldService = true
+                    try persistJournal()
+                }
+            }
+            // Before the commit point, an unmanaged process may have been
+            // started against the old roots since the crash — same refusal
+            // as a fresh run, but the journal stays (the transaction is
+            // real and still needs recovering).
+            if ["prepared", "moved", "fixups"].contains(journal.state),
+               fm.fileExists(atPath: spec.oldDataRoot),
+               Self.lockHeld(spec.oldDataRoot + "/instance.lock") {
+                return .refused("an unmanaged process is running against \(spec.oldDataRoot) "
+                    + "(instance.lock is held) — quit it, then re-run `\(spec.recoveryHint)`. "
+                    + "The migration journal is preserved")
+            }
+            switch journal.state {
+            case "prepared", "moved", "fixups":
+                if mode == .rollback {
+                    try rollback(reason: nil)
+                    return .ok(notes: notes + ["rolled back — the previous installation was restored"])
+                }
+                // Forward by default when possible; otherwise roll back.
+                if let why = forwardPossible() {
+                    try rollback(reason: why)
+                    return .failed("forward recovery impossible (\(why)) — rolled back; "
+                        + "the previous installation was restored")
+                }
+                try moveRoots()
+                try runFixups()
+                try commit()
+                return .ok(notes: notes + ["recovered forward and completed the migration"]
+                    + journal.warnings.map { "⚠ " + $0 })
+            case "committing":
+                if mode == .rollback {
+                    return .refused("the migration already passed its commit point (state: committing) — "
+                        + "recovery completes forward; rollback is no longer offered")
+                }
+                if let why = forwardPossible() {
+                    // Forward impossible: park-restoring rollback, but ONLY
+                    // when every parked asset verifies intact.
+                    if let parkedProblem = parkedAssetsProblem() {
+                        return .failed("forward recovery impossible (\(why)) AND the parked assets "
+                            + "do not verify (\(parkedProblem)) — everything was left in place at "
+                            + "\(spec.stateDir) for manual inspection")
+                    }
+                    try parkRestoringRollback()
+                    return .failed("forward recovery impossible (\(why)) — the parked assets verified "
+                        + "intact and the previous installation was restored byte-identically")
+                }
+                try retire()
+                try setState("committed")
+                try verifyAndCleanup()
+                return .ok(notes: notes + ["recovered forward from the commit phase"]
+                    + journal.warnings.map { "⚠ " + $0 })
+            case "committed", "done":
+                if mode == .rollback {
+                    return .refused("the migration is already committed — recovery only reruns "
+                        + "verification and cleanup; rollback is no longer offered")
+                }
+                try verifyAndCleanup()
+                return .ok(notes: notes + ["re-verified a committed migration and finished cleanup"])
+            default:
+                return .corrupt("unknown journal state \(journal.state)")
+            }
+        } catch let error as EngineError {
+            return error.outcome
+        } catch {
+            return .failed("recovery failed: \(error.localizedDescription) — the journal at "
+                + "\(journalURL.path) is preserved; re-run `\(spec.recoveryHint)` to retry")
+        }
+    }
+
+    /// nil ⇒ forward completion is possible; otherwise the reason it isn't.
+    func forwardPossible() -> String? {
+        guard fm.fileExists(atPath: spec.newBinary) else {
+            return "the new binary \(spec.newBinary) is missing"
+        }
+        for root in journal.roots where root.existed {
+            let oldThere = fm.fileExists(atPath: root.old)
+            let newThere = fm.fileExists(atPath: root.new)
+            if oldThere && newThere {
+                return "both \(root.old) and \(root.new) exist — inconsistent state"
+            }
+            if !oldThere && !newThere {
+                return "neither \(root.old) nor \(root.new) exists — the root is lost"
+            }
+        }
+        if let service = journal.oldService, service.installed, unitManaged,
+           spec.newUnitText == nil {
+            return "no new unit text in the spec"
+        }
+        return nil
+    }
+
+    func parkedAssetsProblem() -> String? {
+        for parked in journal.parked {
+            let path = parkedDir.appendingPathComponent(parked.id)
+            // A recorded-but-never-moved asset is still at its original
+            // place — that's fine for restore (nothing to move back).
+            guard fm.fileExists(atPath: path.path)
+                || fm.fileExists(atPath: parked.originalPath) else {
+                return "parked asset \(parked.id) is missing entirely"
+            }
+            guard fm.fileExists(atPath: path.path) else { continue }
+            switch parked.kind {
+            case "file":
+                if Self.sha256(ofFile: path) != parked.sha256 {
+                    return "parked \(parked.id) does not match its recorded hash"
+                }
+            case "directory":
+                if Self.treeHash(of: path) != parked.sha256 {
+                    return "parked \(parked.id) tree does not match its recorded hash"
+                }
+            case "symlink":
+                if (try? fm.destinationOfSymbolicLink(atPath: path.path)) != parked.target {
+                    return "parked \(parked.id) symlink target changed"
+                }
+            default:
+                return "parked \(parked.id) has unknown kind \(parked.kind)"
+            }
+        }
+        return nil
+    }
+
+    /// Ordinary rollback — valid strictly BEFORE `committing` (nothing has
+    /// been parked or retired yet). Restores roots, preimages (verified by
+    /// hash), service topology; deletes everything the migration created.
+    func rollback(reason: String?) throws {
+        if let reason { log("rolling back: \(reason)") }
+        // Stop/disable anything we started on the new identity.
+        if journal.startedNewUnit, let newUnitName = spec.newUnitName {
+            _ = systemctl(["stop", newUnitName])
+        }
+        if journal.newUnitEnabled, let newUnitName = spec.newUnitName {
+            _ = systemctl(["disable", newUnitName])
+        }
+
+        // Preimages in reverse order.
+        for pre in journal.preimages.reversed() {
+            switch pre.type {
+            case "absent":
+                if fm.fileExists(atPath: pre.path)
+                    || (try? fm.destinationOfSymbolicLink(atPath: pre.path)) != nil {
+                    try? fm.removeItem(atPath: pre.path)
+                }
+            case "file":
+                let stored = preimagesDir.appendingPathComponent(pre.id)
+                guard let data = try? Data(contentsOf: stored) else {
+                    throw EngineError(outcome: .failed(
+                        "rollback could not read the preimage of \(pre.path) — everything was "
+                        + "left in place at \(spec.stateDir); nothing more was restored"))
+                }
+                if let why = Self.writeDurable(data, to: URL(fileURLWithPath: pre.path)) {
+                    throw EngineError(outcome: .failed(
+                        "rollback could not restore \(pre.path): \(why) — the journal and "
+                        + "preimages are preserved; re-run `\(spec.recoveryHint)` to retry"))
+                }
+                if let mode = pre.mode {
+                    try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: pre.path)
+                }
+            case "symlink":
+                try? fm.removeItem(atPath: pre.path)
+                if let target = pre.target {
+                    try? fm.createSymbolicLink(atPath: pre.path, withDestinationPath: target)
+                }
+            case "prefs-new-domain":
+                let defaults = UserDefaults.standard
+                defaults.removePersistentDomain(forName: pre.path)
+                defaults.synchronize()
+            case "prefs-old-domain":
+                // Before committing the old domain was never removed;
+                // re-import only if it is somehow missing.
+                let defaults = UserDefaults.standard
+                if defaults.persistentDomain(forName: pre.path)?.isEmpty ?? true {
+                    try reimportOldPrefsDomain(pre)
+                }
+            default:
+                throw EngineError(outcome: .corrupt(
+                    "unknown preimage type \(pre.type) in the journal"))
+            }
+        }
+
+        // Verify restored files against their recorded hashes NOW, while
+        // fixup-touched paths (recorded under the new roots) still resolve —
+        // the roots move back only after every restore has been proven.
+        for pre in journal.preimages where pre.type == "file" {
+            guard Self.sha256(ofFile: URL(fileURLWithPath: pre.path)) == pre.sha256 else {
+                throw EngineError(outcome: .failed(
+                    "rollback restored \(pre.path) but its hash does not match the preimage — "
+                    + "the journal and preimages are preserved for inspection"))
+            }
+        }
+
+        // Roots back, disk-reconciled.
+        for index in journal.roots.indices.reversed() {
+            let root = journal.roots[index]
+            guard root.existed else { continue }
+            let oldThere = fm.fileExists(atPath: root.old)
+            let newThere = fm.fileExists(atPath: root.new)
+            if oldThere && !newThere { continue }        // never moved / already back
+            if !oldThere && newThere {
+                guard rename(root.new, root.old) == 0 else {
+                    throw EngineError(outcome: .failed(
+                        "rollback could not move \(root.new) back to \(root.old): "
+                        + "\(String(cString: strerror(errno))) — the journal is preserved; "
+                        + "re-run `\(spec.recoveryHint)` to retry"))
+                }
+                _ = Self.fsyncPath(URL(fileURLWithPath: (root.old as NSString).deletingLastPathComponent))
+                journal.roots[index].moved = false
+                try persistJournal()
+                continue
+            }
+            throw EngineError(outcome: .failed(
+                "rollback found \(root.old) and \(root.new) in an inconsistent state "
+                + "(\(oldThere ? "both present" : "both missing")) — everything was held for "
+                + "manual inspection; the journal is at \(journalURL.path)"))
+        }
+
+        // Service topology as captured: the old unit was never uninstalled
+        // before committing, only stopped — restart it if it was active.
+        if journal.stoppedOldService, let service = journal.oldService, service.active {
+            _ = systemctl(["start", service.name])
+            log("restarted \(service.name)")
+        }
+
+        // Rollback complete — clear the journal area.
+        try? fm.removeItem(at: preimagesDir)
+        try? fm.removeItem(at: parkedDir)
+        if fm.fileExists(atPath: journalURL.path) {
+            _ = unlink(journalURL.path)
+            _ = Self.fsyncPath(stateDirURL)
+        }
+        try? fm.removeItem(at: stateDirURL)
+        notes.append("every touched file was restored and verified against its preimage")
+    }
+
+    /// Park-restoring rollback (plan v6): from ≥ committing, when forward is
+    /// impossible and the parked assets verify. Puts unit/binary/bundle back
+    /// from parked/, re-enables the old unit, re-imports the old prefs
+    /// domain, then runs the ordinary rollback.
+    func parkRestoringRollback() throws {
+        log("park-restoring rollback")
+        // Anything started on the new identity goes down first, so old and
+        // new never run side by side during the restore.
+        if journal.startedNewUnit, let newUnitName = spec.newUnitName {
+            _ = systemctl(["stop", newUnitName])
+        }
+        // The compat symlink occupies the binary's path — remove it first
+        // (it is also an `absent` record, so this is just ordering).
+        if journal.symlinkCreated,
+           (try? fm.destinationOfSymbolicLink(atPath: spec.oldBinary)) == spec.newBinary {
+            try? fm.removeItem(atPath: spec.oldBinary)
+        }
+        var restoredPaths: Set<String> = []
+        for parked in journal.parked.reversed() {
+            let stored = parkedDir.appendingPathComponent(parked.id)
+            guard fm.fileExists(atPath: stored.path) else { continue }
+            try? fm.removeItem(atPath: parked.originalPath)
+            guard rename(stored.path, parked.originalPath) == 0 else {
+                throw EngineError(outcome: .failed(
+                    "could not restore parked \(parked.id) to \(parked.originalPath): "
+                    + "\(String(cString: strerror(errno))) — the journal is preserved"))
+            }
+            if let mode = parked.mode, parked.kind != "symlink" {
+                try? fm.setAttributes([.posixPermissions: mode],
+                                      ofItemAtPath: parked.originalPath)
+            }
+            _ = Self.fsyncPath(URL(fileURLWithPath:
+                (parked.originalPath as NSString).deletingLastPathComponent))
+            restoredPaths.insert(parked.originalPath)
+        }
+        // A restored parked asset supersedes any `absent` record at the same
+        // path (the compat symlink over the binary): rollback must not
+        // delete what was just put back.
+        if !restoredPaths.isEmpty {
+            journal.preimages.removeAll {
+                $0.type == "absent" && restoredPaths.contains($0.path)
+            }
+            try persistJournal()
+        }
+        if let service = journal.oldService, service.installed, unitManaged {
+            _ = systemctl(["daemon-reload"])
+            if service.enabled {
+                _ = systemctl(["enable", service.name])
+            }
+        }
+        if let pre = journal.preimages.first(where: { $0.type == "prefs-old-domain" }) {
+            try reimportOldPrefsDomain(pre)
+        }
+        try rollback(reason: nil)
+    }
+
+    func reimportOldPrefsDomain(_ pre: MigrationJournal.Preimage) throws {
+        let stored = preimagesDir.appendingPathComponent(pre.id)
+        guard let data = try? Data(contentsOf: stored),
+              Self.sha256(of: data) == pre.sha256,
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: Any] else {
+            throw EngineError(outcome: .failed(
+                "could not re-import the exported \(pre.path) preferences domain — "
+                + "the export at \(stored.path) is missing or does not match its hash"))
+        }
+        let defaults = UserDefaults.standard
+        defaults.setPersistentDomain(plist, forName: pre.path)
+        defaults.synchronize()
+    }
+
+    /// A failure while the transaction is still before `committing`: roll
+    /// back now and report honestly whether the restore succeeded.
+    func handleMidTransactionFailure(_ why: String) -> MigrationOutcome {
+        // Past the commit point, rollback is NOT the answer — recovery
+        // completes forward (or runs the defined park-restoring rollback,
+        // decided by the next run's state machine, never by an ad-hoc
+        // failure path).
+        if ["committing", "committed", "done"].contains(journal.state) {
+            return .failed(why + " — the migration is past its commit point; nothing was rolled "
+                + "back. The journal at \(journalURL.path) is preserved; re-run "
+                + "`\(spec.recoveryHint)` to complete the migration")
+        }
+        // Pre-move failures (state prepared, nothing moved): restore the
+        // service, drop the journal, report as a plain failure.
+        if journal.state == "prepared", !journal.roots.contains(where: { $0.moved }) {
+            try? restoreServiceAfterRefusal()
+            cleanupJournalArea()
+            return .failed(why + " — nothing had been moved; the installation is untouched")
+        }
+        do {
+            try rollback(reason: why)
+            return .failed(why + " — the migration was rolled back; the previous installation "
+                + "was restored and verified")
+        } catch let rollbackError as EngineError {
+            if case let .failed(inner) = rollbackError.outcome {
+                return .failed(why + "; ROLLBACK ALSO INCOMPLETE: " + inner)
+            }
+            return rollbackError.outcome
+        } catch {
+            return .failed(why + "; rollback also failed: \(error.localizedDescription) — "
+                + "the journal at \(journalURL.path) is preserved; re-run `\(spec.recoveryHint)`")
+        }
+    }
+}
+
+// MARK: - Hidden runner (Stage 3 test harness)
+//
+// Runs the engine against a spec FILE in a separate process, which is what
+// makes the selftest's crash injection real: ADA_MIGRATE_CRASH_POINT kills
+// this process with _exit — no defers, no cleanup — and recovery then runs
+// as a genuinely fresh process against whatever the journal says. Stage 4
+// wires the real user-facing `migrate` command; nothing user-facing changes
+// in Stage 3.
+struct MigrationRunCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "__migrate-run",
+        abstract: "Internal: run the identity-migration engine against a spec file.",
+        shouldDisplay: false
+    )
+
+    @Option(name: .long, help: "Path to a MigrationSpec JSON file.")
+    var spec: String?
+
+    @Flag(name: .long, help: "Explicit rollback instead of forward recovery.")
+    var rollback = false
+
+    @Flag(name: .long, help: "Print read-only detection status and exit.")
+    var detect = false
+
+    @Flag(name: .long, help: "Print doctor's read-only migration report and exit.")
+    var doctor = false
+
+    @Option(name: .long, help: "Print a UserDefaults persistent domain as JSON and exit.")
+    var dumpPrefsDomain: String?
+
+    func run() throws {
+        AdaCLI.prepareIO()
+        if let domain = dumpPrefsDomain {
+            // Read in a FRESH process so the caller never sees its own
+            // process-local UserDefaults cache.
+            let contents = UserDefaults.standard.persistentDomain(forName: domain) ?? [:]
+            var out: [String: String] = [:]
+            for (key, value) in contents { out[key] = String(describing: value) }
+            let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+            print(String(data: data, encoding: .utf8) ?? "{}")
+            return
+        }
+        guard let specPath = spec else {
+            throw ValidationError("--spec is required (or --dump-prefs-domain)")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: specPath))
+        let decoded = try JSONDecoder().decode(MigrationSpec.self, from: data)
+        if detect {
+            let status = MigrationEngine.detect(spec: decoded)
+            print("DETECT old=\(status.oldRootsPresent.count) new=\(status.newRootsPresent.count) "
+                + "journal=\(status.journalState ?? "none")")
+            return
+        }
+        if doctor {
+            print(MigrationEngine.doctorReport(spec: decoded) ?? "no migration journal")
+            return
+        }
+        let outcome = MigrationEngine.run(spec: decoded,
+                                          mode: rollback ? .rollback : .auto) { print("· \($0)") }
+        switch outcome {
+        case .ok(let notes):
+            for note in notes { print("✔ \(note)") }
+            print("MIGRATE-OUTCOME: ok")
+        case .refused(let why):
+            print("MIGRATE-OUTCOME: refused: \(why)")
+            throw ExitCode(2)
+        case .corrupt(let why):
+            print("MIGRATE-OUTCOME: corrupt: \(why)")
+            throw ExitCode(3)
+        case .failed(let why):
+            print("MIGRATE-OUTCOME: failed: \(why)")
+            throw ExitCode(1)
+        }
+    }
+}
