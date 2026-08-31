@@ -5,8 +5,9 @@ name: Release (signed)
 # sign (release-sign environment) → verify candidate → publish one immutable
 # GitHub Release (draft assembled, envelope last, published atomically) →
 # verify through the public path (authenticate with the committed key FIRST,
-# then require byte-identity with the verified candidate) — plus, while the
-# transition window is open, an independent legacy Blob dual-publish job.
+# then require byte-identity with the verified candidate). The transitional
+# legacy Blob dual-publish job was removed when the §6.3 window closed
+# (2026-08-31); Vercel is outside the software trust chain.
 #
 # Runs only where the release channel is armed (repository variable
 # RELEASE_CHANNEL_ENABLED=true: the public canonical repo, and the staging
@@ -288,36 +289,6 @@ jobs:
           VERSION: ${{ needs.authorize.outputs.version }}
           REPO: ${{ github.repository }}
         run: ./.github/scripts/publish-release.sh
-
-  legacy-blob-dual-publish:
-    name: Transitional legacy Blob dual-publish (§6.3)
-    # Lets clients ≤ v0.1.57 make their disclosed final unauthenticated hop.
-    # A SEPARATE job, deliberately: it runs only after the authoritative
-    # GitHub release is live and nothing depends on it, so a Blob failure is
-    # reported as this job's own failure and can neither block
-    # verify-production nor corrupt the release. Removed (with the token
-    # revoked) when the transition window closes.
-    needs: [authorize, publish]
-    if: vars.LEGACY_BLOB_DUAL_PUBLISH == 'true'
-    runs-on: ubuntu-latest
-    environment: release-publish
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Publish the legacy Blob layout
-        env:
-          BLOB_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-          BLOB_PUBLIC_PREFIX: https://z3hrivnareyralos.public.blob.vercel-storage.com/cli
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          ./.github/scripts/publish-cdn.sh "$REF_NAME" || {
-            echo "⚠ legacy Blob dual-publish FAILED — the authoritative GitHub release IS live and verified independently; legacy clients cannot hop until this is fixed"
-            exit 1
-          }
 
   verify-production:
     name: Verify public channel (${{ matrix.label }})

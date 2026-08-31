@@ -9,7 +9,7 @@ and Linux.
 ## Install (prebuilt — no GitHub account, no Swift)
 
 ```sh
-curl -fsSL https://ada-app-psi.vercel.app/cli/install.sh | bash
+curl -fsSL https://github.com/permaevidence/ada-cli/releases/latest/download/install.sh | bash
 ada setup                   # first-run wizard (~5 minutes)
 ada                         # chat; leave with /quit, /exit or Ctrl-C
 ```

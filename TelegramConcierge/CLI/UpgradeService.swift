@@ -21,12 +21,10 @@ import Darwin
 enum UpgradeService {
     /// Signed release channel (docs/RELEASE_SIGNING_PLAN.md §8.1): the update
     /// check trusts ONLY the Ed25519-signed envelope published as a GitHub
-    /// Release asset. There is no fallback to unsigned metadata. Flipping
-    /// this to false (a reviewed source change, never a runtime switch)
-    /// restores the legacy Vercel Blob path for a pre-cutover emergency
-    /// release only; the legacy path is deleted at Phase C cleanup.
-    static let signedUpdatesEnabled = true
-
+    /// Release asset. There is no unsigned metadata path in this binary —
+    /// the pre-signature Vercel Blob feed was retired when the transition
+    /// window closed (§6.3), and the anti-rollback floor below prevents any
+    /// signed release older than the last accepted one.
     static let defaultEnvelopeURL =
         "https://github.com/\(adaCLIReleaseRepository)/releases/latest/download/manifest.sig.json"
 
@@ -38,11 +36,6 @@ enum UpgradeService {
         ProcessInfo.processInfo.environment["ADA_ENVELOPE_URL"] ?? defaultEnvelopeURL
     }
 
-    static let defaultBaseURL = "https://z3hrivnareyralos.public.blob.vercel-storage.com/cli"
-
-    static var baseURL: String {
-        ProcessInfo.processInfo.environment["ADA_BASE_URL"] ?? defaultBaseURL
-    }
 
     static let platformKey: String? = {
         #if os(macOS) && arch(arm64)
@@ -56,21 +49,12 @@ enum UpgradeService {
         #endif
     }()
 
-    struct Manifest: Decodable {
-        struct Platform: Decodable {
-            let url: String
-            let sha256: String
-        }
-        let version: String
-        let platforms: [String: Platform]
-    }
-
     struct Update {
         let version: String
         let url: String
         let sha256: String
-        /// Authenticated exact artifact size from the signed manifest; 0 on
-        /// the legacy unsigned path (no size to enforce there).
+        /// Authenticated exact artifact size from the signed manifest —
+        /// the download is bounded by it, never by Content-Length.
         let size: Int64
     }
 
@@ -136,9 +120,6 @@ enum UpgradeService {
     /// reported, never silently swallowed.
     static func check(warn: (String) -> Void = { _ in }) async -> CheckResult {
         guard let platform = platformKey else { return .unsupportedPlatform }
-        guard signedUpdatesEnabled else {
-            return await legacyUnsignedCheck(platform: platform)
-        }
         let policy = ReleasePolicy.effective
         let manifest: ReleaseSigning.Manifest
         do {
@@ -215,33 +196,6 @@ enum UpgradeService {
             version: manifest.version, url: entry.url, sha256: entry.sha256, size: entry.size))
     }
 
-    /// Pre-signing Blob-manifest check — reachable ONLY when a reviewed
-    /// source commit flips `signedUpdatesEnabled` off for a pre-cutover
-    /// emergency release. Deleted at Phase C cleanup.
-    private static func legacyUnsignedCheck(platform: String) async -> CheckResult {
-        let manifest: Manifest
-        do {
-            let (data, response) = try await URLSession.shared.data(
-                from: URL(string: "\(baseURL)/manifest.json")!)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                throw URLError(.badServerResponse)
-            }
-            manifest = try JSONDecoder().decode(Manifest.self, from: data)
-        } catch {
-            return .failed(error.localizedDescription)
-        }
-        if manifest.version == adaCLIVersion {
-            return .upToDate(adaCLIVersion)
-        }
-        if isDowngrade(candidate: manifest.version, installed: adaCLIVersion) {
-            return .manifestOlder(current: adaCLIVersion, manifest: manifest.version)
-        }
-        guard let entry = manifest.platforms[platform] else {
-            return .noBuildForPlatform(version: manifest.version, platform: platform)
-        }
-        return .available(Update(version: manifest.version, url: entry.url, sha256: entry.sha256, size: 0))
-    }
-
     /// Download, verify, unpack, and swap the installed binary + bundle.
     /// `allowSudo: false` (the chat path) requires a writable install dir —
     /// callers check `installDirWritable()` first for a friendlier message.
@@ -257,24 +211,14 @@ enum UpgradeService {
         defer { try? fm.removeItem(at: tmp) }
         let tarball = tmp.appendingPathComponent("ada.tar.gz")
 
-        let digest: String
-        if update.size > 0 {
-            // Signed path: stream to disk enforcing the AUTHENTICATED exact
-            // size while receiving, hashing incrementally — no unbounded
-            // in-memory buffering of attacker-reachable bytes.
-            digest = try await BoundedHTTP.downloadFile(
-                url: URL(string: update.url)!, to: tarball, expectedBytes: update.size)
-        } else {
-            // Legacy unsigned path (see legacyUnsignedCheck) — no
-            // authenticated size exists to enforce.
-            let (tarData, tarResponse) = try await URLSession.shared.data(
-                from: URL(string: update.url)!)
-            guard (tarResponse as? HTTPURLResponse)?.statusCode == 200 else {
-                throw UpgradeError(message: "download failed (HTTP \((tarResponse as? HTTPURLResponse)?.statusCode ?? 0))")
-            }
-            try tarData.write(to: tarball)
-            digest = SHA256.hash(data: tarData).map { String(format: "%02x", $0) }.joined()
+        guard update.size > 0 else {
+            throw UpgradeError(message: "release entry carries no authenticated size — refusing an unbounded download")
         }
+        // Stream to disk enforcing the AUTHENTICATED exact size while
+        // receiving, hashing incrementally — no unbounded in-memory
+        // buffering of attacker-reachable bytes.
+        let digest = try await BoundedHTTP.downloadFile(
+            url: URL(string: update.url)!, to: tarball, expectedBytes: update.size)
         guard digest == update.sha256.lowercased() else {
             throw UpgradeError(message: "checksum mismatch — download corrupted or tampered with; nothing was changed")
         }

@@ -202,8 +202,8 @@ def main():
           (result.stdout + result.stderr)[-1500:])
 
     # 3c1a3. publisher fault-injection battery (RELEASE_SIGNING_PLAN §11.3):
-    # the real check-supersession / publish-release / verify-public-release /
-    # publish-cdn scripts against a fake Releases API + download host + Blob
+    # the real check-supersession / publish-release / verify-public-release
+    # scripts against a fake Releases API + download host
     # — fail-closed supersession, envelope-last uploads, ambiguous publish, the
     # authenticate-FIRST public verification (forged-binary regression),
     # Blob isolation, and workflow-structure invariants.

@@ -2,9 +2,9 @@
 """Publisher fault-injection tests (docs/RELEASE_SIGNING_PLAN.md §11.3).
 
 Runs the REAL release scripts — check-supersession.sh, publish-release.sh,
-verify-public-release.sh, publish-cdn.sh — against one in-process fake that
-plays the GitHub Releases API, the uploads host, the public
-releases/download host, and the Vercel Blob API, with switchable faults:
+verify-public-release.sh — against one in-process fake that plays the
+GitHub Releases API, the uploads host and the public releases/download
+host, with switchable faults:
 
   * no live signed state is refused (bootstrap retired); invalid live envelope
     never unlocks it; older/equal sequence cannot replace newer live state;
@@ -15,8 +15,9 @@ releases/download host, and the Vercel Blob API, with switchable faults:
   * public verification AUTHENTICATES FIRST with the committed key and
     never executes a downloaded binary before the bytes proved identical to
     the verified candidate (the forged-binary regression);
-  * transitional Blob publish reports failure, and the workflow keeps it in
-    a job nothing depends on;
+  * the workflow carries no transitional Blob publication any more (the
+    §6.3 window closed 2026-08-31) and nothing references the retired
+    publish-cdn.sh;
   * tokens never appear in script output.
 
 Needs: bash, python3, curl, tar, an Ed25519-capable openssl. Exit 0 = all
@@ -43,7 +44,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / ".github" / "scripts"
 REPO = "permaevidence/ada-cli-fake"
 GH_TOKEN = "ghs_FAKEtokenSECRET1234567890abcdef"
-BLOB_TOKEN = "vercel_blob_rw_FAKESECRETabcdef123456"
 PLATFORMS = ["macos-arm64", "linux-x64", "linux-arm64"]
 
 PASSED = 0
@@ -74,7 +74,6 @@ class State:
         self.latest_queue = []      # per-request overrides for /latest (ids), consumed in order
         self.faults = cfg.get("faults", {})
         self.download_overrides = {}  # asset name -> bytes served instead (public host)
-        self.blob = {}              # pathname -> bytes
         self.log = []               # (method, path)
 
 
@@ -118,7 +117,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, {
                 "releases": {str(i): self._release_json(i) | {"asset_order": list(r["assets"].keys())}
                              for i, r in STATE.releases.items()},
-                "latest_id": STATE.latest_id, "log": STATE.log, "blob": sorted(STATE.blob)})
+                "latest_id": STATE.latest_id, "log": STATE.log})
         # public release download host
         m = re.fullmatch(r"/releases/latest/download/([^/]+)", p)
         if m:
@@ -129,12 +128,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rid = next((i for i, r in STATE.releases.items()
                         if not r["draft"] and r["tag_name"] == "v" + m.group(1)), None)
             return self._serve_asset(rid, m.group(2))
-        # Blob public prefix
-        if p.startswith("/blobpublic/"):
-            key = p[len("/blobpublic/"):]
-            if key in STATE.blob:
-                return self._send(200, STATE.blob[key], "application/octet-stream")
-            return self._send(404, b"", "text/plain")
         # GitHub API
         if not self._auth_ok():
             return self._send(401, {"message": "bad credentials"})
@@ -183,8 +176,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for k, v in cfg.get("download_overrides", {}).items():
                 STATE.download_overrides[k] = base64.b64decode(v)
             STATE.latest_queue = cfg.get("latest_queue", STATE.latest_queue)
-            for k, v in cfg.get("blob", {}).items():
-                STATE.blob[k] = base64.b64decode(v)
             return self._send(200, {"ok": True})
         if not self._auth_ok():
             return self._send(401, {"message": "bad credentials"})
@@ -241,17 +232,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         del STATE.releases[int(m.group(1))]
         self._send(204)
 
-    def do_PUT(self):
-        STATE.log.append(("PUT", self.path))
-        body = self._body()
-        if self.headers.get("Authorization") != f"Bearer {BLOB_TOKEN}":
-            return self._send(401, {"error": "bad blob token"})
-        if STATE.faults.get("blob") == "500":
-            return self._send(500, {"error": "blob boom"})
-        key = urllib.parse.unquote(self.path.lstrip("/"))
-        STATE.blob[key] = body
-        self._send(200, {"url": f"blob://{key}"})
-
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -274,7 +254,7 @@ def control(base, path, payload=None):
 # Fixtures
 
 def run(script, env, args=(), cwd=None, timeout=120):
-    e = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "BLOB_TOKEN")}
+    e = {k: v for k, v in os.environ.items() if k != "GH_TOKEN"}
     e.update(env)
     r = subprocess.run(["bash", str(script), *args], env=e, cwd=cwd or REPO_ROOT,
                        capture_output=True, text=True, timeout=timeout)
@@ -564,46 +544,16 @@ def body(work, base):
     check("authenticated sequence mismatch is refused", rc != 0 and not ran, out)
 
     # ------------------------------------------------------------------
-    print("— publish-cdn.sh (transitional Blob) —")
-    blob_env = {"BLOB_TOKEN": BLOB_TOKEN, "BLOB_API_URL": base, "BLOB_PUBLIC_PREFIX": f"{base}/blobpublic/cli"}
-    # publish-cdn.sh reads dist/ and scripts/get-ada.sh relative to a repo-root cwd.
-    cdn_root = work / "cdnroot"
-    def cdn_tree():
-        shutil.rmtree(cdn_root, ignore_errors=True)
-        shutil.copytree(dist59, cdn_root / "dist")
-        (cdn_root / "scripts").mkdir()
-        shutil.copy(REPO_ROOT / "scripts/get-ada.sh", cdn_root / "scripts/get-ada.sh")
-    control(base, "/__control/reset", {})
-    cdn_tree()
-    rc, out = run(SCRIPTS / "publish-cdn.sh", blob_env, ["v0.1.59"], cwd=cdn_root)
-    st = control(base, "/__control/state")
-    check("Blob happy path: legacy layout uploaded", rc == 0
-          and {"cli/manifest.json", "cli/install.sh", "cli/latest/ada-linux-x64.tar.gz",
-               "cli/v0.1.59/ada-linux-x64.tar.gz.sha256"} <= set(st["blob"]), out + str(st["blob"]))
-    check("Blob token never appears in output", BLOB_TOKEN not in out)
-    control(base, "/__control/reset", {"faults": {"blob": "500"}})
-    cdn_tree()
-    rc, out = run(SCRIPTS / "publish-cdn.sh", blob_env, ["v0.1.59"], cwd=cdn_root)
-    st = control(base, "/__control/state")
-    check("Blob failure: exit nonzero (reported by its own job), nothing stored",
-          rc != 0 and any(m == "PUT" for m, p in st["log"]) and not st["blob"], out)
-    control(base, "/__control/reset", {})
-    control(base, "/__control/override", {"blob": {"cli/manifest.json": base64.b64encode(b'{"version":"0.1.60","platforms":{}}').decode()}})
-    cdn_tree()
-    rc, out = run(SCRIPTS / "publish-cdn.sh", blob_env, ["v0.1.59"], cwd=cdn_root)
-    check("Blob supersession: older run never clobbers a newer live manifest", rc == 0 and "superseded; skipping" in out, out)
-
-    # ------------------------------------------------------------------
     print("— workflow structure —")
     wf = (REPO_ROOT / ".github/workflows/release-signed.yml").read_text()
     jobs = re.split(r"\n(?=  [a-z][a-z0-9-]*:\n)", wf)
     def job(name):
         return next((j for j in jobs if j.startswith(f"  {name}:\n")), "")
-    publish = job("publish"); blob = job("legacy-blob-dual-publish"); verify_prod = job("verify-production")
-    check("publish job no longer runs the Blob dual-publish", publish and "publish-cdn.sh" not in publish)
-    check("Blob dual-publish is its own job, after publish, gated by the transition variable",
-          "needs: [authorize, publish]" in blob and "vars.LEGACY_BLOB_DUAL_PUBLISH == 'true'" in blob and "publish-cdn.sh" in blob)
-    check("verify-production depends on publish only — a Blob failure cannot skip it",
+    publish = job("publish"); verify_prod = job("verify-production")
+    check("the transitional Blob dual-publish job is gone and nothing references publish-cdn.sh or a Blob token",
+          publish and not job("legacy-blob-dual-publish") and "publish-cdn.sh" not in wf
+          and "BLOB" not in wf and not (SCRIPTS / "publish-cdn.sh").exists())
+    check("verify-production depends on publish only",
           "needs: [authorize, publish]" in verify_prod and "legacy-blob" not in verify_prod)
     check("verify-production authenticates via the committed key before touching public assets",
           "actions/checkout@" in verify_prod and "download-artifact@" in verify_prod
