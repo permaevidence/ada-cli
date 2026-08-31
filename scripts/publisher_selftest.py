@@ -6,7 +6,7 @@ verify-public-release.sh, publish-cdn.sh — against one in-process fake that
 plays the GitHub Releases API, the uploads host, the public
 releases/download host, and the Vercel Blob API, with switchable faults:
 
-  * bootstrap accepted only for the committed marker; invalid live envelope
+  * no live signed state is refused (bootstrap retired); invalid live envelope
     never unlocks it; older/equal sequence cannot replace newer live state;
   * publishing over an existing immutable release fails honestly, stale
     drafts are cleaned, uploads go envelope-LAST, publication is one PATCH
@@ -371,11 +371,8 @@ def body(work, base):
         return 1
     priv = next((work / "keys").glob("*.priv.pem"))
     key = {"priv": priv, "pub": Path(str(priv)[:-len(".priv.pem")] + ".pub.pem")}
-    bootstrap = work / "BOOTSTRAP_RELEASE"
-    bootstrap.write_text("v0.1.58 58\n")
     live_url = f"{base}/releases/latest/download/manifest.sig.json"
-    common = {"EXPECTED_PUBKEY": str(key["pub"]), "LIVE_ENVELOPE_URL": live_url,
-              "BOOTSTRAP_FILE": str(bootstrap)}
+    common = {"EXPECTED_PUBKEY": str(key["pub"]), "LIVE_ENVELOPE_URL": live_url}
 
     dist58 = make_dist(work / "dist58", "0.1.58", 58, base, key)
     dist59 = make_dist(work / "dist59", "0.1.59", 59, base, key)
@@ -383,13 +380,21 @@ def body(work, base):
     # ------------------------------------------------------------------
     print("— check-supersession.sh —")
     control(base, "/__control/reset", {})
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "58", "REF_NAME": "v0.1.58"})
-    check("bootstrap: committed marker accepts exactly v0.1.58/58", rc == 0 and "bootstrap release accepted" in out, out)
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "59", "REF_NAME": "v0.1.59"})
-    check("bootstrap: any other tag/sequence is refused", rc != 0 and "bootstrap marker names" in out, out)
+    # The one-time bootstrap is gone: without an authenticated live envelope
+    # NOTHING publishes — not the historical bootstrap tag, not a marker file.
+    for seq, ref in (("58", "v0.1.58"), ("59", "v0.1.59")):
+        rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": seq, "REF_NAME": ref})
+        check(f"no live signed state: {ref}/{seq} is refused (bootstrap retired)",
+              rc != 0 and "bootstrap retired" in out, out)
     rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "58", "REF_NAME": "v0.1.58",
-                                                               "BOOTSTRAP_FILE": str(work / "missing")})
-    check("no live state and no marker is refused", rc != 0 and "no bootstrap marker" in out, out)
+                                                               "BOOTSTRAP_FILE": str(work / "marker")})
+    (work / "marker").write_text("v0.1.58 58\n")
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "58", "REF_NAME": "v0.1.58",
+                                                               "BOOTSTRAP_FILE": str(work / "marker")})
+    check("a marker file is inert: BOOTSTRAP_FILE no longer unlocks anything", rc != 0 and "bootstrap retired" in out, out)
+    check("repository carries no bootstrap marker", not (REPO_ROOT / ".github/BOOTSTRAP_RELEASE").exists())
+    check("check-supersession.sh has no marker-reading code",
+          "BOOTSTRAP_FILE" not in (SCRIPTS / "check-supersession.sh").read_text())
 
     seed_release(base, dist58, "0.1.58")
     rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "59", "REF_NAME": "v0.1.59"})
@@ -401,8 +406,8 @@ def body(work, base):
     control(base, "/__control/override", {"download_overrides": {
         "manifest.sig.json": base64.b64encode(tampered_envelope(dist58 / "manifest.sig.json")).decode()}})
     rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "58", "REF_NAME": "v0.1.58"})
-    check("invalid live envelope is a hard stop (never unlocks bootstrap)",
-          rc != 0 and "does not authenticate" in out and "bootstrap" not in out.lower().split("does not authenticate")[0], out)
+    check("invalid live envelope is a hard stop (never treated as absent)",
+          rc != 0 and "does not authenticate" in out and "bootstrap retired" not in out, out)
 
     # ------------------------------------------------------------------
     print("— publish-release.sh —")

@@ -42,7 +42,7 @@ jobs:
       version: ${{ steps.gate.outputs.version }}
       sequence: ${{ steps.gate.outputs.sequence }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           fetch-depth: 0
       - name: Gate checks
@@ -74,7 +74,7 @@ jobs:
           # Live-channel supersession floor (shared script, also tested
           # against a fake channel by scripts/publisher_selftest.py): ours
           # must be strictly greater than the latest AUTHENTICATED live
-          # sequence, or be the one committed bootstrap release.
+          # sequence; there is no bootstrap path (retired after v0.1.58).
           SEQUENCE="$SEQUENCE" REF_NAME="$REF_NAME" REPO="$REPO" EXPECTED_PUBKEY="$EXPECTED_PUBKEY" \
             ./.github/scripts/check-supersession.sh
 
@@ -86,7 +86,7 @@ jobs:
     needs: authorize
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Stamp version
         env:
           VERSION: ${{ needs.authorize.outputs.version }}
@@ -110,7 +110,7 @@ jobs:
     # swift:6.1-jammy (multi-arch index, resolved 2026-08-30)
     container: swift@sha256:159943c473b8d7c57fb18d1f0e9cd7f3b011f05511a39ee1f53ed92bc6cd13d9
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Stamp version
         env:
           VERSION: ${{ needs.authorize.outputs.version }}
@@ -136,7 +136,7 @@ jobs:
     timeout-minutes: 60
     container: swift@sha256:159943c473b8d7c57fb18d1f0e9cd7f3b011f05511a39ee1f53ed92bc6cd13d9
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Stamp version
         env:
           VERSION: ${{ needs.authorize.outputs.version }}
@@ -158,7 +158,7 @@ jobs:
     needs: [authorize, build-macos-arm64, build-linux-x64, build-linux-arm64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
@@ -194,7 +194,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release-sign
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: manifest
@@ -270,7 +270,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
@@ -302,7 +302,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release-publish
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
@@ -341,7 +341,7 @@ jobs:
       # here; the candidate artifacts (already verified by verify-candidate)
       # are what the public bytes must equal. The downloaded binary is run
       # only AFTER authentication, as a functional check.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
