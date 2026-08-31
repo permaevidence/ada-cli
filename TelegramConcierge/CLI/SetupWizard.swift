@@ -986,18 +986,15 @@ struct SetupWizard {
 /// lived in OnboardingView).
 enum OpenCodeGo {
     static let baseURL = "https://opencode.ai/zen/go/v1"
-    static let defaultModel = "kimi-k2.6"
+    /// Default since 2026-08-31 (was kimi-k2.6). The wizard's "Model [1]"
+    /// default is choices[0], so the default model MUST stay first in the list.
+    static let defaultModel = "glm-5.3-flash"
     /// Key-probe fallbacks when the default model's upstream is down
     /// (observed live 2026-08-17: kimi-k2.6 503 while the rest served fine).
-    /// Different upstream providers on purpose; excludes the China-gated one.
-    static let probeFallbacks = ["glm-5.3", "kimi-k3"]
+    /// Different upstream providers on purpose (Moonshot, MiniMax — neither is
+    /// Zhipu like the default); excludes the China-gated one.
+    static let probeFallbacks = ["kimi-k2.6", "minimax-m3"]
     static let choices: [(id: String, label: String, textOnly: Bool)] = [
-        ("kimi-k2.6", "Kimi K2.6", false),
-        // reasoning_content on plain + tool-call turns, replay accepted,
-        // implicit prefix caching; effort restricted to low/high/max (Ada
-        // remaps minimal/medium/xhigh), thinking flag must stay omitted,
-        // images rejected — verified 2026-08-14, replacing glm-5.2.
-        ("glm-5.3", "GLM 5.3", true),
         // Multimodal sibling of GLM 5.3 with the same reasoning contract:
         // reasoning_content on plain + tool-call turns, replay accepted,
         // implicit prefix caching, reasoning_tokens/cached_tokens in usage,
@@ -1006,6 +1003,12 @@ enum OpenCodeGo {
         // apply automatically. Full vision through the Go gateway (data-URL
         // image parts, layout-describe verified) — verified 2026-08-26.
         ("glm-5.3-flash", "GLM 5.3 Flash", false),
+        ("kimi-k2.6", "Kimi K2.6", false),
+        // reasoning_content on plain + tool-call turns, replay accepted,
+        // implicit prefix caching; effort restricted to low/high/max (Ada
+        // remaps minimal/medium/xhigh), thinking flag must stay omitted,
+        // images rejected — verified 2026-08-14, replacing glm-5.2.
+        ("glm-5.3", "GLM 5.3", true),
         ("deepseek-v4-pro", "DeepSeek V4 Pro", true),
         // Hosted only in China: without the per-workspace "Chinese models"
         // opt-in on opencode.ai the gateway returns a RegionError. With the
