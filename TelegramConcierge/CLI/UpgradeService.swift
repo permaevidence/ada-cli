@@ -19,6 +19,25 @@ import Darwin
 /// for the chat path — self-restart via execv with a marker file so the
 /// restarted process can announce the completed update.
 enum UpgradeService {
+    /// Signed release channel (docs/RELEASE_SIGNING_PLAN.md §8.1): the update
+    /// check trusts ONLY the Ed25519-signed envelope published as a GitHub
+    /// Release asset. There is no fallback to unsigned metadata. Flipping
+    /// this to false (a reviewed source change, never a runtime switch)
+    /// restores the legacy Vercel Blob path for a pre-cutover emergency
+    /// release only; the legacy path is deleted at Phase C cleanup.
+    static let signedUpdatesEnabled = true
+
+    static let defaultEnvelopeURL =
+        "https://github.com/\(adaCLIReleaseRepository)/releases/latest/download/manifest.sig.json"
+
+    /// Discovery URL only — everything fetched from it is verified against
+    /// the pinned key, so an override can at worst deny availability (which
+    /// any env-controlling attacker already can). Needed by the staging
+    /// pipeline and the publisher tests.
+    static var envelopeURL: String {
+        ProcessInfo.processInfo.environment["ADA_ENVELOPE_URL"] ?? defaultEnvelopeURL
+    }
+
     static let defaultBaseURL = "https://z3hrivnareyralos.public.blob.vercel-storage.com/cli"
 
     static var baseURL: String {
@@ -50,6 +69,9 @@ enum UpgradeService {
         let version: String
         let url: String
         let sha256: String
+        /// Authenticated exact artifact size from the signed manifest; 0 on
+        /// the legacy unsigned path (no size to enforce there).
+        let size: Int64
     }
 
     enum CheckResult {
@@ -57,9 +79,14 @@ enum UpgradeService {
         case available(Update)
         case unsupportedPlatform
         case noBuildForPlatform(version: String, platform: String)
-        /// The CDN manifest is OLDER than the installed version — a release
+        /// The live manifest is OLDER than the installed version — a release
         /// still publishing (or a publish race). Never "upgrade" onto it.
         case manifestOlder(current: String, manifest: String)
+        /// Signed metadata below this install's anti-rollback floor (the
+        /// binary's embedded sequence or the persisted highest verified
+        /// sequence). Distinct from manifestOlder: this is the signature-era
+        /// refusal and may indicate a rollback/freeze attack on the channel.
+        case rollbackRefused(liveSequence: Int, floor: Int)
         case failed(String)
     }
 
@@ -104,8 +131,94 @@ enum UpgradeService {
         FileManager.default.isWritableFile(atPath: installDir.path)
     }
 
-    static func check() async -> CheckResult {
+    /// `warn` surfaces non-fatal trust-state problems (corrupt or unwritable
+    /// anti-rollback file) without failing the check — per the plan they are
+    /// reported, never silently swallowed.
+    static func check(warn: (String) -> Void = { _ in }) async -> CheckResult {
         guard let platform = platformKey else { return .unsupportedPlatform }
+        guard signedUpdatesEnabled else {
+            return await legacyUnsignedCheck(platform: platform)
+        }
+        let policy = ReleasePolicy.effective
+        let manifest: ReleaseSigning.Manifest
+        do {
+            let raw = try await BoundedHTTP.fetchData(
+                url: URL(string: envelopeURL)!, maxBytes: ReleaseSigning.maxEnvelopeBytes)
+            manifest = try ReleaseSigning.verifyEnvelope(raw, policy: policy)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        // Anti-rollback floor for THIS trust domain only (channel + pinned
+        // artifact location): a staging or mock channel's sequence is never
+        // production's floor, and vice versa.
+        let trust = ReleaseTrustStore.load(domain: policy.trustDomain)
+        if trust.corrupt {
+            warn("⚠ the local release-trust state file is corrupt or in an unrecognized format — rebuilt from this binary's embedded sequence floor (\(adaCLIReleaseSequence))")
+        }
+        let decision = decide(
+            manifest: manifest, installedVersion: adaCLIVersion,
+            ownSequence: adaCLIReleaseSequence, persistedSequence: trust.sequence,
+            platform: platform)
+        // Persist the highest verified sequence only for metadata that passed
+        // every check and moved anti-rollback state forward. The store is a
+        // locked monotonic merge, so a concurrent check that verified a
+        // newer sequence can never be overwritten by this one. A persist
+        // failure is reported, never treated as silent success.
+        switch decision {
+        case .upToDate, .available:
+            if manifest.sequence > (trust.sequence ?? 0) {
+                do {
+                    try ReleaseTrustStore.store(manifest.sequence, domain: policy.trustDomain)
+                } catch {
+                    warn("⚠ could not persist the anti-rollback sequence (\(error.localizedDescription)) — the embedded floor still applies")
+                }
+            }
+        default:
+            break
+        }
+        return decision
+    }
+
+    /// Pure decision core over an already-AUTHENTICATED manifest — separated
+    /// so the selftest can exercise every sequence/version combination.
+    static func decide(
+        manifest: ReleaseSigning.Manifest, installedVersion: String,
+        ownSequence: Int, persistedSequence: Int?, platform: String
+    ) -> CheckResult {
+        let floor = max(ownSequence, persistedSequence ?? 0)
+        if manifest.sequence < floor {
+            return .rollbackRefused(liveSequence: manifest.sequence, floor: floor)
+        }
+        if manifest.sequence == ownSequence {
+            if manifest.version == installedVersion {
+                return .upToDate(installedVersion)
+            }
+            if isDowngrade(candidate: manifest.version, installed: installedVersion) {
+                return .manifestOlder(current: installedVersion, manifest: manifest.version)
+            }
+            return .failed("live release repeats this install's sequence \(ownSequence) with a different version (\(manifest.version) vs \(installedVersion)) — refusing inconsistent metadata")
+        }
+        // manifest.sequence > ownSequence (and >= persisted floor)
+        if manifest.version == installedVersion {
+            return .failed("live release repeats the installed version \(installedVersion) under a newer sequence \(manifest.sequence) — refusing inconsistent metadata")
+        }
+        // Release publishing can race; a newer sequence must also carry a
+        // strictly newer version. Applies to source builds too: "0.1.4-dev"
+        // must not be "upgraded" to 0.1.2.
+        if isDowngrade(candidate: manifest.version, installed: installedVersion) {
+            return .manifestOlder(current: installedVersion, manifest: manifest.version)
+        }
+        guard let entry = manifest.platforms[platform] else {
+            return .noBuildForPlatform(version: manifest.version, platform: platform)
+        }
+        return .available(Update(
+            version: manifest.version, url: entry.url, sha256: entry.sha256, size: entry.size))
+    }
+
+    /// Pre-signing Blob-manifest check — reachable ONLY when a reviewed
+    /// source commit flips `signedUpdatesEnabled` off for a pre-cutover
+    /// emergency release. Deleted at Phase C cleanup.
+    private static func legacyUnsignedCheck(platform: String) async -> CheckResult {
         let manifest: Manifest
         do {
             let (data, response) = try await URLSession.shared.data(
@@ -120,17 +233,13 @@ enum UpgradeService {
         if manifest.version == adaCLIVersion {
             return .upToDate(adaCLIVersion)
         }
-        // Release publishing is concurrent (the slow ARM job of an older tag
-        // can finish after a newer release went live) — never treat an older
-        // manifest as an update. Applies to source builds too: "0.1.4-dev"
-        // must not be "upgraded" to 0.1.2.
         if isDowngrade(candidate: manifest.version, installed: adaCLIVersion) {
             return .manifestOlder(current: adaCLIVersion, manifest: manifest.version)
         }
         guard let entry = manifest.platforms[platform] else {
             return .noBuildForPlatform(version: manifest.version, platform: platform)
         }
-        return .available(Update(version: manifest.version, url: entry.url, sha256: entry.sha256))
+        return .available(Update(version: manifest.version, url: entry.url, sha256: entry.sha256, size: 0))
     }
 
     /// Download, verify, unpack, and swap the installed binary + bundle.
@@ -142,22 +251,33 @@ enum UpgradeService {
         progress: (String) -> Void
     ) async throws {
         progress("Downloading…")
-        let (tarData, tarResponse) = try await URLSession.shared.data(
-            from: URL(string: update.url)!)
-        guard (tarResponse as? HTTPURLResponse)?.statusCode == 200 else {
-            throw UpgradeError(message: "download failed (HTTP \((tarResponse as? HTTPURLResponse)?.statusCode ?? 0))")
-        }
-        let digest = SHA256.hash(data: tarData).map { String(format: "%02x", $0) }.joined()
-        guard digest == update.sha256.lowercased() else {
-            throw UpgradeError(message: "checksum mismatch — download corrupted or tampered with; nothing was changed")
-        }
-
         let fm = FileManager.default
         let tmp = fm.temporaryDirectory.appendingPathComponent("ada-upgrade-\(UUID().uuidString)")
         try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tmp) }
         let tarball = tmp.appendingPathComponent("ada.tar.gz")
-        try tarData.write(to: tarball)
+
+        let digest: String
+        if update.size > 0 {
+            // Signed path: stream to disk enforcing the AUTHENTICATED exact
+            // size while receiving, hashing incrementally — no unbounded
+            // in-memory buffering of attacker-reachable bytes.
+            digest = try await BoundedHTTP.downloadFile(
+                url: URL(string: update.url)!, to: tarball, expectedBytes: update.size)
+        } else {
+            // Legacy unsigned path (see legacyUnsignedCheck) — no
+            // authenticated size exists to enforce.
+            let (tarData, tarResponse) = try await URLSession.shared.data(
+                from: URL(string: update.url)!)
+            guard (tarResponse as? HTTPURLResponse)?.statusCode == 200 else {
+                throw UpgradeError(message: "download failed (HTTP \((tarResponse as? HTTPURLResponse)?.statusCode ?? 0))")
+            }
+            try tarData.write(to: tarball)
+            digest = SHA256.hash(data: tarData).map { String(format: "%02x", $0) }.joined()
+        }
+        guard digest == update.sha256.lowercased() else {
+            throw UpgradeError(message: "checksum mismatch — download corrupted or tampered with; nothing was changed")
+        }
         try runOrThrow("/usr/bin/tar", ["-xzf", tarball.path, "-C", tmp.path])
 
         let bundleName = BundleCheck.bundleName

@@ -1,0 +1,357 @@
+name: Release (signed)
+
+# The hardened, signed release pipeline (docs/RELEASE_SIGNING_PLAN.md §7):
+# authorize → build (3 platforms, GitHub-hosted only) → assemble manifest →
+# sign (release-sign environment) → verify candidate → publish one immutable
+# GitHub Release (draft assembled, envelope last, published atomically) →
+# verify through the public path (authenticate with the committed key FIRST,
+# then require byte-identity with the verified candidate) — plus, while the
+# transition window is open, an independent legacy Blob dual-publish job.
+#
+# Runs only where the release channel is armed (repository variable
+# RELEASE_CHANNEL_ENABLED=true: the public canonical repo, and the staging
+# repo during Phase B). The private archive never sets it.
+#
+# Secret separation (§7.3): the signing job holds only the signing key and a
+# read-only token; the publishing job holds contents:write but never the
+# key; builds hold neither.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+# One production publication at a time, never cancelled mid-publish: a stale
+# run is stopped by the sequence re-check inside the group, not by a cancel
+# that could interrupt a half-published draft.
+concurrency:
+  group: ada-cli-release-signed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_PUBKEY: .github/release-keys/ada-cli-release.pub.pem
+
+jobs:
+  authorize:
+    name: Authorize (credential-free)
+    if: vars.RELEASE_CHANNEL_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.gate.outputs.version }}
+      sequence: ${{ steps.gate.outputs.sequence }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Gate checks
+        id: gate
+        env:
+          # Context values only ever cross into the shell via env (§7.1) —
+          # a malicious-but-valid tag name must never be shell-evaluated.
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [ "$REF_TYPE" = "tag" ] || { echo "✖ not a tag push"; exit 1; }
+          printf '%s' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "✖ tag '$REF_NAME' is not exact SemVer"; exit 1; }
+          VERSION="${REF_NAME#v}"
+
+          # The tagged commit must be reachable from protected main.
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "✖ tagged commit is not on protected main"; exit 1; }
+
+          # Source sequence constant (the reviewed monotonic sequence).
+          SEQUENCE="$(grep -E '^let adaCLIReleaseSequence = [0-9]+$' \
+            TelegramConcierge/CLI/ReleaseSigning.swift | grep -oE '[0-9]+')"
+          [ -n "$SEQUENCE" ] || { echo "✖ adaCLIReleaseSequence not found"; exit 1; }
+
+          [ -f "$EXPECTED_PUBKEY" ] || { echo "✖ committed expected public key missing"; exit 1; }
+
+          # Live-channel supersession floor (shared script, also tested
+          # against a fake channel by scripts/publisher_selftest.py): ours
+          # must be strictly greater than the latest AUTHENTICATED live
+          # sequence, or be the one committed bootstrap release.
+          SEQUENCE="$SEQUENCE" REF_NAME="$REF_NAME" REPO="$REPO" EXPECTED_PUBKEY="$EXPECTED_PUBKEY" \
+            ./.github/scripts/check-supersession.sh
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sequence=$SEQUENCE" >> "$GITHUB_OUTPUT"
+
+  build-macos-arm64:
+    name: Build macOS arm64
+    needs: authorize
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Stamp version
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+        run: ./.github/scripts/stamp-version.sh "$VERSION"
+      - name: Build
+        run: swift build -c release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp LICENSE THIRD_PARTY_NOTICES.md .build/release/
+          tar -czf dist/ada-macos-arm64.tar.gz -C .build/release ada ada-cli_ada.bundle LICENSE THIRD_PARTY_NOTICES.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ada-macos-arm64
+          path: dist/ada-macos-arm64.tar.gz
+
+  build-linux-x64:
+    name: Build Linux x64
+    needs: authorize
+    runs-on: ubuntu-latest
+    # swift:6.1-jammy (multi-arch index, resolved 2026-08-30)
+    container: swift@sha256:159943c473b8d7c57fb18d1f0e9cd7f3b011f05511a39ee1f53ed92bc6cd13d9
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Stamp version
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+        run: ./.github/scripts/stamp-version.sh "$VERSION"
+      - name: Build (static Swift stdlib)
+        run: swift build -c release --static-swift-stdlib
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp LICENSE THIRD_PARTY_NOTICES.md .build/release/
+          tar -czf dist/ada-linux-x64.tar.gz -C .build/release ada ada-cli_ada.resources LICENSE THIRD_PARTY_NOTICES.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ada-linux-x64
+          path: dist/ada-linux-x64.tar.gz
+
+  build-linux-arm64:
+    name: Build Linux arm64 (native)
+    needs: authorize
+    # GitHub-hosted native ARM runner — validated 2026-08-30 (4 CPU/16 GB,
+    # release build 4m15s). QEMU fallback documented in the plan, §7.2.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    container: swift@sha256:159943c473b8d7c57fb18d1f0e9cd7f3b011f05511a39ee1f53ed92bc6cd13d9
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Stamp version
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+        run: ./.github/scripts/stamp-version.sh "$VERSION"
+      - name: Build (static Swift stdlib)
+        run: swift build -c release --static-swift-stdlib
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp LICENSE THIRD_PARTY_NOTICES.md .build/release/
+          tar -czf dist/ada-linux-arm64.tar.gz -C .build/release ada ada-cli_ada.resources LICENSE THIRD_PARTY_NOTICES.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ada-linux-arm64
+          path: dist/ada-linux-arm64.tar.gz
+
+  assemble:
+    name: Assemble manifest
+    needs: [authorize, build-macos-arm64, build-linux-x64, build-linux-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Build manifest (all three platforms required)
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for platform in macos-arm64 linux-x64 linux-arm64; do
+            [ -f "dist/ada-$platform.tar.gz" ] || { echo "✖ missing dist/ada-$platform.tar.gz"; exit 1; }
+          done
+          ./.github/scripts/build-manifest.sh "$VERSION" "$SEQUENCE" dist/manifest.json
+          cat dist/manifest.json
+          # Checksum sidecars for the installer's disclosed TLS-bootstrap
+          # fallback (systems without python3/openssl); signed-path clients
+          # never read them.
+          for tarball in dist/ada-*.tar.gz; do
+            (cd dist && sha256sum "$(basename "$tarball")" > "$(basename "$tarball").sha256")
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: manifest
+          path: |
+            dist/manifest.json
+            dist/*.sha256
+
+  sign:
+    name: Sign metadata
+    needs: [authorize, assemble]
+    runs-on: ubuntu-latest
+    environment: release-sign
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: manifest
+          path: dist
+      - name: Sign the manifest
+        env:
+          SIGNING_KEY_B64: ${{ secrets.ADA_CLI_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$SIGNING_KEY_B64" ] || { echo "✖ ADA_CLI_SIGNING_KEY is not configured"; exit 1; }
+          KEYFILE="$(mktemp)"
+          chmod 600 "$KEYFILE"
+          trap 'rm -f "$KEYFILE"' EXIT
+          printf '%s' "$SIGNING_KEY_B64" | base64 -d > "$KEYFILE"
+          EXPECTED_PUBKEY_PEM="$EXPECTED_PUBKEY" \
+            ./.github/scripts/sign-envelope.sh "$KEYFILE" ada-cli dist/manifest.json dist/manifest.sig.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: envelope
+          path: dist/manifest.sig.json
+
+  verify-candidate:
+    name: Verify candidate (${{ matrix.label }})
+    needs: [authorize, sign]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - label: macos
+            os: macos-15
+            platform: macos-arm64
+          - label: linux
+            os: ubuntu-latest
+            platform: linux-x64
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Run the built binary's own verifier over the fresh envelope
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          mkdir extracted
+          tar -xzf "dist/ada-$PLATFORM.tar.gz" -C extracted
+          ./extracted/ada __verify-envelope dist/manifest.sig.json \
+            --expect-version "$VERSION" --expect-sequence "$SEQUENCE"
+          # The authenticated hashes must match the actual artifacts.
+          python3 - <<'PYEOF'
+          import base64, hashlib, json
+          payload = json.loads(base64.b64decode(json.load(open("dist/manifest.sig.json"))["payload"]))
+          for platform, entry in payload["platforms"].items():
+              path = f"dist/ada-{platform}.tar.gz"
+              digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+              assert digest == entry["sha256"], f"hash mismatch for {platform}"
+              import os
+              assert os.path.getsize(path) == entry["size"], f"size mismatch for {platform}"
+          print("artifact hashes and sizes match the authenticated manifest")
+          PYEOF
+
+  publish:
+    name: Publish immutable release
+    needs: [authorize, verify-candidate]
+    runs-on: ubuntu-latest
+    environment: release-publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Re-check supersession inside the publish lock
+        env:
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: ./.github/scripts/check-supersession.sh
+      - name: Assemble draft, envelope last, publish once (confirmed by re-read)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: ./.github/scripts/publish-release.sh
+
+  legacy-blob-dual-publish:
+    name: Transitional legacy Blob dual-publish (§6.3)
+    # Lets clients ≤ v0.1.57 make their disclosed final unauthenticated hop.
+    # A SEPARATE job, deliberately: it runs only after the authoritative
+    # GitHub release is live and nothing depends on it, so a Blob failure is
+    # reported as this job's own failure and can neither block
+    # verify-production nor corrupt the release. Removed (with the token
+    # revoked) when the transition window closes.
+    needs: [authorize, publish]
+    if: vars.LEGACY_BLOB_DUAL_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: release-publish
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the legacy Blob layout
+        env:
+          BLOB_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          BLOB_PUBLIC_PREFIX: https://z3hrivnareyralos.public.blob.vercel-storage.com/cli
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ./.github/scripts/publish-cdn.sh "$REF_NAME" || {
+            echo "⚠ legacy Blob dual-publish FAILED — the authoritative GitHub release IS live and verified independently; legacy clients cannot hop until this is fixed"
+            exit 1
+          }
+
+  verify-production:
+    name: Verify public channel (${{ matrix.label }})
+    needs: [authorize, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos
+            os: macos-15
+            platform: macos-arm64
+          - label: linux
+            os: ubuntu-latest
+            platform: linux-x64
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      # The committed expected key + verifier script are the trust anchor
+      # here; the candidate artifacts (already verified by verify-candidate)
+      # are what the public bytes must equal. The downloaded binary is run
+      # only AFTER authentication, as a functional check.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Authenticate, then download and compare through the public latest path
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          PLATFORM: ${{ matrix.platform }}
+          REPO: ${{ github.repository }}
+          CANDIDATE_TARBALL: dist/ada-${{ matrix.platform }}.tar.gz
+          CANDIDATE_ENVELOPE: dist/manifest.sig.json
+        run: ./.github/scripts/verify-public-release.sh

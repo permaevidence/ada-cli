@@ -12,6 +12,10 @@ credentials.json
 auth.json
 *.key
 *.pem
+# The committed PUBLIC release-verification key is the one deliberate
+# exception — it is the expected-key pin the signing pipeline checks
+# against (never a private key; sign-envelope.sh derives and compares).
+!.github/release-keys/*.pub.pem
 *.p12
 *_ed25519*
 *.minisig

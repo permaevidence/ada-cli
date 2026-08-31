@@ -52,6 +52,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ADA = sys.argv[1] if len(sys.argv) > 1 else ".build/debug/ada"
 # Repo root for selftests that scan the source tree (midturn invariant scan).
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The binary's embedded release sequence (its anti-rollback floor). Mock
+# release channels must use sequences RELATIVE to it: release-prep commits
+# bump the constant, and the staging pipeline stamps it, so hardcoded
+# fixture sequences go red exactly when a release is being cut.
+def _source_release_sequence():
+    try:
+        src = open(os.path.join(REPO_ROOT, "TelegramConcierge", "CLI", "ReleaseSigning.swift")).read()
+        return int(re.search(r"^let adaCLIReleaseSequence = (\d+)$", src, re.M).group(1))
+    except Exception:
+        return 58
+BASE_SEQ = _source_release_sequence()
 MOCK_REPLY = "Hello from the mock model! Smoke test says hi."
 
 passed = 0
@@ -178,6 +190,26 @@ def main():
     # sidecar flock must genuinely serialize writers. Isolated XDG roots.
     result = subprocess.run([ADA, "__secretstore-selftest"], capture_output=True, text=True, timeout=120)
     check("secretstore-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c1a2. signed release channel (RELEASE_SIGNING_PLAN §11): RFC 8032
+    # vectors, envelope/domain/manifest strictness, anti-rollback decisions,
+    # trust store, bounded streaming downloads, OpenSSL↔Swift interop
+    # through the real keygen + signing scripts (needs the repo-root cwd).
+    result = subprocess.run([ADA, "__release-signing-selftest"], capture_output=True,
+                            text=True, timeout=300, cwd=REPO_ROOT)
+    check("release-signing-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # 3c1a3. publisher fault-injection battery (RELEASE_SIGNING_PLAN §11.3):
+    # the real check-supersession / publish-release / verify-public-release /
+    # publish-cdn scripts against a fake Releases API + download host + Blob
+    # — bootstrap gating, envelope-last uploads, ambiguous publish, the
+    # authenticate-FIRST public verification (forged-binary regression),
+    # Blob isolation, and workflow-structure invariants.
+    result = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "publisher_selftest.py")],
+                            capture_output=True, text=True, timeout=600, cwd=REPO_ROOT)
+    check("publisher-selftest", result.returncode == 0,
           (result.stdout + result.stderr)[-1500:])
 
     # 3c1b. userdata toolchain installer: fake-apt/dpkg-backed prefix
@@ -640,22 +672,20 @@ def main():
                 tar_bytes = f.read()
             tar_sha = hashlib.sha256(tar_bytes).hexdigest()
 
-            # Mutable so later checks can re-point the mock CDN at a
+            # SIGNED mock channel (the client is signed-only): the harness
+            # signs each mock manifest with a deterministic test key through
+            # the binary's own -dev-gated `__test-sign-envelope`, and hands
+            # the client the matching pinned key via ADA_RELEASE_TEST_KEY.
+            # Mutable so later checks can re-point the channel at a
             # downgrade version or a corrupted build.
-            cdn_state = {"version": "9.9.9", "tar": tar_bytes, "sha": tar_sha}
+            cdn_state = {"envelope": b"", "tar": tar_bytes}
 
             class MockCDNHandler(BaseHTTPRequestHandler):
                 protocol_version = "HTTP/1.1"
 
                 def do_GET(self):
-                    if self.path.endswith("/manifest.json"):
-                        body = json.dumps({
-                            "version": cdn_state["version"],
-                            "platforms": {cdn_platform: {
-                                "url": f"http://127.0.0.1:{cdn_port}/ada.tar.gz",
-                                "sha256": cdn_state["sha"],
-                            }},
-                        }).encode()
+                    if self.path == "/manifest.sig.json":
+                        body = cdn_state["envelope"]
                         ctype = "application/json"
                     elif self.path.endswith("/ada.tar.gz"):
                         body = cdn_state["tar"]
@@ -676,12 +706,49 @@ def main():
             cdn = ThreadingHTTPServer(("127.0.0.1", 0), MockCDNHandler)
             cdn_port = cdn.server_address[1]
             threading.Thread(target=cdn.serve_forever, daemon=True).start()
+
+            import datetime as dt
+            TEST_SEED = "5eed" * 16
+
+            def sign_mock(version, sequence, tar, sha):
+                now = dt.datetime.now(dt.timezone.utc)
+                manifest = {
+                    "schema": 1, "channel": "ada-cli", "sequence": sequence,
+                    "version": version,
+                    "published": (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "expires": (now + dt.timedelta(days=180)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "platforms": {cdn_platform: {
+                        "url": f"http://127.0.0.1:{cdn_port}/dl/v{version}/ada.tar.gz",
+                        "sha256": sha, "size": len(tar),
+                    }},
+                }
+                mpath = os.path.join(home, "mock-manifest.json")
+                epath = os.path.join(home, "mock-manifest.sig.json")
+                with open(mpath, "w") as f:
+                    json.dump(manifest, f, separators=(",", ":"))
+                result = subprocess.run(
+                    [ADA, "__test-sign-envelope", mpath, epath, "--seed-hex", TEST_SEED],
+                    capture_output=True, text=True, check=True)
+                key_id = pub_hex = None
+                for line in result.stdout.splitlines():
+                    if line.startswith("keyId="):
+                        key_id = line[len("keyId="):]
+                    elif line.startswith("publicKeyHex="):
+                        pub_hex = line[len("publicKeyHex="):]
+                with open(epath, "rb") as f:
+                    cdn_state["envelope"] = f.read()
+                cdn_state["tar"] = tar
+                return key_id, pub_hex
+
+            test_key_id, test_pub_hex = sign_mock("9.9.9", BASE_SEQ + 1, tar_bytes, tar_sha)
             llm = ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
             llm_port = llm.server_address[1]
             threading.Thread(target=llm.serve_forever, daemon=True).start()
 
             env = isolated_env(home)
-            env["ADA_BASE_URL"] = f"http://127.0.0.1:{cdn_port}"
+            env["ADA_ENVELOPE_URL"] = f"http://127.0.0.1:{cdn_port}/manifest.sig.json"
+            env["ADA_RELEASE_URL_PREFIX"] = f"http://127.0.0.1:{cdn_port}/dl/v{{version}}/"
+            env["ADA_RELEASE_TEST_KEY"] = f"{test_key_id}:{test_pub_hex}"
             config_dir = os.path.join(home, ".config", "ada")
             os.makedirs(config_dir, exist_ok=True)
             with open(os.path.join(config_dir, "secrets.json"), "w") as f:
@@ -747,7 +814,7 @@ def main():
 
                 # Downgrade refusal: the CDN briefly serving an OLDER version
                 # (concurrent-release race) must never be installed.
-                cdn_state["version"] = "0.0.1"
+                sign_mock("0.0.1", BASE_SEQ + 2, tar_bytes, tar_sha)
                 proc.stdin.write(b"/upgrade\n")
                 proc.stdin.flush()
                 refused = wait_for("Not downgrading", 60)
@@ -768,8 +835,8 @@ def main():
                                 "ada", bundle_name], check=True)
                 with open(corrupt_tar, "rb") as f:
                     corrupt_bytes = f.read()
-                cdn_state.update(version="8.8.8", tar=corrupt_bytes,
-                                 sha=hashlib.sha256(corrupt_bytes).hexdigest())
+                sign_mock("8.8.8", BASE_SEQ + 3, corrupt_bytes,
+                          hashlib.sha256(corrupt_bytes).hexdigest())
                 proc.stdin.write(b"/upgrade\n")
                 proc.stdin.flush()
                 rejected = wait_for("failed verification", 120)
@@ -794,7 +861,7 @@ def main():
                     with open(path, "rb") as f:
                         return hashlib.sha256(f.read()).hexdigest()
                 pre_hash = sha256_of(os.path.join(install_dir, "ada"))
-                cdn_state.update(version="7.7.7", tar=tar_bytes, sha=tar_sha)
+                sign_mock("7.7.7", BASE_SEQ + 4, tar_bytes, tar_sha)
                 env2 = dict(env)
                 env2["ADA_UPGRADE_FAULT"] = "bundle-move"
                 proc2 = subprocess.Popen(
@@ -1282,16 +1349,17 @@ def main():
             p5_tar_bytes = f.read()
         p5_sha = hashlib5.sha256(p5_tar_bytes).hexdigest()
 
+        # Signed mock channel, same contract as phase 7's: the client is
+        # signed-only, so the mock serves a __test-sign-envelope-signed
+        # envelope and the harness pins the test key via env.
+        p5_envelope = {"body": b""}
+
         class P5CDNHandler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def do_GET(self):
-                if self.path.endswith("/manifest.json"):
-                    body = json.dumps({"version": "9.9.9", "platforms": {
-                        p5_platform: {
-                            "url": f"http://127.0.0.1:{p5_cdn_port}/p5.tar.gz",
-                            "sha256": p5_sha}}}).encode()
-                    ctype = "application/json"
+                if self.path == "/manifest.sig.json":
+                    body, ctype = p5_envelope["body"], "application/json"
                 elif self.path.endswith("/p5.tar.gz"):
                     body, ctype = p5_tar_bytes, "application/gzip"
                 else:
@@ -1310,6 +1378,32 @@ def main():
         p5_cdn = ThreadingHTTPServer(("127.0.0.1", 0), P5CDNHandler)
         p5_cdn_port = p5_cdn.server_address[1]
         threading.Thread(target=p5_cdn.serve_forever, daemon=True).start()
+
+        import datetime as p5_dt
+        p5_now = p5_dt.datetime.now(p5_dt.timezone.utc)
+        p5_manifest = {
+            "schema": 1, "channel": "ada-cli", "sequence": BASE_SEQ + 1, "version": "9.9.9",
+            "published": (p5_now - p5_dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expires": (p5_now + p5_dt.timedelta(days=180)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "platforms": {p5_platform: {
+                "url": f"http://127.0.0.1:{p5_cdn_port}/dl/v9.9.9/p5.tar.gz",
+                "sha256": p5_sha, "size": len(p5_tar_bytes)}},
+        }
+        p5_mpath = os.path.join(home, "p5-manifest.json")
+        p5_epath = os.path.join(home, "p5-manifest.sig.json")
+        with open(p5_mpath, "w") as f:
+            json.dump(p5_manifest, f, separators=(",", ":"))
+        p5_sign = subprocess.run(
+            [ADA, "__test-sign-envelope", p5_mpath, p5_epath, "--seed-hex", "5eed" * 16],
+            capture_output=True, text=True, check=True)
+        p5_key_id = p5_pub_hex = None
+        for line in p5_sign.stdout.splitlines():
+            if line.startswith("keyId="):
+                p5_key_id = line[len("keyId="):]
+            elif line.startswith("publicKeyHex="):
+                p5_pub_hex = line[len("publicKeyHex="):]
+        with open(p5_epath, "rb") as f:
+            p5_envelope["body"] = f.read()
 
         with tg_lock:
             tg_state["updates"].clear()
@@ -1336,7 +1430,9 @@ def main():
         tg_mark("phase5-start")
         try:
             out5, rc5 = run_poller_phase(
-                {"ADA_BASE_URL": f"http://127.0.0.1:{p5_cdn_port}"}, phase5,
+                {"ADA_ENVELOPE_URL": f"http://127.0.0.1:{p5_cdn_port}/manifest.sig.json",
+                 "ADA_RELEASE_URL_PREFIX": f"http://127.0.0.1:{p5_cdn_port}/dl/v{{version}}/",
+                 "ADA_RELEASE_TEST_KEY": f"{p5_key_id}:{p5_pub_hex}"}, phase5,
                 binary=os.path.join(p5_install, "ada"))
         finally:
             p5_cdn.shutdown()

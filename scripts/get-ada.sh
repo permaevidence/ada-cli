@@ -1,24 +1,36 @@
 #!/bin/bash
 # Public Ada CLI installer — prebuilt binaries, no GitHub account, no Swift.
 #
-#   curl -fsSL https://ada-app-psi.vercel.app/cli/install.sh | bash
-#   wget -qO-  https://ada-app-psi.vercel.app/cli/install.sh | bash   (no curl)
+#   curl -fsSL https://github.com/permaevidence/ada-cli/releases/latest/download/install.sh | bash
+#   wget -qO-  … | bash   (no curl)
 #
-# Downloads the prebuilt tarball for this OS/arch from the Ada release CDN,
-# verifies its SHA-256, and installs `ada` + its resource bundle.
-#   ADA_INSTALL_DIR=/some/bin      install location. Default: ~/.local/bin
-#                                  (user-writable, so remote /upgrade from
-#                                  Telegram never needs a sudo password);
-#                                  /usr/local/bin when running as root.
-#   ADA_BASE_URL=…                 alternate release CDN (testing)
+# Downloads the prebuilt tarball for this OS/arch from the signed GitHub
+# release channel and installs `ada` + its resource bundle.
 #
-# This script is published to the CDN by .github/workflows/release.yml;
-# scripts/get-ada.sh in the repo is the source of truth. Artifacts download
-# straight from the Blob CDN (not proxied through the website) — only this
-# script's memorable URL lives on the ada domain.
+# AUTHENTICATION (docs/RELEASE_SIGNING_PLAN.md §8.2): when this machine has
+# python3 and an Ed25519-capable openssl (proven against a LOCAL RFC 8032
+# known vector, never against live content), the installer verifies the
+# signed release envelope with the embedded public key, then downloads the
+# exact version-pinned asset it authenticates, enforcing size and SHA-256.
+# Without that capability it falls back to a plainly disclosed TLS bootstrap
+# (checksum from the same origin). Either way, the FIRST install trusts the
+# origin that served this script; the installed binary's pinned key protects
+# every later update.
+#
+#   ADA_INSTALL_DIR=/some/bin   install location. Default: ~/.local/bin
+#                               (user-writable, so remote /upgrade from
+#                               Telegram never needs a sudo password);
+#                               /usr/local/bin when running as root.
+#   ADA_RELEASE_BASE=…          alternate releases base (staging/testing)
+#
+# scripts/get-ada.sh in the repo is the source of truth; the release
+# workflow publishes it as the `install.sh` asset of every release.
 set -euo pipefail
 
-BASE_URL="${ADA_BASE_URL:-https://z3hrivnareyralos.public.blob.vercel-storage.com/cli}"
+RELEASE_BASE="${ADA_RELEASE_BASE:-https://github.com/permaevidence/ada-cli/releases}"
+# Stamped at the key ceremony (64 hex chars of the raw Ed25519 public key).
+# Empty = pre-ceremony build: TLS bootstrap only.
+ADA_RELEASE_PUBKEY_HEX="621031636aa2bb2edb64a58f2f72de7bc3559b08d717c79b4251f8b1e35b8a95" # STAMP-INSTALLER-KEY
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -80,20 +92,187 @@ TARBALL="ada-$PLATFORM.tar.gz"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "Downloading Ada CLI ($PLATFORM)…"
-fetch "$TMP/$TARBALL"        "$BASE_URL/latest/$TARBALL"
-fetch "$TMP/$TARBALL.sha256" "$BASE_URL/latest/$TARBALL.sha256"
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
 
-echo "Verifying checksum…"
-EXPECTED="$(awk '{print $1}' "$TMP/$TARBALL.sha256")"
-if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL="$(sha256sum "$TMP/$TARBALL" | awk '{print $1}')"
-else
-    ACTUAL="$(shasum -a 256 "$TMP/$TARBALL" | awk '{print $1}')"
+# Ed25519-capable openssl: must ACCEPT the RFC 8032 TEST 2 vector and
+# REJECT a tampered copy of it. A capability probe over a local known
+# vector — a live signature failure is never misread as "unsupported".
+probe_openssl() {
+    local ossl="$1" d="$TMP/probe"
+    rm -rf "$d"; mkdir -p "$d"
+    python3 - "$d" <<'PYEOF' || return 1
+import sys
+d = sys.argv[1]
+pub = bytes.fromhex("302a300506032b6570032100"
+                    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+open(d + "/pub.der", "wb").write(pub)
+open(d + "/msg", "wb").write(bytes.fromhex("72"))
+sig = bytes.fromhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+                    "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00")
+open(d + "/sig", "wb").write(sig)
+bad = bytearray(sig); bad[0] ^= 1
+open(d + "/badsig", "wb").write(bytes(bad))
+PYEOF
+    "$ossl" pkey -pubin -inform DER -in "$d/pub.der" -out "$d/pub.pem" 2>/dev/null || return 1
+    "$ossl" pkeyutl -verify -rawin -pubin -inkey "$d/pub.pem" \
+        -in "$d/msg" -sigfile "$d/sig" >/dev/null 2>&1 || return 1
+    if "$ossl" pkeyutl -verify -rawin -pubin -inkey "$d/pub.pem" \
+        -in "$d/msg" -sigfile "$d/badsig" >/dev/null 2>&1; then return 1; fi
+    return 0
+}
+
+OPENSSL=""
+if [ -n "$ADA_RELEASE_PUBKEY_HEX" ] && command -v python3 >/dev/null 2>&1; then
+    for candidate in "${OPENSSL_BIN:-}" openssl \
+        /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+        [ -n "$candidate" ] || continue
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        if probe_openssl "$candidate"; then OPENSSL="$candidate"; break; fi
+    done
 fi
-if [ "$EXPECTED" != "$ACTUAL" ]; then
-    echo "✖ Checksum mismatch — download corrupted or tampered with. Aborting."
-    exit 1
+
+if [ -n "$OPENSSL" ]; then
+    echo "Fetching signed release metadata…"
+    fetch "$TMP/manifest.sig.json" "$RELEASE_BASE/latest/download/manifest.sig.json"
+    ENV_SIZE="$(wc -c < "$TMP/manifest.sig.json" | tr -d ' ')"
+    [ "$ENV_SIZE" -le 131072 ] || { echo "✖ envelope is $ENV_SIZE bytes (limit 131072) — refusing."; exit 1; }
+
+    # Strict parse + payload validation in stdlib python; Ed25519 verify in
+    # openssl. Everything the download below uses comes from the
+    # AUTHENTICATED payload: version-pinned URL, exact size, SHA-256.
+    python3 - "$TMP" "$ADA_RELEASE_PUBKEY_HEX" "$PLATFORM" <<'PYEOF'
+import base64, datetime, hashlib, json, sys
+tmp, pub_hex, platform = sys.argv[1:4]
+raw = open(f"{tmp}/manifest.sig.json", "rb").read()
+try:
+    env = json.loads(raw.decode("utf-8"))
+except Exception:
+    sys.exit("ENVELOPE-FAIL: not valid JSON")
+if not isinstance(env, dict):
+    sys.exit("ENVELOPE-FAIL: not a JSON object")
+for field in ("format", "channel", "keyId", "payload", "signature"):
+    if not isinstance(env.get(field), str):
+        sys.exit(f"ENVELOPE-FAIL: field '{field}' missing")
+if env["format"] != "ada-release-envelope-v1":
+    sys.exit("ENVELOPE-FAIL: unsupported format")
+if env["channel"] != "ada-cli":
+    sys.exit("ENVELOPE-FAIL: wrong channel")
+fp = hashlib.sha256(bytes.fromhex(pub_hex)).hexdigest()[:16]
+if not (env["keyId"].startswith("ada-cli-release-v") and env["keyId"].endswith("-" + fp)):
+    sys.exit("ENVELOPE-FAIL: keyId does not match the embedded key")
+def strict_b64(value, name):
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except Exception:
+        sys.exit(f"ENVELOPE-FAIL: '{name}' not valid base64")
+    if base64.b64encode(decoded).decode() != value:
+        sys.exit(f"ENVELOPE-FAIL: '{name}' not canonical base64")
+    return decoded
+payload = strict_b64(env["payload"], "payload")
+signature = strict_b64(env["signature"], "signature")
+if len(payload) > 65536:
+    sys.exit("ENVELOPE-FAIL: payload too large")
+if len(signature) != 64:
+    sys.exit("ENVELOPE-FAIL: signature is not 64 bytes")
+open(f"{tmp}/payload", "wb").write(payload)
+open(f"{tmp}/sig.bin", "wb").write(signature)
+domain = (b"ada-release-envelope-v1\0" + env["channel"].encode() + b"\0"
+          + env["keyId"].encode() + b"\0")
+open(f"{tmp}/input", "wb").write(domain + payload)
+open(f"{tmp}/relpub.der", "wb").write(
+    bytes.fromhex("302a300506032b6570032100") + bytes.fromhex(pub_hex))
+PYEOF
+
+    "$OPENSSL" pkey -pubin -inform DER -in "$TMP/relpub.der" -out "$TMP/relpub.pem" 2>/dev/null
+    if ! "$OPENSSL" pkeyutl -verify -rawin -pubin -inkey "$TMP/relpub.pem" \
+        -in "$TMP/input" -sigfile "$TMP/sig.bin" >/dev/null 2>&1; then
+        echo "✖ RELEASE SIGNATURE VERIFICATION FAILED — the release channel does not"
+        echo "  match Ada's pinned key. NOT installing. If this persists, check"
+        echo "  https://github.com/permaevidence/ada-cli/releases directly."
+        exit 1
+    fi
+
+    # Written to a file first: heredocs INSIDE $(…) trip bash 3.2's naive
+    # substitution scanner (apostrophes/parens in the body are miscounted).
+    cat > "$TMP/manifest_check.py" <<'PYEOF'
+import datetime, json, sys
+tmp, platform, release_base = sys.argv[1:4]
+manifest = json.loads(open(f"{tmp}/payload", "rb").read())
+if manifest.get("schema") != 1 or manifest.get("channel") != "ada-cli":
+    sys.exit("MANIFEST-FAIL: wrong schema/channel")
+version = manifest.get("version", "")
+import re
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+    sys.exit("MANIFEST-FAIL: bad version")
+def parse(ts):
+    return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+now = datetime.datetime.now(datetime.timezone.utc)
+if parse(manifest["expires"]) <= now:
+    sys.exit("MANIFEST-FAIL: metadata expired — stale or frozen channel")
+if parse(manifest["published"]) > now + datetime.timedelta(hours=24):
+    sys.exit("MANIFEST-FAIL: published in the future — check this machine's clock")
+entry = manifest.get("platforms", {}).get(platform)
+if not entry:
+    sys.exit(f"MANIFEST-FAIL: no build for {platform}")
+# Default: the canonical repo's version-pinned asset path. An overridden
+# RELEASE_BASE (staging/testing) moves the prefix with it — safety still
+# rests on the authenticated size + SHA-256 below, the prefix is
+# defense-in-depth for the default install.
+prefix = f"{release_base}/download/v{version}/"
+url = entry.get("url", "")
+if not url.startswith(prefix) or "/" in url[len(prefix):] or ".." in url:
+    sys.exit("MANIFEST-FAIL: asset URL outside the pinned release location")
+sha = entry.get("sha256", "")
+if not re.fullmatch(r"[0-9a-f]{64}", sha):
+    sys.exit("MANIFEST-FAIL: bad sha256")
+size = entry.get("size", 0)
+# 2 GiB ceiling (written as a literal: "<<" inside $() would be parsed
+# as a shell heredoc operator by bash)
+if not (isinstance(size, int) and 0 < size <= 2147483648):
+    sys.exit("MANIFEST-FAIL: bad size")
+print(version); print(url); print(sha); print(size)
+PYEOF
+    ASSET_INFO="$(python3 "$TMP/manifest_check.py" "$TMP" "$PLATFORM" "$RELEASE_BASE")"
+    VERSION="$(printf '%s\n' "$ASSET_INFO" | sed -n 1p)"
+    ASSET_URL="$(printf '%s\n' "$ASSET_INFO" | sed -n 2p)"
+    EXPECTED="$(printf '%s\n' "$ASSET_INFO" | sed -n 3p)"
+    ASSET_SIZE="$(printf '%s\n' "$ASSET_INFO" | sed -n 4p)"
+
+    echo "✔ signed release metadata verified: Ada CLI $VERSION"
+    echo "Downloading Ada CLI $VERSION ($PLATFORM)…"
+    fetch "$TMP/$TARBALL" "$ASSET_URL"
+    GOT_SIZE="$(wc -c < "$TMP/$TARBALL" | tr -d ' ')"
+    [ "$GOT_SIZE" = "$ASSET_SIZE" ] || {
+        echo "✖ downloaded $GOT_SIZE bytes, manifest authenticates $ASSET_SIZE — aborting."; exit 1; }
+    ACTUAL="$(sha256_of "$TMP/$TARBALL")"
+    [ "$EXPECTED" = "$ACTUAL" ] || {
+        echo "✖ checksum mismatch against the SIGNED manifest — aborting."; exit 1; }
+else
+    if [ -n "$ADA_RELEASE_PUBKEY_HEX" ]; then
+        echo "⚠ This system lacks python3 or an Ed25519-capable openssl, so the release"
+        echo "  signature CANNOT be verified here. Proceeding over HTTPS/TLS only —"
+        echo "  first-install authenticity rests on the TLS connection to github.com."
+    else
+        echo "⚠ Pre-release installer build without an embedded release key —"
+        echo "  installing over HTTPS/TLS only."
+    fi
+    echo "Downloading Ada CLI ($PLATFORM)…"
+    fetch "$TMP/$TARBALL"        "$RELEASE_BASE/latest/download/$TARBALL"
+    fetch "$TMP/$TARBALL.sha256" "$RELEASE_BASE/latest/download/$TARBALL.sha256"
+    echo "Verifying checksum…"
+    EXPECTED="$(awk '{print $1}' "$TMP/$TARBALL.sha256")"
+    ACTUAL="$(sha256_of "$TMP/$TARBALL")"
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo "✖ Checksum mismatch — download corrupted or tampered with. Aborting."
+        exit 1
+    fi
 fi
 
 tar -xzf "$TMP/$TARBALL" -C "$TMP"

@@ -4109,7 +4109,14 @@ class ConversationManager: ObservableObject {
             try? await sendText("✖ Ada can't persist state to disk right now (writes failing — check disk space); /upgrade is deferred until storage recovers.")
             return
         }
-        switch await UpgradeService.check() {
+        var trustWarnings: [String] = []
+        let checkResult = await UpgradeService.check(warn: { trustWarnings.append($0) })
+        for warning in trustWarnings {
+            try? await sendText(warning)
+        }
+        switch checkResult {
+        case .rollbackRefused(let live, let floor):
+            try? await sendText("✖ The release channel serves signed metadata with sequence \(live), BELOW this install's trusted floor \(floor). This can be a stale mirror — or a rollback attack. Refusing; if it persists, check https://github.com/permaevidence/ada-cli/releases directly.")
         case .failed(let reason):
             try? await sendText("✖ Update check failed: \(reason)")
         case .unsupportedPlatform:

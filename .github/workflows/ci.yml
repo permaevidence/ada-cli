@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux (Ubuntu, Swift container)
+    runs-on: ubuntu-latest
+    container: swift:6.1-jammy
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install runtime dependencies
+        run: |
+          apt-get update
+          apt-get install -y python3 poppler-utils imagemagick procps curl
+      - name: Build
+        run: swift build
+      - name: Smoke test
+        run: python3 scripts/smoke_test.py .build/debug/ada
+
+  macos:
+    name: macOS
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build
+        run: swift build
+      - name: Smoke test
+        run: python3 scripts/smoke_test.py .build/debug/ada

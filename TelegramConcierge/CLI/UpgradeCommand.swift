@@ -19,7 +19,10 @@ struct Upgrade: AsyncParsableCommand {
     func run() async throws {
         print("Checking for updates…")
         let update: UpgradeService.Update
-        switch await UpgradeService.check() {
+        switch await UpgradeService.check(warn: { print($0) }) {
+        case .rollbackRefused(let live, let floor):
+            print("✖ The release channel serves signed metadata with sequence \(live), BELOW this install's trusted floor \(floor). This can be a stale mirror — or a rollback attack. Refusing; if it persists, check https://github.com/permaevidence/ada-cli/releases directly.")
+            throw ExitCode(1)
         case .unsupportedPlatform:
             print("✖ No prebuilt releases exist for this platform.")
             throw ExitCode(1)
