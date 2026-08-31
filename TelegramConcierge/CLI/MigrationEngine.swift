@@ -76,6 +76,20 @@ struct MigrationSpec: Codable, Equatable {
     var newUnitText: String?
     var systemctl: String?
 
+    // Ubuntu Touch keep-awake unit (plan §4.3 step 1: BOTH units captured
+    // with three independent flags; recreated/retired transactionally
+    // "where privileges allow"). It is a SYSTEM unit — a separate systemctl
+    // seam without --user, and `wakelockManaged` says whether this process
+    // may modify system units (phones route that through the UT app's sudo
+    // dialog; an unmanaged run captures state and warns instead).
+    var oldWakelockUnitPath: String?
+    var newWakelockUnitPath: String?
+    var oldWakelockUnitName: String?
+    var newWakelockUnitName: String?
+    var newWakelockUnitText: String?
+    var wakelockSystemctl: String?
+    var wakelockManaged: Bool?
+
     // Bounded health probe (plan §4.3.5b): argv that must exit 0 against the
     // NEW identity before anything old is retired.
     var healthProbe: [String]
@@ -111,6 +125,7 @@ struct MigrationSpec: Codable, Equatable {
         upgradeMarkerNames ?? [".ada-upgrade-staged-bin", ".ada-upgrade-staged-bundle"]
     }
     var recoveryHint: String { recoveryCommand ?? "migrate" }
+    var wakelockPrivileged: Bool { wakelockManaged ?? false }
 
     /// Root pairs in move order. Only pairs whose old side exists at run
     /// time are moved; the journal records what was found.
@@ -135,6 +150,7 @@ struct MigrationJournal: Codable {
         var active: Bool
     }
     var oldService: UnitCapture?
+    var wakelockService: UnitCapture?
     var stoppedOldService: Bool
 
     var oldBinaryExists: Bool
@@ -165,6 +181,7 @@ struct MigrationJournal: Codable {
         var sha256: String?
         var mode: Int?
         var uid: Int?
+        var gid: Int?
         var target: String?
     }
     var preimages: [Preimage]
@@ -176,6 +193,8 @@ struct MigrationJournal: Codable {
         var kind: String   // "file" | "directory" | "symlink"
         var sha256: String?
         var mode: Int?
+        var uid: Int?
+        var gid: Int?
         var target: String?
     }
     var parked: [Parked]
@@ -184,6 +203,9 @@ struct MigrationJournal: Codable {
     var newUnitInstalled: Bool
     var newUnitEnabled: Bool
     var startedNewUnit: Bool
+    var newWakelockInstalled: Bool
+    var newWakelockEnabled: Bool
+    var startedNewWakelock: Bool
     var symlinkCreated: Bool
     /// §4.6: the file at oldBinary did not hash-match the capture — it was
     /// left untouched and no compat symlink was created.
@@ -229,6 +251,34 @@ final class MigrationEngine {
     static func run(spec: MigrationSpec, mode: MigrationMode,
                     log: @escaping (String) -> Void) -> MigrationOutcome {
         if let why = validateSpec(spec) { return .refused(why) }
+        // Exclusive cross-process lock (Codex Stage 3 round 1 #1): two
+        // concurrent migrate/recovery processes would load the same journal
+        // and race the same root renames. The lock is a SIBLING of the state
+        // dir — cleanup deletes the state dir wholesale, and unlinking a
+        // held lock would let a rival acquire a fresh inode at the same path
+        // (the toolchain-lock lesson). Held for the whole transaction;
+        // flock dies with the process, so a crash never wedges it.
+        let lockPath = spec.stateDir.hasSuffix("/")
+            ? String(spec.stateDir.dropLast()) + ".lock" : spec.stateDir + ".lock"
+        try? FileManager.default.createDirectory(
+            atPath: (lockPath as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)
+        let lockFD = open(lockPath, O_WRONLY | O_CREAT, 0o600)
+        guard lockFD >= 0 else {
+            return .refused("cannot open the migration lock at \(lockPath): "
+                + String(cString: strerror(errno)))
+        }
+        guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
+            close(lockFD)
+            return .refused("another migration or recovery process is already running "
+                + "(lock \(lockPath) is held) — wait for it to finish and retry")
+        }
+        // Close-on-exec, or the daemon this migration STARTS inherits the fd
+        // and keeps the flock alive after we exit — every later recovery
+        // would then refuse against a phantom holder (the InstanceLock
+        // lesson).
+        _ = fcntl(lockFD, F_SETFD, FD_CLOEXEC)
+        defer { flock(lockFD, LOCK_UN); close(lockFD) }
         let journalPath = URL(fileURLWithPath: spec.stateDir)
             .appendingPathComponent("journal.json")
         if FileManager.default.fileExists(atPath: journalPath.path) {
@@ -354,56 +404,134 @@ final class MigrationEngine {
         guard states.contains(journal.state) else {
             return .failure(LoadFailure(message: "the migration journal has unknown state \"\(journal.state)\" — refusing to act on it"))
         }
-        // Every recorded path must sit under a location the spec names.
+        // Every recorded path must resolve — symlinks canonicalized through
+        // the deepest existing ancestor — to a location STRICTLY INSIDE one
+        // the spec names, never a whole directory itself: rollback DELETES
+        // `absent` paths, so a corrupted entry naming e.g. the wrapper bin
+        // dir must not validate (Codex Stage 3 round 1 #4).
         var allowed = spec.rootPairs.flatMap { [$0.old, $0.new] }
-        allowed += [spec.wrapperBinDir, spec.stateDir,
+        allowed += [spec.wrapperBinDir,
                     (spec.oldBinary as NSString).deletingLastPathComponent,
                     (spec.newBinary as NSString).deletingLastPathComponent]
         allowed += [spec.unitDir, spec.oldBundle, spec.newBundle].compactMap { $0 }
-        func allowedPath(_ path: String) -> Bool {
-            guard path.hasPrefix("/"), !path.split(separator: "/").contains("..") else {
-                return false
-            }
-            return allowed.contains { root in
-                path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        if let path = spec.oldWakelockUnitPath {
+            allowed.append((path as NSString).deletingLastPathComponent)
+        }
+        if let path = spec.newWakelockUnitPath {
+            allowed.append((path as NSString).deletingLastPathComponent)
+        }
+        let canonicalAllowed = allowed.compactMap { canonicalize($0) }
+        func strictlyInside(_ path: String) -> Bool {
+            guard let canonical = canonicalize(path) else { return false }
+            return canonicalAllowed.contains { root in
+                canonical.hasPrefix(root.hasSuffix("/") ? root : root + "/")
             }
         }
-        for pre in journal.preimages where !pre.type.hasPrefix("prefs-") {
-            guard allowedPath(pre.path) else {
-                return .failure(LoadFailure(message: "the migration journal records a path outside the expected locations "
-                    + "(\(pre.path)) — refusing to act on it"))
+        for pre in journal.preimages {
+            switch pre.type {
+            case "file":
+                guard pre.sha256 != nil, !pre.id.isEmpty else {
+                    return .failure(LoadFailure(message: "the migration journal has a file preimage without a hash (\(pre.path)) — refusing to act on it"))
+                }
+                guard strictlyInside(pre.path) else {
+                    return .failure(LoadFailure(message: "the migration journal records a path outside the expected locations (\(pre.path)) — refusing to act on it"))
+                }
+            case "symlink":
+                guard pre.target != nil else {
+                    return .failure(LoadFailure(message: "the migration journal has a symlink preimage without a target (\(pre.path)) — refusing to act on it"))
+                }
+                guard strictlyInside(pre.path) else {
+                    return .failure(LoadFailure(message: "the migration journal records a path outside the expected locations (\(pre.path)) — refusing to act on it"))
+                }
+            case "absent":
+                guard strictlyInside(pre.path) else {
+                    return .failure(LoadFailure(message: "the migration journal records a path outside the expected locations (\(pre.path)) — refusing to act on it"))
+                }
+            case "prefs-old-domain", "prefs-new-domain":
+                guard pre.path == spec.oldPrefsDomain || pre.path == spec.newPrefsDomain else {
+                    return .failure(LoadFailure(message: "the migration journal records an unexpected preferences domain (\(pre.path)) — refusing to act on it"))
+                }
+            default:
+                return .failure(LoadFailure(message: "the migration journal has a preimage of unknown type \"\(pre.type)\" — refusing to act on it"))
             }
         }
-        for pre in journal.preimages where pre.type.hasPrefix("prefs-") {
-            guard pre.path == spec.oldPrefsDomain || pre.path == spec.newPrefsDomain else {
-                return .failure(LoadFailure(message: "the migration journal records an unexpected preferences domain "
-                    + "(\(pre.path)) — refusing to act on it"))
-            }
-        }
+        // Parked assets restore to EXACT spec-named targets — validate the
+        // id → path binding precisely, not just containment.
+        let parkedTargets: [String: String?] = [
+            "unit": spec.unitDir.flatMap { dir in spec.oldUnitName.map { dir + "/" + $0 } },
+            "wakelock-unit": spec.oldWakelockUnitPath,
+            "binary": spec.oldBinary,
+            "bundle": spec.oldBundle,
+        ]
         for parked in journal.parked {
-            guard allowedPath(parked.originalPath) else {
-                return .failure(LoadFailure(message: "the migration journal records a parked asset outside the expected "
-                    + "locations (\(parked.originalPath)) — refusing to act on it"))
+            guard let expected = parkedTargets[parked.id] ?? nil,
+                  parked.originalPath == expected else {
+                return .failure(LoadFailure(message: "the migration journal records an unexpected parked asset (\(parked.id) → \(parked.originalPath)) — refusing to act on it"))
+            }
+            switch parked.kind {
+            case "file", "directory":
+                guard parked.sha256 != nil else {
+                    return .failure(LoadFailure(message: "the migration journal has a parked \(parked.id) without a hash — refusing to act on it"))
+                }
+            case "symlink":
+                guard parked.target != nil else {
+                    return .failure(LoadFailure(message: "the migration journal has a parked symlink without a target — refusing to act on it"))
+                }
+            default:
+                return .failure(LoadFailure(message: "the migration journal has a parked asset of unknown kind \"\(parked.kind)\" — refusing to act on it"))
             }
         }
-        for root in journal.roots {
-            guard allowedPath(root.old), allowedPath(root.new) else {
-                return .failure(LoadFailure(message: "the migration journal records a root outside the expected locations — refusing to act on it"))
+        // Roots must be exactly the spec's pairs, in order.
+        let specPairs = spec.rootPairs
+        guard journal.roots.count <= specPairs.count else {
+            return .failure(LoadFailure(message: "the migration journal records more roots than the spec defines — refusing to act on it"))
+        }
+        for (index, root) in journal.roots.enumerated() {
+            guard root.old == specPairs[index].old, root.new == specPairs[index].new else {
+                return .failure(LoadFailure(message: "the migration journal's root #\(index) does not match the spec — refusing to act on it"))
             }
         }
         return .success(journal)
+    }
+
+    /// Canonical form for containment checks: realpath(3) of the deepest
+    /// EXISTING ancestor (defeating symlinked parents), with the
+    /// not-yet-existing remainder re-appended (already traversal-checked).
+    static func canonicalize(_ path: String) -> String? {
+        guard path.hasPrefix("/"), !path.split(separator: "/").contains("..") else {
+            return nil
+        }
+        var existing = path
+        var remainder: [String] = []
+        while existing != "/" {
+            var st = stat()
+            if lstat(existing, &st) == 0 { break }
+            remainder.append((existing as NSString).lastPathComponent)
+            existing = (existing as NSString).deletingLastPathComponent
+            if existing.isEmpty { existing = "/" }
+        }
+        var buffer = [CChar](repeating: 0, count: 4096)
+        guard realpath(existing, &buffer) != nil else { return nil }
+        var canonical = String(cString: buffer)
+        for component in remainder.reversed() {
+            canonical += (canonical.hasSuffix("/") ? "" : "/") + component
+        }
+        return canonical
     }
 
     static func freshJournal(spec: MigrationSpec) -> MigrationJournal {
         MigrationJournal(
             schema: 1, state: "prepared",
             createdAt: ISO8601DateFormatter().string(from: Date()),
-            spec: spec, oldService: nil, stoppedOldService: false,
+            spec: spec, oldService: nil, wakelockService: nil,
+            stoppedOldService: false,
             oldBinaryExists: false, oldBinaryIsSymlink: false,
             oldBinarySymlinkTarget: nil, oldBinarySHA256: nil,
             roots: [], preimages: [], parked: [], fixupsDone: [],
             newUnitInstalled: false, newUnitEnabled: false,
-            startedNewUnit: false, symlinkCreated: false,
+            startedNewUnit: false,
+            newWakelockInstalled: false, newWakelockEnabled: false,
+            startedNewWakelock: false, symlinkCreated: false,
             binaryParkSkipped: false, warnings: [])
     }
 
@@ -449,10 +577,15 @@ final class MigrationEngine {
         return nil
     }
 
-    /// temp file → fsync(file) → rename(2) → fsync(directory). The journal
-    /// and every fixup modification ride on this.
+    /// temp file → checked chmod → fsync(file) → rename(2) →
+    /// fsync(directory). The journal and every fixup modification ride on
+    /// this. The mode is applied to the TEMP file, before the rename and the
+    /// barriers — a crash can therefore never leave the final path with
+    /// content but wrong permissions (Codex Stage 3 round 1 #3: secrets.json
+    /// must never exist with loosened permissions, even transiently across
+    /// power loss).
     @discardableResult
-    static func writeDurable(_ data: Data, to url: URL) -> String? {
+    static func writeDurable(_ data: Data, to url: URL, mode: Int? = nil) -> String? {
         let fm = FileManager.default
         let dir = url.deletingLastPathComponent()
         do {
@@ -463,6 +596,13 @@ final class MigrationEngine {
         let tmp = dir.appendingPathComponent(".migrate-tmp-\(UUID().uuidString)")
         do { try data.write(to: tmp) } catch {
             return "could not write \(tmp.path): \(error.localizedDescription)"
+        }
+        if let mode {
+            guard chmod(tmp.path, mode_t(mode)) == 0 else {
+                let why = String(cString: strerror(errno))
+                try? fm.removeItem(at: tmp)
+                return "could not set mode \(String(mode, radix: 8)) on \(url.path): \(why)"
+            }
         }
         if let why = fsyncPath(tmp) {
             try? fm.removeItem(at: tmp)
@@ -480,7 +620,7 @@ final class MigrationEngine {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(journal)
-        if let why = Self.writeDurable(data, to: journalURL) {
+        if let why = Self.writeDurable(data, to: journalURL, mode: 0o600) {
             throw EngineError(outcome: .failed("could not persist the migration journal: \(why)"))
         }
     }
@@ -624,6 +764,41 @@ final class MigrationEngine {
         return Self.runBounded([path, "--user"] + args, timeout: 60)
     }
 
+    /// System-bus systemctl for the wakelock unit (no --user).
+    func systemctlSystem(_ args: [String]) -> RunResult {
+        guard let path = spec.wakelockSystemctl ?? spec.systemctl else {
+            return RunResult(exitCode: 0, output: "")
+        }
+        return Self.runBounded([path] + args, timeout: 60)
+    }
+
+    /// A service operation whose failure must surface, never be shrugged
+    /// off (Codex Stage 3 round 1 #2): rollback deleting the journal after
+    /// an ignored failed restart would falsely report a restored system.
+    func systemctlChecked(_ args: [String], system: Bool = false,
+                          context: String) throws {
+        let result = system ? systemctlSystem(args) : systemctl(args)
+        guard result.exitCode == 0 else {
+            throw EngineError(outcome: .failed(
+                "\(context): systemctl \(args.joined(separator: " ")) failed "
+                + "(exit \(result.exitCode)): \(result.tail) — the journal at "
+                + "\(journalURL.path) is preserved; re-run `\(spec.recoveryHint)` after fixing this"))
+        }
+    }
+
+    func unitActive(_ name: String, system: Bool = false) -> Bool {
+        (system ? systemctlSystem(["is-active", name]) : systemctl(["is-active", name]))
+            .output.trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+    }
+    func unitEnabled(_ name: String, system: Bool = false) -> Bool {
+        (system ? systemctlSystem(["is-enabled", name]) : systemctl(["is-enabled", name]))
+            .output.trimmingCharacters(in: .whitespacesAndNewlines) == "enabled"
+    }
+
+    var wakelockConfigured: Bool {
+        spec.oldWakelockUnitPath != nil && spec.oldWakelockUnitName != nil
+    }
+
     var unitManaged: Bool { spec.systemctl != nil && spec.unitDir != nil
         && spec.oldUnitName != nil && spec.newUnitName != nil }
     var oldUnitPath: String? {
@@ -659,11 +834,20 @@ final class MigrationEngine {
             if existing.isEmpty {
                 return .ok(notes: ["nothing to migrate — no old roots present"])
             }
-            // Refusals that must not leave a journal behind.
-            for pair in existing where fm.fileExists(atPath: pair.new) {
-                return .refused("the new root \(pair.new) already exists while \(pair.old) is still present. "
-                    + "A previous partial attempt would have left a journal (none was found), so this "
-                    + "directory was not created by a migration — move it aside, then retry")
+            // Refusals that must not leave a journal behind. ANY existing
+            // new root refuses — even one whose old counterpart is absent:
+            // proceeding would mix unrelated pre-existing destination data
+            // into the migration (Codex Stage 3 round 1 #5).
+            for pair in spec.rootPairs where fm.fileExists(atPath: pair.new) {
+                return .refused("the new root \(pair.new) already exists. A previous partial "
+                    + "attempt would have left a journal (none was found), so this directory was "
+                    + "not created by a migration — move it aside, then retry")
+            }
+            if let newDomain = spec.newPrefsDomain,
+               let existingPrefs = UserDefaults.standard.persistentDomain(forName: newDomain),
+               !existingPrefs.isEmpty {
+                return .refused("the new preferences domain \(newDomain) already contains data — "
+                    + "it was not created by a migration; export/remove it first, then retry")
             }
             let binDir = (spec.oldBinary as NSString).deletingLastPathComponent
             for marker in spec.upgradeMarkers {
@@ -720,6 +904,21 @@ final class MigrationEngine {
             journal.oldService = MigrationJournal.UnitCapture(
                 name: unitName, unitPath: unitPath,
                 installed: installed, enabled: enabled, active: active)
+        }
+        if wakelockConfigured, let unitPath = spec.oldWakelockUnitPath,
+           let unitName = spec.oldWakelockUnitName {
+            let installed = fm.fileExists(atPath: unitPath)
+            journal.wakelockService = MigrationJournal.UnitCapture(
+                name: unitName, unitPath: unitPath,
+                installed: installed,
+                enabled: installed && unitEnabled(unitName, system: true),
+                active: installed && unitActive(unitName, system: true))
+            if installed && !spec.wakelockPrivileged {
+                journal.warnings.append(
+                    "the keep-awake unit \(unitName) is installed but this process has no "
+                    + "privileges to migrate system units — its captured state is recorded; "
+                    + "swap it via the companion app (or manually) after migration")
+            }
         }
         var st = stat()
         if lstat(spec.oldBinary, &st) == 0 {
@@ -795,8 +994,12 @@ final class MigrationEngine {
                 throw EngineError(outcome: handleMidTransactionFailure(
                     "could not move \(root.old) → \(root.new): \(String(cString: strerror(errno)))"))
             }
-            _ = Self.fsyncPath(URL(fileURLWithPath: parent))
-            _ = Self.fsyncPath(URL(fileURLWithPath: (root.old as NSString).deletingLastPathComponent))
+            for dir in [parent, (root.old as NSString).deletingLastPathComponent] {
+                if let why = Self.fsyncPath(URL(fileURLWithPath: dir)) {
+                    throw EngineError(outcome: handleMidTransactionFailure(
+                        "root move of \(root.old) is not durable: \(why)"))
+                }
+            }
             journal.roots[index].moved = true
             try persistJournal()
             log("moved \(root.old) → \(root.new)")
@@ -832,7 +1035,7 @@ final class MigrationEngine {
             let target = try fm.destinationOfSymbolicLink(atPath: path)
             journal.preimages.append(MigrationJournal.Preimage(
                 id: id, type: "symlink", path: path, sha256: nil,
-                mode: nil, uid: Int(st.st_uid), target: target))
+                mode: nil, uid: Int(st.st_uid), gid: Int(st.st_gid), target: target))
         } else {
             let url = URL(fileURLWithPath: path)
             guard let data = try? Data(contentsOf: url) else {
@@ -840,13 +1043,14 @@ final class MigrationEngine {
                     "cannot read \(path) for its preimage"))
             }
             let copy = preimagesDir.appendingPathComponent(id)
-            if let why = Self.writeDurable(data, to: copy) {
+            if let why = Self.writeDurable(data, to: copy, mode: 0o600) {
                 throw EngineError(outcome: handleMidTransactionFailure(
                     "cannot store the preimage of \(path): \(why)"))
             }
             journal.preimages.append(MigrationJournal.Preimage(
                 id: id, type: "file", path: path, sha256: Self.sha256(of: data),
-                mode: Int(st.st_mode & 0o7777), uid: Int(st.st_uid), target: nil))
+                mode: Int(st.st_mode & 0o7777), uid: Int(st.st_uid),
+                gid: Int(st.st_gid), target: nil))
         }
         try persistJournal()
     }
@@ -856,19 +1060,17 @@ final class MigrationEngine {
         if journal.preimages.contains(where: { $0.path == path }) { return }
         journal.preimages.append(MigrationJournal.Preimage(
             id: newPreimageID(), type: "absent", path: path, sha256: nil,
-            mode: nil, uid: nil, target: nil))
+            mode: nil, uid: nil, gid: nil, target: nil))
         try persistJournal()
     }
 
-    /// Fixup modification: staged copy + fsync + atomic rename, preserving
-    /// the original mode.
+    /// Fixup modification: staged copy with the target mode applied to the
+    /// temp file BEFORE the atomic rename — content and permissions become
+    /// visible together, durably.
     func stagedWrite(_ data: Data, to path: String, mode: Int?) throws {
-        if let why = Self.writeDurable(data, to: URL(fileURLWithPath: path)) {
+        if let why = Self.writeDurable(data, to: URL(fileURLWithPath: path), mode: mode) {
             throw EngineError(outcome: handleMidTransactionFailure(
                 "could not write \(path): \(why)"))
-        }
-        if let mode {
-            try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: path)
         }
     }
 
@@ -1075,16 +1277,17 @@ final class MigrationEngine {
         let export = try PropertyListSerialization.data(
             fromPropertyList: contents, format: .xml, options: 0)
         let id = newPreimageID()
-        if let why = Self.writeDurable(export, to: preimagesDir.appendingPathComponent(id)) {
+        if let why = Self.writeDurable(export, to: preimagesDir.appendingPathComponent(id),
+                                       mode: 0o600) {
             throw EngineError(outcome: handleMidTransactionFailure(
                 "cannot export the \(oldDomain) preferences domain: \(why)"))
         }
         journal.preimages.append(MigrationJournal.Preimage(
             id: id, type: "prefs-old-domain", path: oldDomain,
-            sha256: Self.sha256(of: export), mode: nil, uid: nil, target: nil))
+            sha256: Self.sha256(of: export), mode: nil, uid: nil, gid: nil, target: nil))
         journal.preimages.append(MigrationJournal.Preimage(
             id: newPreimageID(), type: "prefs-new-domain", path: newDomain,
-            sha256: nil, mode: nil, uid: nil, target: nil))
+            sha256: nil, mode: nil, uid: nil, gid: nil, target: nil))
         try persistJournal()
         defaults.setPersistentDomain(contents, forName: newDomain)
         defaults.synchronize()
@@ -1129,6 +1332,47 @@ final class MigrationEngine {
                 journal.startedNewUnit = true
                 try persistJournal()
                 log("started \(newUnitName)")
+            }
+        }
+
+        // 5a (continued): the keep-awake unit, transactionally, where
+        // privileges allow (plan §4.3.5a). Both old wakelock and new run
+        // side by side until retirement — two holders of one kernel
+        // wakelock are harmless, and the phone must never sleep mid-window.
+        if let wakelock = journal.wakelockService, wakelock.installed,
+           spec.wakelockPrivileged,
+           let newPath = spec.newWakelockUnitPath,
+           let newName = spec.newWakelockUnitName {
+            guard let unitText = spec.newWakelockUnitText else {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "the old keep-awake unit is installed but the spec provides no new unit text"))
+            }
+            try recordAbsent(newPath)
+            try stagedWrite(Data(unitText.utf8), to: newPath, mode: 0o644)
+            journal.newWakelockInstalled = true
+            try persistJournal()
+            let reload = systemctlSystem(["daemon-reload"])
+            guard reload.exitCode == 0 else {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "system daemon-reload failed after installing \(newName): \(reload.tail)"))
+            }
+            if wakelock.enabled {
+                let enable = systemctlSystem(["enable", newName])
+                guard enable.exitCode == 0 else {
+                    throw EngineError(outcome: handleMidTransactionFailure(
+                        "could not enable \(newName): \(enable.tail)"))
+                }
+                journal.newWakelockEnabled = true
+                try persistJournal()
+            }
+            if wakelock.active {
+                let start = systemctlSystem(["start", newName])
+                guard start.exitCode == 0 else {
+                    throw EngineError(outcome: handleMidTransactionFailure(
+                        "could not start \(newName): \(start.tail)"))
+                }
+                journal.startedNewWakelock = true
+                try persistJournal()
             }
         }
 
@@ -1195,7 +1439,8 @@ final class MigrationEngine {
             }
             journal.parked.append(MigrationJournal.Parked(
                 id: id, originalPath: originalPath, kind: kind, sha256: hash,
-                mode: Int(st.st_mode & 0o7777), target: target))
+                mode: Int(st.st_mode & 0o7777), uid: Int(st.st_uid),
+                gid: Int(st.st_gid), target: target))
             try persistJournal()
         }
         let dest = parkedDir.appendingPathComponent(id)
@@ -1205,24 +1450,50 @@ final class MigrationEngine {
                 "could not park \(originalPath): \(String(cString: strerror(errno))) — "
                 + "the journal is at \(journalURL.path); re-run `\(spec.recoveryHint)` to resume"))
         }
-        _ = Self.fsyncPath(parkedDir)
-        _ = Self.fsyncPath(URL(fileURLWithPath: (originalPath as NSString).deletingLastPathComponent))
+        for dir in [parkedDir,
+                    URL(fileURLWithPath: (originalPath as NSString).deletingLastPathComponent)] {
+            if let why = Self.fsyncPath(dir) {
+                throw EngineError(outcome: .failed(
+                    "parking of \(originalPath) is not durable: \(why) — the journal is "
+                    + "preserved; re-run `\(spec.recoveryHint)` to resume"))
+            }
+        }
     }
 
     /// Retirement sub-steps, each idempotent for forward recovery.
     func retire() throws {
         // Old unit: disable (reversible from captured flags), park the unit
-        // file, reload.
+        // file, reload — each checked; a silently failed retirement would
+        // leave two services owning one bot/conversation.
         if let service = journal.oldService, service.installed, unitManaged {
             if service.enabled, fm.fileExists(atPath: service.unitPath) {
-                _ = systemctl(["disable", service.name])
+                try systemctlChecked(["disable", service.name], context: "retirement")
             }
             if fm.fileExists(atPath: service.unitPath) {
                 try park(service.unitPath, id: "unit")
-                _ = systemctl(["daemon-reload"])
+                try systemctlChecked(["daemon-reload"], context: "retirement")
             }
         }
         Self.crashPoint("after-unit-retirement")
+
+        // Old keep-awake unit (privileged only): stop, disable, park, reload.
+        if let wakelock = journal.wakelockService, wakelock.installed,
+           spec.wakelockPrivileged {
+            if fm.fileExists(atPath: wakelock.unitPath) {
+                if wakelock.active {
+                    try systemctlChecked(["stop", wakelock.name], system: true,
+                                         context: "retirement")
+                }
+                if wakelock.enabled {
+                    try systemctlChecked(["disable", wakelock.name], system: true,
+                                         context: "retirement")
+                }
+                try park(wakelock.unitPath, id: "wakelock-unit")
+                try systemctlChecked(["daemon-reload"], system: true,
+                                     context: "retirement")
+            }
+        }
+        Self.crashPoint("after-wakelock-retirement")
 
         // Old binary: park ONLY a verified installation (plan §4.6) — the
         // content hash must match the capture. Anything else stays untouched
@@ -1309,9 +1580,26 @@ final class MigrationEngine {
                 problems.append("compat symlink does not resolve to \(spec.newBinary)")
             }
         }
-        if let service = journal.oldService, service.installed,
-           fm.fileExists(atPath: service.unitPath) {
-            problems.append("old unit file still present: \(service.unitPath)")
+        if let service = journal.oldService, service.installed {
+            if fm.fileExists(atPath: service.unitPath) {
+                problems.append("old unit file still present: \(service.unitPath)")
+            }
+            if unitManaged, unitActive(service.name) {
+                problems.append("the old unit \(service.name) is still active")
+            }
+        }
+        if journal.startedNewWakelock, let name = spec.newWakelockUnitName,
+           !unitActive(name, system: true) {
+            problems.append("the new keep-awake unit \(name) is not active")
+        }
+        if let wakelock = journal.wakelockService, wakelock.installed,
+           spec.wakelockPrivileged {
+            if fm.fileExists(atPath: wakelock.unitPath) {
+                problems.append("old keep-awake unit file still present: \(wakelock.unitPath)")
+            }
+            if unitActive(wakelock.name, system: true) {
+                problems.append("the old keep-awake unit \(wakelock.name) is still active")
+            }
         }
         guard problems.isEmpty else {
             throw EngineError(outcome: .failed(
@@ -1474,26 +1762,82 @@ final class MigrationEngine {
         return nil
     }
 
+    /// Where a recorded path lives RIGHT NOW: a retried rollback runs after
+    /// a partial one already moved some roots back, and restoring to the
+    /// recorded new-root path would then recreate the new root from
+    /// scratch. Translates new-root paths onto the old root when the move
+    /// back has already happened; nil means the containing root is in an
+    /// inconsistent state (both or neither side present) and the caller
+    /// must hold.
+    func currentLocation(of path: String) -> String? {
+        for pair in spec.rootPairs {
+            let newPrefix = pair.new.hasSuffix("/") ? pair.new : pair.new + "/"
+            guard path == pair.new || path.hasPrefix(newPrefix) else { continue }
+            let newThere = fm.fileExists(atPath: pair.new)
+            let oldThere = fm.fileExists(atPath: pair.old)
+            if newThere && !oldThere { return path }
+            if oldThere && !newThere {
+                return pair.old + String(path.dropFirst(pair.new.count))
+            }
+            return nil
+        }
+        return path   // outside every moved root (bin dir, unit dir, …)
+    }
+
     /// Ordinary rollback — valid strictly BEFORE `committing` (nothing has
     /// been parked or retired yet). Restores roots, preimages (verified by
     /// hash), service topology; deletes everything the migration created.
     func rollback(reason: String?) throws {
         if let reason { log("rolling back: \(reason)") }
-        // Stop/disable anything we started on the new identity.
+        // Stop/disable anything we started on the new identity — CHECKED: a
+        // rollback that leaves the new service running while reporting
+        // success would be a lie (Codex Stage 3 round 1 #2).
         if journal.startedNewUnit, let newUnitName = spec.newUnitName {
-            _ = systemctl(["stop", newUnitName])
+            try systemctlChecked(["stop", newUnitName], context: "rollback")
         }
         if journal.newUnitEnabled, let newUnitName = spec.newUnitName {
-            _ = systemctl(["disable", newUnitName])
+            try systemctlChecked(["disable", newUnitName], context: "rollback")
+        }
+        if journal.startedNewWakelock, let name = spec.newWakelockUnitName {
+            try systemctlChecked(["stop", name], system: true, context: "rollback")
+        }
+        if journal.newWakelockEnabled, let name = spec.newWakelockUnitName {
+            try systemctlChecked(["disable", name], system: true, context: "rollback")
         }
 
-        // Preimages in reverse order.
+        // Preimages in reverse order, each at its CURRENT location.
         for pre in journal.preimages.reversed() {
+            let location: String
+            switch pre.type {
+            case "absent", "file", "symlink":
+                guard let resolved = currentLocation(of: pre.path) else {
+                    throw EngineError(outcome: .failed(
+                        "rollback found the root containing \(pre.path) in an inconsistent "
+                        + "state — everything was held for inspection; the journal is at \(journalURL.path)"))
+                }
+                location = resolved
+            default:
+                location = pre.path
+            }
             switch pre.type {
             case "absent":
-                if fm.fileExists(atPath: pre.path)
-                    || (try? fm.destinationOfSymbolicLink(atPath: pre.path)) != nil {
-                    try? fm.removeItem(atPath: pre.path)
+                var st = stat()
+                if lstat(location, &st) == 0 {
+                    // We only ever CREATE files and symlinks. A directory
+                    // here means the record (or the world) is wrong — and
+                    // deleting a directory recursively on a corrupted
+                    // record is exactly the disaster validation exists to
+                    // prevent. Refuse and hold.
+                    guard (st.st_mode & S_IFMT) != S_IFDIR else {
+                        throw EngineError(outcome: .failed(
+                            "rollback found a DIRECTORY at the absent-recorded path \(location) "
+                            + "— refusing to delete it; the journal is preserved for inspection"))
+                    }
+                    do { try fm.removeItem(atPath: location) } catch {
+                        throw EngineError(outcome: .failed(
+                            "rollback could not remove the created path \(location): "
+                            + "\(error.localizedDescription) — the journal is preserved"))
+                    }
                 }
             case "file":
                 let stored = preimagesDir.appendingPathComponent(pre.id)
@@ -1502,18 +1846,23 @@ final class MigrationEngine {
                         "rollback could not read the preimage of \(pre.path) — everything was "
                         + "left in place at \(spec.stateDir); nothing more was restored"))
                 }
-                if let why = Self.writeDurable(data, to: URL(fileURLWithPath: pre.path)) {
+                if let why = Self.writeDurable(data, to: URL(fileURLWithPath: location),
+                                               mode: pre.mode) {
                     throw EngineError(outcome: .failed(
-                        "rollback could not restore \(pre.path): \(why) — the journal and "
+                        "rollback could not restore \(location): \(why) — the journal and "
                         + "preimages are preserved; re-run `\(spec.recoveryHint)` to retry"))
                 }
-                if let mode = pre.mode {
-                    try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: pre.path)
+                if let uid = pre.uid, let gid = pre.gid {
+                    guard chown(location, uid_t(uid), gid_t(gid)) == 0 else {
+                        throw EngineError(outcome: .failed(
+                            "rollback could not restore the ownership of \(location): "
+                            + "\(String(cString: strerror(errno))) — the journal is preserved"))
+                    }
                 }
             case "symlink":
-                try? fm.removeItem(atPath: pre.path)
+                try? fm.removeItem(atPath: location)
                 if let target = pre.target {
-                    try? fm.createSymbolicLink(atPath: pre.path, withDestinationPath: target)
+                    try fm.createSymbolicLink(atPath: location, withDestinationPath: target)
                 }
             case "prefs-new-domain":
                 let defaults = UserDefaults.standard
@@ -1532,11 +1881,12 @@ final class MigrationEngine {
             }
         }
 
-        // Verify restored files against their recorded hashes NOW, while
-        // fixup-touched paths (recorded under the new roots) still resolve —
-        // the roots move back only after every restore has been proven.
+        // Verify restored files against their recorded hashes NOW, at their
+        // current locations, BEFORE the roots move back — the move only
+        // happens after every restore has been proven.
         for pre in journal.preimages where pre.type == "file" {
-            guard Self.sha256(ofFile: URL(fileURLWithPath: pre.path)) == pre.sha256 else {
+            guard let location = currentLocation(of: pre.path),
+                  Self.sha256(ofFile: URL(fileURLWithPath: location)) == pre.sha256 else {
                 throw EngineError(outcome: .failed(
                     "rollback restored \(pre.path) but its hash does not match the preimage — "
                     + "the journal and preimages are preserved for inspection"))
@@ -1568,11 +1918,51 @@ final class MigrationEngine {
                 + "manual inspection; the journal is at \(journalURL.path)"))
         }
 
+        // Unit files created on the new identity are gone now (absent
+        // restores) — reload before restoring the old topology.
+        if unitManaged, journal.newUnitInstalled {
+            try systemctlChecked(["daemon-reload"], context: "rollback")
+        }
+        if journal.newWakelockInstalled {
+            try systemctlChecked(["daemon-reload"], system: true, context: "rollback")
+        }
+
         // Service topology as captured: the old unit was never uninstalled
         // before committing, only stopped — restart it if it was active.
         if journal.stoppedOldService, let service = journal.oldService, service.active {
-            _ = systemctl(["start", service.name])
+            try systemctlChecked(["start", service.name],
+                                 context: "rollback (restarting the old service)")
             log("restarted \(service.name)")
+        }
+
+        // VERIFY the restored topology before declaring success — the
+        // journal is deleted below, so this is the last honest moment
+        // (Codex Stage 3 round 1 #2).
+        if unitManaged {
+            if let service = journal.oldService, service.installed,
+               unitActive(service.name) != service.active {
+                throw EngineError(outcome: .failed(
+                    "rollback finished but \(service.name) is \(service.active ? "not active" : "still active") "
+                    + "— captured topology not restored; the journal is preserved"))
+            }
+            if let newUnitName = spec.newUnitName, journal.startedNewUnit,
+               unitActive(newUnitName) {
+                throw EngineError(outcome: .failed(
+                    "rollback finished but \(newUnitName) is still active — the journal is preserved"))
+            }
+        }
+        if spec.wakelockPrivileged {
+            if let wakelock = journal.wakelockService, wakelock.installed,
+               unitActive(wakelock.name, system: true) != wakelock.active {
+                throw EngineError(outcome: .failed(
+                    "rollback finished but the keep-awake unit \(wakelock.name) does not match "
+                    + "its captured state — the journal is preserved"))
+            }
+            if let name = spec.newWakelockUnitName, journal.startedNewWakelock,
+               unitActive(name, system: true) {
+                throw EngineError(outcome: .failed(
+                    "rollback finished but \(name) is still active — the journal is preserved"))
+            }
         }
 
         // Rollback complete — clear the journal area.
@@ -1595,7 +1985,11 @@ final class MigrationEngine {
         // Anything started on the new identity goes down first, so old and
         // new never run side by side during the restore.
         if journal.startedNewUnit, let newUnitName = spec.newUnitName {
-            _ = systemctl(["stop", newUnitName])
+            try systemctlChecked(["stop", newUnitName], context: "park-restoring rollback")
+        }
+        if journal.startedNewWakelock, let name = spec.newWakelockUnitName {
+            try systemctlChecked(["stop", name], system: true,
+                                 context: "park-restoring rollback")
         }
         // The compat symlink occupies the binary's path — remove it first
         // (it is also an `absent` record, so this is just ordering).
@@ -1613,12 +2007,27 @@ final class MigrationEngine {
                     "could not restore parked \(parked.id) to \(parked.originalPath): "
                     + "\(String(cString: strerror(errno))) — the journal is preserved"))
             }
-            if let mode = parked.mode, parked.kind != "symlink" {
-                try? fm.setAttributes([.posixPermissions: mode],
-                                      ofItemAtPath: parked.originalPath)
+            if parked.kind != "symlink" {
+                if let mode = parked.mode {
+                    guard chmod(parked.originalPath, mode_t(mode)) == 0 else {
+                        throw EngineError(outcome: .failed(
+                            "could not restore the mode of \(parked.originalPath): "
+                            + "\(String(cString: strerror(errno))) — the journal is preserved"))
+                    }
+                }
+                if let uid = parked.uid, let gid = parked.gid {
+                    guard chown(parked.originalPath, uid_t(uid), gid_t(gid)) == 0 else {
+                        throw EngineError(outcome: .failed(
+                            "could not restore the ownership of \(parked.originalPath): "
+                            + "\(String(cString: strerror(errno))) — the journal is preserved"))
+                    }
+                }
             }
-            _ = Self.fsyncPath(URL(fileURLWithPath:
-                (parked.originalPath as NSString).deletingLastPathComponent))
+            if let why = Self.fsyncPath(URL(fileURLWithPath:
+                (parked.originalPath as NSString).deletingLastPathComponent)) {
+                throw EngineError(outcome: .failed(
+                    "restore of \(parked.originalPath) is not durable: \(why) — the journal is preserved"))
+            }
             restoredPaths.insert(parked.originalPath)
         }
         // A restored parked asset supersedes any `absent` record at the same
@@ -1631,9 +2040,25 @@ final class MigrationEngine {
             try persistJournal()
         }
         if let service = journal.oldService, service.installed, unitManaged {
-            _ = systemctl(["daemon-reload"])
+            try systemctlChecked(["daemon-reload"], context: "park-restoring rollback")
             if service.enabled {
-                _ = systemctl(["enable", service.name])
+                try systemctlChecked(["enable", service.name],
+                                     context: "park-restoring rollback")
+            }
+        }
+        // The old keep-awake unit was stopped and disabled at retirement —
+        // re-arm it exactly per its captured flags.
+        if let wakelock = journal.wakelockService, wakelock.installed,
+           spec.wakelockPrivileged {
+            try systemctlChecked(["daemon-reload"], system: true,
+                                 context: "park-restoring rollback")
+            if wakelock.enabled {
+                try systemctlChecked(["enable", wakelock.name], system: true,
+                                     context: "park-restoring rollback")
+            }
+            if wakelock.active {
+                try systemctlChecked(["start", wakelock.name], system: true,
+                                     context: "park-restoring rollback")
             }
         }
         if let pre = journal.preimages.first(where: { $0.type == "prefs-old-domain" }) {

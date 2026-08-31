@@ -119,19 +119,23 @@ struct MigrationSelftest: AsyncParsableCommand {
             var binDir: String, unitDir: String, sysd: String
             var oldBinary: String, newBinary: String
             var oldBundle: String, newBundle: String
+            var systemUnits: String
             var stateDir: String, probeLog: String, specPath: String
             var spec: MigrationSpec
             var oldUnit: String { unitDir + "/ada-test.service" }
             var newUnit: String { unitDir + "/briglia-test.service" }
+            var oldWakelockUnit: String { systemUnits + "/ada-keepawake-test.service" }
+            var newWakelockUnit: String { systemUnits + "/briglia-keepawake-test.service" }
             /// Everything a rollback must restore byte-identically.
             var restoreRoots: [String] {
-                [oldConfig, oldData, oldLanding, binDir, unitDir, oldBundle]
+                [oldConfig, oldData, oldLanding, binDir, unitDir, oldBundle, systemUnits]
             }
         }
 
         func makeFixture(_ name: String,
                          units: Bool = true, unitEnabled: Bool = true,
                          unitActive: Bool = true,
+                         wakelock: Bool = false, wakelockManaged: Bool = true,
                          prefs: Bool = false,
                          persona: String = "Ada",
                          binaryIsSymlink: Bool = false,
@@ -148,6 +152,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             let sysd = root + "/sysd"
             let oldBundle = root + "/bundle-old"
             let newBundle = root + "/bundle-new"
+            let systemUnits = root + "/system-units"
             let stateDir = root + "/state/migrate"
             let probeLog = root + "/probe.log"
 
@@ -222,7 +227,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             #!/bin/sh
             SD="\(sysd)"
             echo "$@" >> "$SD/log"
-            shift   # drop --user
+            if [ "$1" = "--user" ]; then shift; fi
             verb="$1"; unit="$2"
             case "$verb" in
               daemon-reload) exit 0;;
@@ -234,7 +239,8 @@ struct MigrationSelftest: AsyncParsableCommand {
               stop) rm -f "$SD/$unit.active"
                     if [ -f "$SD/$unit.pid" ]; then kill "$(cat "$SD/$unit.pid")" 2>/dev/null; rm -f "$SD/$unit.pid"; fi
                     exit 0;;
-              start) touch "$SD/$unit.active"
+              start) if [ "${FAKE_SYSTEMCTL_FAIL_START:-0}" = "1" ]; then echo "start refused"; exit 1; fi
+                     touch "$SD/$unit.active"
                      if [ "$unit" = "briglia-test.service" ]; then
                        nohup python3 "$SD/lockholder.py" "\(newData)/instance.lock" "$SD/$unit.pid" >/dev/null 2>&1 &
                      fi
@@ -255,6 +261,13 @@ struct MigrationSelftest: AsyncParsableCommand {
             } else {
                 try fm.createDirectory(atPath: unitDir, withIntermediateDirectories: true)
             }
+            try fm.createDirectory(atPath: systemUnits, withIntermediateDirectories: true)
+            if wakelock {
+                try writeFile(systemUnits + "/ada-keepawake-test.service",
+                              "[Unit]\nDescription=old keepawake\n")
+                try writeFile(sysd + "/ada-keepawake-test.service.enabled", "")
+                try writeFile(sysd + "/ada-keepawake-test.service.active", "")
+            }
 
             var spec = MigrationSpec(
                 oldConfigRoot: oldConfig, newConfigRoot: newConfig,
@@ -267,6 +280,13 @@ struct MigrationSelftest: AsyncParsableCommand {
                 newUnitName: "briglia-test.service",
                 newUnitText: "[Unit]\nDescription=new briglia\n[Service]\nExecStart=\(newBinary) daemon\n",
                 systemctl: systemctl,
+                oldWakelockUnitPath: wakelock ? systemUnits + "/ada-keepawake-test.service" : nil,
+                newWakelockUnitPath: wakelock ? systemUnits + "/briglia-keepawake-test.service" : nil,
+                oldWakelockUnitName: wakelock ? "ada-keepawake-test.service" : nil,
+                newWakelockUnitName: wakelock ? "briglia-keepawake-test.service" : nil,
+                newWakelockUnitText: wakelock ? "[Unit]\nDescription=new keepawake\n" : nil,
+                wakelockSystemctl: wakelock ? systemctl : nil,
+                wakelockManaged: wakelock ? wakelockManaged : nil,
                 healthProbe: [probe], healthProbeTimeout: 15,
                 stateDir: stateDir,
                 personaOldName: "Ada", personaNewName: "Bree",
@@ -291,6 +311,7 @@ struct MigrationSelftest: AsyncParsableCommand {
                            binDir: binDir, unitDir: unitDir, sysd: sysd,
                            oldBinary: oldBinary, newBinary: newBinary,
                            oldBundle: oldBundle, newBundle: newBundle,
+                           systemUnits: systemUnits,
                            stateDir: stateDir, probeLog: probeLog,
                            specPath: specPath, spec: spec)
         }
@@ -374,6 +395,14 @@ struct MigrationSelftest: AsyncParsableCommand {
                 check("\(label): compat symlink old → new binary", target == f.newBinary)
             }
             check("\(label): old bundle retired", !fm.fileExists(atPath: f.oldBundle))
+            if f.spec.oldWakelockUnitPath != nil, f.spec.wakelockManaged == true {
+                check("\(label): keep-awake unit migrated (new enabled+active, old retired)",
+                      fm.fileExists(atPath: f.newWakelockUnit)
+                      && !fm.fileExists(atPath: f.oldWakelockUnit)
+                      && fm.fileExists(atPath: f.sysd + "/briglia-keepawake-test.service.enabled")
+                      && fm.fileExists(atPath: f.sysd + "/briglia-keepawake-test.service.active")
+                      && !fm.fileExists(atPath: f.sysd + "/ada-keepawake-test.service.active"))
+            }
             check("\(label): journal area fully cleaned up",
                   !fm.fileExists(atPath: f.stateDir))
             let probeRuns = readText(f.probeLog).split(separator: "\n").count
@@ -419,12 +448,14 @@ struct MigrationSelftest: AsyncParsableCommand {
             for path in [fixture.oldConfig, fixture.oldData, fixture.oldLanding] {
                 try fm.removeItem(atPath: path)
             }
-            let before = snapshot([fixture.root])
+            let before = snapshot(fixture.restoreRoots)
             let result = runEngine(fixture)
             check("fresh install: no-op success", result.code == 0
                   && result.output.contains("nothing to migrate"), result.output)
+            // The cross-process lock sibling is the one documented artifact
+            // of any engine invocation; the journal area must not appear.
             check("fresh install: zero writes (no journal area created)",
-                  snapshotDiff(before, snapshot([fixture.root])).isEmpty
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty
                   && !fm.fileExists(atPath: fixture.stateDir))
         }
 
@@ -447,7 +478,7 @@ struct MigrationSelftest: AsyncParsableCommand {
 
         let seededPrefs: [String: Any] = ["privacyMode": "strict", "spendCents": 4200]
         do {
-            let fixture = try makeFixture("full", prefs: true)
+            let fixture = try makeFixture("full", wakelock: true, prefs: true)
             defer { killHolders(fixture) }
             let oldDomain = fixture.spec.oldPrefsDomain!
             let newDomain = fixture.spec.newPrefsDomain!
@@ -641,6 +672,21 @@ struct MigrationSelftest: AsyncParsableCommand {
                 $0["preimages"] = [["id": "evil", "type": "file",
                                     "path": "/etc/passwd", "sha256": "00"]]
             }
+            try expectCorrupt("absent entry naming a whole allowed directory",
+                              needle: "outside the expected locations") {
+                $0["preimages"] = [["id": "evil2", "type": "absent",
+                                    "path": fixture.binDir]]
+            }
+            try expectCorrupt("parked asset with a substituted target",
+                              needle: "unexpected parked asset") {
+                $0["parked"] = [["id": "binary", "kind": "file",
+                                 "originalPath": fixture.binDir + "/other-file",
+                                 "sha256": "00"]]
+            }
+            try expectCorrupt("file preimage without a hash", needle: "without a hash") {
+                $0["preimages"] = [["id": "pre-0000", "type": "file",
+                                    "path": fixture.oldConfig + "/secrets.json"]]
+            }
             // Spec mismatch: same journal, different invoking spec.
             try original.write(toFile: journalPath, atomically: true, encoding: .utf8)
             var mismatched = fixture.spec
@@ -683,11 +729,11 @@ struct MigrationSelftest: AsyncParsableCommand {
 
         let forwardPoints = ["after-prepared", "between-root-moves", "after-moved",
                              "mid-fixups", "after-fixups", "after-committing-marker",
-                             "after-unit-retirement", "after-binary-park",
-                             "after-bundle-park", "after-symlink",
+                             "after-unit-retirement", "after-wakelock-retirement",
+                             "after-binary-park", "after-bundle-park", "after-symlink",
                              "after-committed", "during-post-verify"]
         for point in forwardPoints {
-            let fixture = try makeFixture("fwd-\(point)")
+            let fixture = try makeFixture("fwd-\(point)", wakelock: true)
             defer { killHolders(fixture) }
             let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": point])
             check("crash@\(point): child died at the injected point",
@@ -702,7 +748,8 @@ struct MigrationSelftest: AsyncParsableCommand {
         print("\n— crash matrix: explicit rollback before the commit point —")
 
         for point in ["between-root-moves", "after-moved", "mid-fixups", "after-fixups"] {
-            let fixture = try makeFixture("rb-\(point)", prefs: point == "after-fixups")
+            let fixture = try makeFixture("rb-\(point)", wakelock: true,
+                                          prefs: point == "after-fixups")
             defer { killHolders(fixture) }
             var oldDomain = "", newDomain = ""
             if let od = fixture.spec.oldPrefsDomain, let nd = fixture.spec.newPrefsDomain {
@@ -782,7 +829,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         print("\n— park-restoring rollback (forward impossible, parked verify) —")
 
         do {
-            let fixture = try makeFixture("park-restore", prefs: true)
+            let fixture = try makeFixture("park-restore", wakelock: true, prefs: true)
             defer { killHolders(fixture) }
             let oldDomain = fixture.spec.oldPrefsDomain!
             let newDomain = fixture.spec.newPrefsDomain!
@@ -815,6 +862,10 @@ struct MigrationSelftest: AsyncParsableCommand {
             check("park-restore: the restored old binary runs", oldRun.exitCode == 0)
             check("park-restore: old unit re-enabled per captured flags",
                   fm.fileExists(atPath: fixture.sysd + "/ada-test.service.enabled"))
+            check("park-restore: old keep-awake unit re-armed (enabled + active)",
+                  fm.fileExists(atPath: fixture.sysd + "/ada-keepawake-test.service.enabled")
+                  && fm.fileExists(atPath: fixture.sysd + "/ada-keepawake-test.service.active")
+                  && fm.fileExists(atPath: fixture.oldWakelockUnit))
         }
 
         do {
@@ -907,6 +958,98 @@ struct MigrationSelftest: AsyncParsableCommand {
                   && readText(fixture.oldBinary).contains("impostor")
                   && (try? fm.destinationOfSymbolicLink(atPath: fixture.oldBinary)) == nil)
             assertMigratedState(fixture, label: "foreign-binary", expectSymlink: false)
+        }
+
+        // ============================================================
+        print("\n— hardening round: lock, honest rollback, destination state, wakelock privileges —")
+
+        do {
+            // Concurrent migrate/recovery refused by the sibling flock.
+            let fixture = try makeFixture("lock-conflict", units: false)
+            try fm.createDirectory(atPath: (fixture.stateDir as NSString)
+                .deletingLastPathComponent, withIntermediateDirectories: true)
+            let lockPath = fixture.stateDir + ".lock"
+            let fd = open(lockPath, O_WRONLY | O_CREAT, 0o600)
+            check("lock fixture: sibling lock openable", fd >= 0)
+            _ = flock(fd, LOCK_EX | LOCK_NB)
+            let before = snapshot(fixture.restoreRoots)
+            let result = runEngine(fixture)
+            flock(fd, LOCK_UN); close(fd)
+            check("concurrent migration: refused while the lock is held",
+                  result.code == 2 && result.output.contains("already running"), result.output)
+            check("concurrent migration: nothing touched",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty)
+            let retry = runEngine(fixture)
+            check("after the lock is released, migration proceeds", retry.code == 0, retry.output)
+        }
+
+        do {
+            // Rollback must not report success when the old service cannot
+            // be restarted: journal preserved, retry completes honestly.
+            let fixture = try makeFixture("rollback-honesty")
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-fixups"])
+            check("rollback-honesty: crash injected", crashed.code == 137)
+            let failed = runEngine(fixture, args: ["--rollback"],
+                                   env: ["FAKE_SYSTEMCTL_FAIL_START": "1"])
+            check("rollback-honesty: failed service restart surfaces as FAILURE, journal kept",
+                  failed.code == 1 && failed.output.contains("journal")
+                  && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), failed.output)
+            let retried = runEngine(fixture, args: ["--rollback"])
+            check("rollback-honesty: retry completes the rollback", retried.code == 0,
+                  retried.output)
+            check("rollback-honesty: byte-identical restore after the retry",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty)
+            check("rollback-honesty: old service active again",
+                  fm.fileExists(atPath: fixture.sysd + "/ada-test.service.active"))
+        }
+
+        do {
+            // A new root existing WITHOUT its old counterpart must refuse
+            // (unrelated destination data must never be mixed in).
+            let fixture = try makeFixture("refuse-orphan-newroot", units: false)
+            try fm.removeItem(atPath: fixture.oldData)
+            try writeFile(fixture.newData + "/foreign.txt", "not ours")
+            let result = runEngine(fixture)
+            check("orphan new root (old side missing): refused",
+                  result.code == 2 && result.output.contains("already exists"), result.output)
+            check("orphan new root: foreign data untouched",
+                  readText(fixture.newData + "/foreign.txt") == "not ours")
+        }
+
+        do {
+            // A pre-existing NEW preferences domain refuses — it was not
+            // created by a migration and rollback bookkeeping would
+            // otherwise delete it.
+            let fixture = try makeFixture("refuse-prefs", units: false, prefs: true)
+            let newDomain = fixture.spec.newPrefsDomain!
+            defer {
+                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                UserDefaults.standard.synchronize()
+            }
+            UserDefaults.standard.setPersistentDomain(["pre": "existing"], forName: newDomain)
+            UserDefaults.standard.synchronize()
+            let result = runEngine(fixture)
+            check("pre-existing new prefs domain: refused",
+                  result.code == 2 && result.output.contains("preferences domain"), result.output)
+            check("pre-existing new prefs domain: its data survives",
+                  dumpPrefs(newDomain).contains("existing"))
+        }
+
+        do {
+            // Unprivileged wakelock: captured and warned about, never touched.
+            let fixture = try makeFixture("wakelock-unmanaged", wakelock: true,
+                                          wakelockManaged: false)
+            defer { killHolders(fixture) }
+            let wakelockBytes = sha(fixture.oldWakelockUnit)
+            let result = runEngine(fixture)
+            check("unprivileged wakelock: migration succeeds with a warning",
+                  result.code == 0 && result.output.contains("no privileges"), result.output)
+            check("unprivileged wakelock: old unit file untouched, no new unit created",
+                  sha(fixture.oldWakelockUnit) == wakelockBytes
+                  && !fm.fileExists(atPath: fixture.newWakelockUnit)
+                  && fm.fileExists(atPath: fixture.sysd + "/ada-keepawake-test.service.active"))
         }
 
         // ============================================================
