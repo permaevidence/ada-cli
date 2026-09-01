@@ -692,7 +692,7 @@ class ConversationManager: ObservableObject {
             }
             do {
                 let transcription = try await OpenAITranscriptionService.shared
-                    .transcribeAudioFile(url: audioURL, apiKey: apiKey)
+                    .transcribeAudioFile(url: audioURL, apiKey: apiKey, prompt: TranscriptionVocabulary.chatHint())
                 guard !transcription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     return .failure(.failed("the recording sounded empty"))
                 }
@@ -1888,7 +1888,7 @@ class ConversationManager: ObservableObject {
                         return
                     }
                     do {
-                        transcription = try await OpenAITranscriptionService.shared.transcribeAudioFile(url: audioURL, apiKey: apiKey)
+                        transcription = try await OpenAITranscriptionService.shared.transcribeAudioFile(url: audioURL, apiKey: apiKey, prompt: TranscriptionVocabulary.chatHint())
                     } catch {
                         transcription = nil
                         transcriptionFailureReason = error.localizedDescription
@@ -2128,7 +2128,7 @@ class ConversationManager: ObservableObject {
                         return
                     }
                     do {
-                        transcription = try await OpenAITranscriptionService.shared.transcribeAudioFile(url: spoolURL, apiKey: apiKey)
+                        transcription = try await OpenAITranscriptionService.shared.transcribeAudioFile(url: spoolURL, apiKey: apiKey, prompt: TranscriptionVocabulary.chatHint())
                     } catch {
                         transcription = nil
                         transcriptionFailureReason = error.localizedDescription

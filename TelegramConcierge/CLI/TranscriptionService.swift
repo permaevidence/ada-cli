@@ -67,13 +67,18 @@ actor OpenAITranscriptionService {
         var errorDescription: String? { message }
     }
 
-    func transcribeAudioFile(url: URL, apiKey: String, language: String? = nil) async throws -> String {
+    /// `prompt` is OpenAI's transcription hint: a short list of proper nouns
+    /// the recognizer would otherwise misspell (see
+    /// `TranscriptionVocabulary.chatHint`). Chat voice notes pass it;
+    /// `transcribe_media` on arbitrary files does not.
+    func transcribeAudioFile(url: URL, apiKey: String, language: String? = nil, prompt: String? = nil) async throws -> String {
         let data = try await performRequest(
             url: url,
             apiKey: apiKey,
             model: "gpt-transcribe",
             responseFormat: nil,
-            language: language
+            language: language,
+            prompt: prompt
         )
 
         guard let decoded = try? JSONDecoder().decode(TranscriptionResponse.self, from: data) else {
@@ -89,13 +94,14 @@ actor OpenAITranscriptionService {
 
     /// Transcribe to SRT subtitles. Uses whisper-1 because gpt-transcribe
     /// does not support timestamped response formats.
-    func transcribeAudioFileSRT(url: URL, apiKey: String, language: String? = nil) async throws -> String {
+    func transcribeAudioFileSRT(url: URL, apiKey: String, language: String? = nil, prompt: String? = nil) async throws -> String {
         let data = try await performRequest(
             url: url,
             apiKey: apiKey,
             model: "whisper-1",
             responseFormat: "srt",
-            language: language
+            language: language,
+            prompt: prompt
         )
 
         let srt = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -115,7 +121,8 @@ actor OpenAITranscriptionService {
         apiKey: String,
         model: String,
         responseFormat: String?,
-        language: String?
+        language: String?,
+        prompt: String?
     ) async throws -> Data {
         let trimmedApiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedApiKey.isEmpty else {
@@ -136,30 +143,17 @@ actor OpenAITranscriptionService {
             request.setValue("Bearer \(trimmedApiKey)", forHTTPHeaderField: "Authorization")
             request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-            var body = Data()
-            func appendField(name: String, value: String) {
-                body.append("--\(boundary)\r\n".data(using: .utf8)!)
-                body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
-                body.append("\(value)\r\n".data(using: .utf8)!)
-            }
-
-            appendField(name: "model", value: model)
-            if let responseFormat {
-                appendField(name: "response_format", value: responseFormat)
-            }
-            if let language, !language.isEmpty {
-                appendField(name: "language", value: language)
-            }
-
             let filename = url.lastPathComponent.isEmpty ? "voice.ogg" : url.lastPathComponent
-            body.append("--\(boundary)\r\n".data(using: .utf8)!)
-            body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
-            body.append("Content-Type: \(mimeType(for: url))\r\n\r\n".data(using: .utf8)!)
-            body.append(fileData)
-            body.append("\r\n".data(using: .utf8)!)
-            body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-
-            request.httpBody = body
+            request.httpBody = Self.multipartBody(
+                boundary: boundary,
+                model: model,
+                responseFormat: responseFormat,
+                language: language,
+                prompt: prompt,
+                filename: filename,
+                mimeType: mimeType(for: url),
+                fileData: fileData
+            )
 
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
@@ -192,6 +186,46 @@ actor OpenAITranscriptionService {
         }
     }
 
+    /// The multipart form the transcriptions endpoint expects. Pure and
+    /// static so the selftest can assert the exact fields sent (the `prompt`
+    /// vocabulary hint in particular) without a network.
+    nonisolated static func multipartBody(
+        boundary: String,
+        model: String,
+        responseFormat: String?,
+        language: String?,
+        prompt: String?,
+        filename: String,
+        mimeType: String,
+        fileData: Data
+    ) -> Data {
+        var body = Data()
+        func appendField(name: String, value: String) {
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+            body.append("\(value)\r\n".data(using: .utf8)!)
+        }
+
+        appendField(name: "model", value: model)
+        if let responseFormat {
+            appendField(name: "response_format", value: responseFormat)
+        }
+        if let language, !language.isEmpty {
+            appendField(name: "language", value: language)
+        }
+        if let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines), !prompt.isEmpty {
+            appendField(name: "prompt", value: prompt)
+        }
+
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
+        body.append(fileData)
+        body.append("\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        return body
+    }
+
     private func mimeType(for url: URL) -> String {
         switch url.pathExtension.lowercased() {
         case "ogg", "oga":
@@ -209,5 +243,60 @@ actor OpenAITranscriptionService {
         default:
             return "application/octet-stream"
         }
+    }
+}
+
+// MARK: - Vocabulary hint for chat voice notes
+
+/// Builds the `prompt` sent with chat voice notes. OpenAI's transcription
+/// models treat it as a spelling/vocabulary hint, which is exactly what the
+/// product and persona names need: "Briglia" is opaque to an English
+/// recognizer and "Bree" to an Italian one, and a custom /setname persona
+/// or an unusual user name has the same problem.
+///
+/// Shape matters: measured 2026-09-01 on gpt-transcribe with Italian audio,
+/// a bare list ("Briglia, Bree.") still produced "Bre"/"Bray", while a
+/// glossary sentence that says what each name IS ("Bree (the assistant),
+/// Briglia (the software)") produced "Bree" — the model uses the role
+/// context, not just the spelling. whisper-1 is fine with either.
+enum TranscriptionVocabulary {
+    static let productName = "Briglia"
+    static let defaultPersonaName = "Bree"
+
+    /// Hint for the configured persona and user (reads the secret store).
+    static func chatHint() -> String {
+        chatHint(
+            assistantName: KeychainHelper.load(key: KeychainHelper.assistantNameKey),
+            userName: KeychainHelper.load(key: KeychainHelper.userNameKey)
+        )
+    }
+
+    /// Pure variant. The persona entry is the configured name (default
+    /// "Bree"); "Bree" is still listed as a plain term when the persona was
+    /// renamed, and the user's name gets its own entry. Each name is
+    /// collapsed to one line, capped, and deduplicated case-insensitively.
+    /// Always non-empty, always one line.
+    static func chatHint(assistantName: String?, userName: String?) -> String {
+        func clean(_ raw: String?) -> String? {
+            guard let raw else { return nil }
+            let collapsed = raw
+                .components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            guard !collapsed.isEmpty else { return nil }
+            return String(collapsed.prefix(60))
+        }
+        var entries: [String] = []
+        var seen = Set<String>()
+        func add(_ name: String?, role: String?) {
+            guard let name, seen.insert(name.lowercased()).inserted else { return }
+            entries.append(role.map { "\(name) (\($0))" } ?? name)
+        }
+        let persona = clean(assistantName) ?? defaultPersonaName
+        add(persona, role: "the assistant")
+        add(defaultPersonaName, role: nil)
+        add(productName, role: "the software")
+        add(clean(userName), role: "the user")
+        return "Names: " + entries.joined(separator: ", ") + "."
     }
 }

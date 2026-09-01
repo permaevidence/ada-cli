@@ -148,6 +148,40 @@ struct MediaSelftest: AsyncParsableCommand {
         check("removeAll clears entries and byte count",
               cache.pages(forKey: keyA) == nil && cache.currentTotalBytes == 0)
 
+        print("Voice transcription request")
+        // Vocabulary hint: glossary sentence, persona/user aware, deduplicated, one line.
+        check("hint: defaults",
+              TranscriptionVocabulary.chatHint(assistantName: nil, userName: nil)
+              == "Names: Bree (the assistant), Briglia (the software).")
+        check("hint: default persona spelled differently is not duplicated",
+              TranscriptionVocabulary.chatHint(assistantName: "bree", userName: "  ")
+              == "Names: bree (the assistant), Briglia (the software).")
+        check("hint: custom persona keeps Bree as a term, user name appended",
+              TranscriptionVocabulary.chatHint(assistantName: "Ada", userName: "Sofia Bruni")
+              == "Names: Ada (the assistant), Bree, Briglia (the software), Sofia Bruni (the user).")
+        let messy = TranscriptionVocabulary.chatHint(assistantName: "Ali\n\tBaba", userName: "briglia")
+        check("hint: newlines collapsed, dedup is case-insensitive",
+              messy == "Names: Ali Baba (the assistant), Bree, Briglia (the software).", detail: "got '\(messy)'")
+        check("hint: never multi-line",
+              !TranscriptionVocabulary.chatHint(assistantName: "a\nb", userName: "c\r\nd").contains("\n"))
+        // Multipart body: prompt field present only when a hint is given.
+        func body(prompt: String?) -> String {
+            String(decoding: OpenAITranscriptionService.multipartBody(
+                boundary: "B", model: "gpt-transcribe", responseFormat: nil, language: nil,
+                prompt: prompt, filename: "voice.ogg", mimeType: "audio/ogg", fileData: Data("x".utf8)), as: UTF8.self)
+        }
+        let withHint = body(prompt: "Briglia, Bree")
+        check("multipart: prompt field carries the hint",
+              withHint.contains("Content-Disposition: form-data; name=\"prompt\"\r\n\r\nBriglia, Bree\r\n")
+              && withHint.contains("name=\"model\"\r\n\r\ngpt-transcribe\r\n")
+              && withHint.hasSuffix("--B--\r\n"))
+        check("multipart: no prompt field without a hint",
+              !body(prompt: nil).contains("name=\"prompt\"") && !body(prompt: "  \n").contains("name=\"prompt\""))
+        // The prompt precedes the file part so the server parses it before the payload.
+        check("multipart: prompt precedes file part",
+              (withHint.range(of: "name=\"prompt\"")?.lowerBound ?? withHint.endIndex)
+              < (withHint.range(of: "name=\"file\"")?.lowerBound ?? withHint.startIndex))
+
         if failures > 0 {
             print("\n\(failures) media check(s) failed.")
             throw ExitCode(1)
