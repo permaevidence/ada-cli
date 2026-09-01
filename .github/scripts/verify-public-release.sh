@@ -50,17 +50,31 @@ trap 'rm -rf "$WORK"' EXIT
 
 # 1. Authenticate FIRST. A signature failure is final, not "not yet":
 #    the public channel is serving metadata that does not authenticate.
-#    Only an authenticated OLDER version (latest not propagated yet) retries.
+#    Only an authenticated PREVIOUS state retries — an older version of this
+#    channel, or (transition window only, RENAME_PLAN.md §3.2) the exact
+#    pre-rename legacy envelope: GitHub's latest pointer lags a published
+#    release by up to a couple of minutes (measured in the Stage-7 rehearsal,
+#    2026-09-01), and during the transition the state it lags on is the
+#    legacy envelope, which by design does not authenticate under this
+#    channel. Anything that authenticates as neither is a hard stop.
+# shellcheck source=legacy-transition.sh
+. "$HERE/legacy-transition.sh"
 SERVED=""
 for attempt in $(seq 1 "$ATTEMPTS"); do
+    SERVED=""; NOTE=""
     if curl -fsSL --max-filesize 131072 -o "$WORK/public.sig.json" \
          "$RELEASE_BASE_URL/releases/latest/download/manifest.sig.json"; then
-        "$HERE/verify-envelope.sh" "$WORK/public.sig.json" "$EXPECTED_PUBKEY" "$CHANNEL" "$WORK/payload.json" \
-            >/dev/null || { echo "✖ the PUBLIC envelope does not authenticate against the committed key — refusing"; exit 1; }
-        SERVED="$(python3 -c "import json;print(json.load(open('$WORK/payload.json'))['version'])")"
-        [ "$SERVED" = "$VERSION" ] && break
+        if "$HERE/verify-envelope.sh" "$WORK/public.sig.json" "$EXPECTED_PUBKEY" "$CHANNEL" "$WORK/payload.json" >/dev/null; then
+            SERVED="$(python3 -c "import json;print(json.load(open('$WORK/payload.json'))['version'])")"
+            [ "$SERVED" = "$VERSION" ] && break
+            NOTE=", authenticated v$SERVED"
+        elif legacy_live_authenticates "$WORK/public.sig.json" "$EXPECTED_PUBKEY" "$WORK/legacy-payload.json"; then
+            NOTE=", authenticated pre-rename legacy envelope"
+        else
+            echo "✖ the PUBLIC envelope does not authenticate against the committed key — refusing"; exit 1
+        fi
     fi
-    echo "…latest does not serve $VERSION yet (attempt $attempt${SERVED:+, authenticated v$SERVED})"
+    echo "…latest does not serve $VERSION yet (attempt $attempt$NOTE)"
     sleep "$RETRY_SLEEP"
 done
 [ "$SERVED" = "$VERSION" ] || { echo "✖ the public latest path never served an authenticated v$VERSION"; exit 1; }

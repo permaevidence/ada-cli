@@ -463,9 +463,11 @@ def body(work, base):
     rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
     check("an envelope under any other retired channel does not authenticate",
           rc != 0 and "does not authenticate" in out, out)
-    check("no bypass: check-supersession.sh reads no legacy override from the environment",
-          "LEGACY_CHANNEL=\"ada-cli\"" in (SCRIPTS / "check-supersession.sh").read_text()
-          and "${LEGACY" not in (SCRIPTS / "check-supersession.sh").read_text())
+    helper = (SCRIPTS / "legacy-transition.sh").read_text()
+    check("no bypass: the legacy descriptor is compiled into legacy-transition.sh, read by both call sites, with no environment override",
+          "LEGACY_CHANNEL=\"ada-cli\"" in helper and "${LEGACY" not in helper
+          and all("legacy-transition.sh" in (SCRIPTS / f).read_text() and "${LEGACY" not in (SCRIPTS / f).read_text()
+                  for f in ("check-supersession.sh", "verify-public-release.sh")))
     control(base, "/__control/reset", {})
     seed_release(base, dist58, "0.1.58")
 
@@ -622,6 +624,37 @@ def body(work, base):
           rc != 0 and "never served an authenticated v0.1.59" in out and not ran, out)
     rc, out, ran = verify({"SEQUENCE": "60"})
     check("authenticated sequence mismatch is refused", rc != 0 and not ran, out)
+
+    # transition window (RENAME_PLAN §3.2): GitHub's latest pointer still
+    # serves the pre-rename LEGACY envelope for a while after the first
+    # Briglia release is published (about two minutes measured live in the
+    # Stage-7 rehearsal). Authenticated legacy = "not propagated yet"; a
+    # hostile legacy-shaped envelope stays a hard stop with no retry.
+    control(base, "/__control/reset", {})
+    leg_id = seed_release(base, legacy58, "0.1.58", latest=False)
+    seed_release(base, dist59, "0.1.59")
+    control(base, "/__control/override", {"latest_queue": [leg_id, leg_id]})
+    rc, out, ran = verify()
+    check("transition: latest still serving the authenticated legacy envelope retries, then passes",
+          rc == 0 and ran and "attempt 1, authenticated pre-rename legacy envelope" in out
+          and "attempt 2, authenticated pre-rename legacy envelope" in out and "attempt 3" not in out, out)
+    control(base, "/__control/reset", {})
+    seed_release(base, legacy58, "0.1.58")
+    rc, out, ran = verify({"ATTEMPTS": "2"})
+    check("transition: legacy latest never replaced → reported, exit nonzero, binary never executed",
+          rc != 0 and "never served an authenticated v0.1.59" in out and not ran, out)
+    control(base, "/__control/reset", {})
+    seed_release(base, foreign, "0.1.58")
+    rc, out, ran = verify()
+    check("transition: legacy-signed envelope whose artifacts are outside the old repository → hard stop, no retry",
+          rc != 0 and "does not authenticate" in out and "attempt 2" not in out and not ran, out)
+    control(base, "/__control/reset", {})
+    seed_release(base, legacy58, "0.1.58")
+    control(base, "/__control/override", {"download_overrides": {
+        "manifest.sig.json": base64.b64encode(tampered_envelope(legacy58 / "manifest.sig.json")).decode()}})
+    rc, out, ran = verify()
+    check("transition: tampered legacy envelope on latest → hard stop, no retry, binary never executed",
+          rc != 0 and "does not authenticate" in out and "attempt 2" not in out and not ran, out)
 
     # ------------------------------------------------------------------
     print("— workflow structure —")

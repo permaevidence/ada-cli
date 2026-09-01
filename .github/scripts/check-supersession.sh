@@ -30,43 +30,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# Legacy-transition descriptor (RENAME_PLAN.md §3.2): after the repository
-# rename the channel's "latest" is still the previous identity's envelope
-# (channel `ada-cli`, keyId `ada-cli-release-v1-…` over the SAME key
-# material, artifacts under the old repository path) until the first Briglia
-# release publishes. It is accepted as the supersession floor ONLY when it
-# authenticates under this compiled descriptor AND our sequence is strictly
-# greater. There is no environment override and no bypass flag; this block
-# is deleted in the follow-up commit after the first Briglia release.
-LEGACY_CHANNEL="ada-cli"
-LEGACY_ARTIFACT_PREFIX="https://github.com/permaevidence/ada-cli/releases/download/v"
+# Legacy-transition descriptor (RENAME_PLAN.md §3.2): see legacy-transition.sh.
+# The old channel's envelope is accepted as the supersession floor ONLY when
+# it authenticates under that compiled descriptor AND our sequence is
+# strictly greater. No environment override, no bypass flag; the helper and
+# this call site are deleted in the follow-up commit after the first Briglia
+# release.
+# shellcheck source=legacy-transition.sh
+. "$HERE/legacy-transition.sh"
 
 if curl -fsSL --max-filesize 131072 -o "$WORK/live.sig.json" "$LIVE_ENVELOPE_URL"; then
     # Anything served that does not authenticate is a hard stop — a
     # tampered or malformed live envelope must never be "treated as absent".
     if "$HERE/verify-envelope.sh" "$WORK/live.sig.json" "$EXPECTED_PUBKEY" "$CHANNEL" "$WORK/live-payload.json"; then
         LIVE_KIND="current"
-    elif "$HERE/verify-envelope.sh" "$WORK/live.sig.json" "$EXPECTED_PUBKEY" "$LEGACY_CHANNEL" "$WORK/live-payload.json"; then
+    elif legacy_live_authenticates "$WORK/live.sig.json" "$EXPECTED_PUBKEY" "$WORK/live-payload.json"; then
         LIVE_KIND="legacy"
-        # The authenticated legacy payload must be the genuine old channel's
-        # manifest: its own channel field and every artifact URL pin the
-        # previous identity. Anything else signed under the old domain is
-        # refused — the descriptor is exact, not a wildcard.
-        python3 - "$WORK/live-payload.json" "$LEGACY_CHANNEL" "$LEGACY_ARTIFACT_PREFIX" <<'PYEOF'
-import json, sys
-path, channel, prefix = sys.argv[1:4]
-m = json.load(open(path))
-if m.get("schema") != 1 or m.get("channel") != channel:
-    sys.exit(f"✖ legacy envelope authenticates but its payload is not a {channel} schema-1 manifest")
-version = m.get("version")
-platforms = m.get("platforms")
-if not isinstance(version, str) or not isinstance(platforms, dict) or not platforms:
-    sys.exit("✖ legacy manifest is malformed")
-for name, entry in platforms.items():
-    url = entry.get("url") if isinstance(entry, dict) else None
-    if not isinstance(url, str) or not url.startswith(prefix + version + "/"):
-        sys.exit(f"✖ legacy manifest artifact for {name} is not under {prefix}{version}/ — refusing")
-PYEOF
     else
         echo "✖ the live envelope does not authenticate against the committed key (neither as $CHANNEL nor as the legacy $LEGACY_CHANNEL descriptor) — refusing"; exit 1
     fi
