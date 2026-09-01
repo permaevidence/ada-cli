@@ -289,7 +289,8 @@ final class TerminalSession {
             print("""
               /attach <path> [message]   send a file (with optional text)
               /quit             exit (also Ctrl-C)
-            Power commands: /spend (/more1 /more5 /more10 raise the limit), /hide, /show,
+            Power commands: /spend [turn|daily|monthly <usd|off>] (limits are off by default;
+              /more1 /more5 /more10 raise a reached daily/monthly limit), /hide, /show,
               /transcribe_local, /transcribe_openai
             All Telegram commands work here too — the two surfaces share one command set.
             """)

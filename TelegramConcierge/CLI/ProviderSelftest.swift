@@ -111,6 +111,17 @@ struct ProviderSelftest: AsyncParsableCommand {
               ProviderProfiles.activeProfile() == .local
               && ProviderProfiles.isConfigured(.local))
 
+        // 5b. OpenCode `reasoning_history`: Fireworks/Kimi-only parameter.
+        // Kimi K3 on the Go gateway rejects it with HTTP 400 on every request
+        // since 2026-09-01; the other reasoning_content models still take it.
+        for (model, expected) in [("kimi-k3", nil), ("kimi-k3-0901", nil), ("KIMI-K3", nil),
+                                  ("kimi-k2.6", "preserved"), ("kimi-k2.7-code", "preserved"),
+                                  ("glm-5.3-flash", "preserved"), ("minimax-m3", "preserved"),
+                                  ("qwen3.8-max", "preserved"), ("deepseek-v4-flash", "preserved")] as [(String, String?)] {
+            check("reasoning_history for \(model) is \(expected.map { "\"\($0)\"" } ?? "omitted")",
+                  OpenRouterService.openCodeReasoningHistory(forReasoningContentModel: model) == expected)
+        }
+
         // 6. Multi-profile world: save all four, hop between them, verify the
         //    runtime slots and vision state follow each hop.
         wipe(allKeys)

@@ -828,7 +828,10 @@ class ConversationManager: ObservableObject {
     /// is recorded — history must only ever contain what actually reached the
     /// user's chat, so an unread tail is dropped once the conversation moves on.
     private var pendingContinuationText: String?
-    private let defaultToolSpendLimitPerTurnUSD = 0.20
+    // No per-turn tool-spend cap unless the user sets one (`/spend turn`).
+    // The old $0.20 default — an OpenRouter-era safety net — silently cut
+    // turns after a single high-quality generated image (≈ $0.19) and was
+    // unreachable from the CLI (2026-09-01).
     private let minimumToolSpendLimitPerTurnUSD = 0.001
     private var maxToolRoundsSafetyLimit: Int {
         AgentTurnOverrides.override(forAgent: "main") ?? AgentTurnOverrides.mainAgentDefault
@@ -3099,7 +3102,7 @@ class ConversationManager: ObservableObject {
             await stopActiveExecution()
             return true
         case "/spend":
-            await sendSpendSnapshot()
+            await handleSpendCommand(argument: commandArgument(from: text))
             return true
         case "/more1":
             await increaseSpendLimitIfNeeded(by: 1)
@@ -4879,27 +4882,58 @@ class ConversationManager: ObservableObject {
         }
     }
 
-    private func sendSpendSnapshot() async {
+    /// `/spend` — the snapshot plus every limit; `/spend turn|daily|monthly
+    /// <usd|off>` sets or removes one. All three are OFF by default; the only
+    /// other way to change them used to be editing secrets.json by hand.
+    private func handleSpendCommand(argument: String) async {
+        defer {
+            if activeRunId == nil {
+                statusMessage = "Listening... (Last check: \(formattedTime()))"
+            }
+        }
+        guard !argument.isEmpty else {
+            try? await sendText(spendSnapshotText())
+            return
+        }
+        switch SpendLimitCommand.parse(argument) {
+        case .failure(let why):
+            try? await sendText("✖ \(why.description)\n\(SpendLimitCommand.usage)")
+        case .success(let edit):
+            let key: String
+            switch edit.scope {
+            case .turn: key = KeychainHelper.openRouterToolSpendLimitPerTurnUSDKey
+            case .daily: key = KeychainHelper.openRouterToolSpendLimitDailyUSDKey
+            case .monthly: key = KeychainHelper.openRouterToolSpendLimitMonthlyUSDKey
+            }
+            do {
+                if let usd = edit.limitUSD {
+                    try KeychainHelper.save(key: key, value: SpendLimitCommand.storedValue(usd))
+                    try? await sendText("✅ \(edit.scope.label) spend limit set to $\(formatUSD(usd)) — applies from the next message.\n\(spendSnapshotText())")
+                } else {
+                    try KeychainHelper.delete(key: key)
+                    try? await sendText("✅ \(edit.scope.label) spend limit removed — no \(edit.scope.noun) cap.\n\(spendSnapshotText())")
+                }
+            } catch {
+                try? await sendText("✖ Could not store the \(edit.scope.noun) spend limit: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func spendSnapshotText() -> String {
         let snapshot = KeychainHelper.openRouterSpendSnapshot(referenceDate: Date())
-        let extra = KeychainHelper.openRouterSpendLimitIncreaseSnapshot(referenceDate: Date())
-        var lines = [
-            "💸 API spend",
-            "Today: $\(formatUSD(snapshot.today))",
-            "This month: $\(formatUSD(snapshot.month))"
-        ]
-        if extra.daily > 0 {
-            lines.append("Today's extra limit: +$\(formatUSD(extra.daily))")
+        let status = currentSpendLimitStatus(referenceDate: Date())
+        let turnCap = configuredToolSpendLimitPerTurnUSD()
+        func limitText(_ base: Double?, extra: Double) -> String {
+            guard let base else { return "off" }
+            return "$\(formatUSD(base + extra))" + (extra > 0 ? " (incl. +$\(formatUSD(extra)) temporary)" : "")
         }
-        if extra.monthly > 0 {
-            lines.append("This month's extra limit: +$\(formatUSD(extra.monthly))")
-        }
-        let message = lines.joined(separator: "\n")
-
-        try? await sendText(message)
-
-        if activeRunId == nil {
-            statusMessage = "Listening... (Last check: \(formattedTime()))"
-        }
+        return [
+            "💸 API spend (paid tools: image generation, web search, subagent calls billed through the gateway)",
+            "Today: $\(formatUSD(snapshot.today)) — daily limit: \(limitText(status.dailyBaseLimitUSD, extra: status.dailyExtraUSD))",
+            "This month: $\(formatUSD(snapshot.month)) — monthly limit: \(limitText(status.monthlyBaseLimitUSD, extra: status.monthlyExtraUSD))",
+            "Per-turn cap: \(turnCap.map { "$" + formatUSD($0) } ?? "off")",
+            SpendLimitCommand.usage,
+        ].joined(separator: "\n")
     }
 
     private func setPrivacyMode(enabled: Bool) async {
@@ -5271,7 +5305,7 @@ class ConversationManager: ObservableObject {
 
         toolLoop: for round in 1...maxToolRoundsSafetyLimit {
             try Task.checkCancellation()
-            print("[ConversationManager] Tool round \(round) (turn spend: $\(formatUSD(cumulativeToolSpendUSD)) / $\(formatUSD(toolSpendLimitPerTurnUSD)), today: $\(formatUSD(todaySpentUSD)), month: $\(formatUSD(monthSpentUSD)))")
+            print("[ConversationManager] Tool round \(round) (turn spend: $\(formatUSD(cumulativeToolSpendUSD)) / \(toolSpendLimitPerTurnUSD.map { "$" + formatUSD($0) } ?? "no cap"), today: $\(formatUSD(todaySpentUSD)), month: $\(formatUSD(monthSpentUSD)))")
             
             // Call LLM (with tools available for chaining)
             let llmStartTime = Date()
@@ -5409,10 +5443,10 @@ class ConversationManager: ObservableObject {
                     prevRoundPromptTokens = tokens
                 }
                 
-                if cumulativeToolSpendUSD >= toolSpendLimitPerTurnUSD {
+                if let perTurnCap = toolSpendLimitPerTurnUSD, cumulativeToolSpendUSD >= perTurnCap {
                     didHitToolSpendLimit = true
                     statusMessage = "Spend limit reached, preparing response..."
-                    print("[ConversationManager] Tool spend limit reached ($\(formatUSD(cumulativeToolSpendUSD)) >= $\(formatUSD(toolSpendLimitPerTurnUSD))); forcing final response")
+                    print("[ConversationManager] Tool spend limit reached ($\(formatUSD(cumulativeToolSpendUSD)) >= $\(formatUSD(perTurnCap))); forcing final response")
                     break toolLoop
                 }
 
@@ -5601,10 +5635,10 @@ class ConversationManager: ObservableObject {
                     break toolLoop
                 }
 
-                if cumulativeToolSpendUSD >= toolSpendLimitPerTurnUSD {
+                if let perTurnCap = toolSpendLimitPerTurnUSD, cumulativeToolSpendUSD >= perTurnCap {
                     didHitToolSpendLimit = true
                     statusMessage = "Spend limit reached, preparing response..."
-                    print("[ConversationManager] Tool spend limit reached after tool execution ($\(formatUSD(cumulativeToolSpendUSD)) >= $\(formatUSD(toolSpendLimitPerTurnUSD))); forcing final response")
+                    print("[ConversationManager] Tool spend limit reached after tool execution ($\(formatUSD(cumulativeToolSpendUSD)) >= $\(formatUSD(perTurnCap))); forcing final response")
                     break toolLoop
                 }
 
@@ -5659,7 +5693,7 @@ class ConversationManager: ObservableObject {
         } else if didHitToolSpendLimit {
             forceFinishTail = """
             [SPEND LIMIT] The tool spend limit for this turn has been reached \
-            (spent approximately $\(formatUSD(cumulativeToolSpendUSD)), limit $\(formatUSD(toolSpendLimitPerTurnUSD))). \
+            (spent approximately $\(formatUSD(cumulativeToolSpendUSD)), limit $\(formatUSD(toolSpendLimitPerTurnUSD ?? cumulativeToolSpendUSD))). \
             Do NOT call any more tools. Provide the best possible response to the user \
             using the information you already have.
             """
@@ -5811,14 +5845,15 @@ class ConversationManager: ObservableObject {
         }
     }
     
-    private func configuredToolSpendLimitPerTurnUSD() -> Double {
+    /// nil = no per-turn cap (the default).
+    private func configuredToolSpendLimitPerTurnUSD() -> Double? {
         guard let rawValue = KeychainHelper.load(key: KeychainHelper.openRouterToolSpendLimitPerTurnUSDKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !rawValue.isEmpty,
               let parsed = Double(rawValue),
               parsed.isFinite,
               parsed >= minimumToolSpendLimitPerTurnUSD else {
-            return defaultToolSpendLimitPerTurnUSD
+            return nil
         }
         return parsed
     }
@@ -5871,13 +5906,13 @@ class ConversationManager: ObservableObject {
         guard dailyExceeded || monthlyExceeded else { return nil }
 
         if dailyExceeded, monthlyExceeded, let dailyLimitUSD, let monthlyLimitUSD {
-            return "I paused tool usage because both spend limits were reached (today: $\(formatUSD(todaySpentUSD)) / $\(formatUSD(dailyLimitUSD)); this month: $\(formatUSD(monthSpentUSD)) / $\(formatUSD(monthlyLimitUSD))). Reply `/more1`, `/more5`, or `/more10` to temporarily raise the reached limit and keep going, or raise the limits permanently in ~/.config/briglia/secrets.json."
+            return "I paused tool usage because both spend limits were reached (today: $\(formatUSD(todaySpentUSD)) / $\(formatUSD(dailyLimitUSD)); this month: $\(formatUSD(monthSpentUSD)) / $\(formatUSD(monthlyLimitUSD))). Reply `/more1`, `/more5`, or `/more10` to temporarily raise the reached limit and keep going, or change the limits for good with `/spend daily <usd|off>` and `/spend monthly <usd|off>`."
         }
         if dailyExceeded, let dailyLimitUSD {
-            return "I paused tool usage because the daily spend limit was reached (today: $\(formatUSD(todaySpentUSD)) / $\(formatUSD(dailyLimitUSD))). Reply `/more1`, `/more5`, or `/more10` to temporarily raise the reached limit and keep going, or raise it permanently in ~/.config/briglia/secrets.json."
+            return "I paused tool usage because the daily spend limit was reached (today: $\(formatUSD(todaySpentUSD)) / $\(formatUSD(dailyLimitUSD))). Reply `/more1`, `/more5`, or `/more10` to temporarily raise the reached limit and keep going, or change it for good with `/spend daily <usd|off>` / `/spend monthly <usd|off>`."
         }
         if monthlyExceeded, let monthlyLimitUSD {
-            return "I paused tool usage because the monthly spend limit was reached (this month: $\(formatUSD(monthSpentUSD)) / $\(formatUSD(monthlyLimitUSD))). Reply `/more1`, `/more5`, or `/more10` to temporarily raise the reached limit and keep going, or raise it permanently in ~/.config/briglia/secrets.json."
+            return "I paused tool usage because the monthly spend limit was reached (this month: $\(formatUSD(monthSpentUSD)) / $\(formatUSD(monthlyLimitUSD))). Reply `/more1`, `/more5`, or `/more10` to temporarily raise the reached limit and keep going, or change it for good with `/spend daily <usd|off>` / `/spend monthly <usd|off>`."
         }
         return nil
     }
@@ -10107,3 +10142,70 @@ class ConversationManager: ObservableObject {
         }
     }
 }
+
+/// `/spend <scope> <usd|off>` parsing — pure, so the selftest pins it.
+enum SpendLimitCommand {
+    enum Scope: String, CaseIterable {
+        case turn, daily, monthly
+        var label: String {
+            switch self {
+            case .turn: return "Per-turn"
+            case .daily: return "Daily"
+            case .monthly: return "Monthly"
+            }
+        }
+        var noun: String {
+            switch self {
+            case .turn: return "per-turn"
+            case .daily: return "daily"
+            case .monthly: return "monthly"
+            }
+        }
+    }
+    struct Edit: Equatable {
+        let scope: Scope
+        /// nil = remove the limit.
+        let limitUSD: Double?
+    }
+    struct ParseError: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
+    }
+    static let minimumUSD = 0.001
+    static let usage = "Set with /spend turn|daily|monthly <usd|off> (e.g. /spend daily 5, /spend turn off). /more1 /more5 /more10 raise a reached daily/monthly limit for today/this month only."
+
+    static func parse(_ argument: String) -> Result<Edit, ParseError> {
+        let parts = argument.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard parts.count == 2 else {
+            return .failure(ParseError("Expected a scope and a value."))
+        }
+        guard let scope = Scope(rawValue: parts[0].lowercased()) else {
+            return .failure(ParseError("Unknown scope '\(parts[0])' — use turn, daily or monthly."))
+        }
+        let raw = parts[1].lowercased()
+        if ["off", "none", "unlimited", "0"].contains(raw) {
+            return .success(Edit(scope: scope, limitUSD: nil))
+        }
+        var number = raw
+        if number.hasPrefix("$") { number.removeFirst() }
+        if number.hasSuffix("$") { number.removeLast() }
+        number = number.replacingOccurrences(of: ",", with: ".")
+        guard let usd = Double(number), usd.isFinite else {
+            return .failure(ParseError("'\(parts[1])' is not an amount in USD."))
+        }
+        guard usd >= minimumUSD else {
+            return .failure(ParseError("The minimum is $\(storedValue(minimumUSD)); use `off` to remove the limit."))
+        }
+        return .success(Edit(scope: scope, limitUSD: usd))
+    }
+
+    /// Plain decimal text, never locale-formatted — the store is parsed with Double().
+    static func storedValue(_ usd: Double) -> String {
+        var text = String(format: "%.3f", usd)
+        while text.hasSuffix("0") { text.removeLast() }
+        if text.hasSuffix(".") { text.removeLast() }
+        return text
+    }
+}
+
+

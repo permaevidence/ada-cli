@@ -296,6 +296,21 @@ actor OpenRouterService {
             || normalized.contains("qwen3.")
     }
 
+    /// Fireworks/Kimi `reasoning_history: "preserved"` — sent with every
+    /// OpenCode reasoning_content model EXCEPT Kimi K3: since 2026-09-01 the
+    /// Go gateway serves K3 from an upstream that answers OpenRouter-style
+    /// (`reasoning` + `reasoning_details`, no `reasoning_content`) and
+    /// rejects the parameter outright — HTTP 400 "Unsupported request
+    /// parameter(s): reasoning_history" on EVERY request, plain or replay.
+    /// K3 accepts every replay shape (reasoning_content, reasoning_details,
+    /// none) and `thinking`/`reasoning_effort` unchanged (verified live
+    /// against kimi-k3, kimi-k2.6, glm-5.3-flash, minimax-m3, qwen3.8-max:
+    /// only K3 rejects it). One rule for the main loop AND the archive
+    /// summarizer — the two used to duplicate the string.
+    static func openCodeReasoningHistory(forReasoningContentModel model: String) -> String? {
+        model.lowercased().contains("kimi-k3") ? nil : "preserved"
+    }
+
     private static func isOpenCodeGLMReasoningModel(_ normalizedModel: String) -> Bool {
         normalizedModel.contains("glm-5.1") || normalizedModel.contains("glm-5.2")
             // Emits/replays reasoning_content like 5.1/5.2 (plain + tool-call
@@ -2076,7 +2091,8 @@ actor OpenRouterService {
             reasoning: reasoningConfig,
             reasoningEffort: reasoningEffortField,
             thinking: openCodeThinkingType.map { ThinkingConfig(type: $0) },
-            reasoningHistory: useReasoningContent ? "preserved" : nil
+            reasoningHistory: useReasoningContent
+                ? Self.openCodeReasoningHistory(forReasoningContentModel: effectiveModel) : nil
         )
 
         let url = URL(string: baseURL)!

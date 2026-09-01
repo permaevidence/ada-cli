@@ -2191,7 +2191,8 @@ actor ConversationArchiveService {
                     : reasoningEffort
                 archiveThinking = nil
             }
-            archiveReasoningHistory = usesOpenCodeReasoningContent ? "preserved" : nil
+            archiveReasoningHistory = usesOpenCodeReasoningContent
+                ? OpenRouterService.openCodeReasoningHistory(forReasoningContentModel: model) : nil
         case .lmStudio:
             archiveReasoningConfig = nil
             archiveReasoningEffort = nil

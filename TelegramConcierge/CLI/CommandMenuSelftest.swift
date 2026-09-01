@@ -56,6 +56,22 @@ struct CommandMenuSelftest: ParsableCommand {
             check("/commands does not reveal \(hidden)", !listing.contains(hidden))
         }
 
+        // 4b. /spend <scope> <usd|off> parsing (limits are OFF by default;
+        // this is the only supported way to set them from chat).
+        typealias SLC = SpendLimitCommand
+        func parsed(_ text: String) -> SLC.Edit? { try? SLC.parse(text).get() }
+        check("/spend turn 0.50 parses", parsed("turn 0.50") == SLC.Edit(scope: .turn, limitUSD: 0.5))
+        check("/spend daily $5 parses (dollar sign, integer)", parsed("daily $5") == SLC.Edit(scope: .daily, limitUSD: 5))
+        check("/spend monthly 12,5 parses (comma decimal)", parsed("monthly 12,5") == SLC.Edit(scope: .monthly, limitUSD: 12.5))
+        check("/spend turn off removes the limit", parsed("turn off") == SLC.Edit(scope: .turn, limitUSD: nil))
+        check("/spend daily 0 removes the limit", parsed("daily 0") == SLC.Edit(scope: .daily, limitUSD: nil))
+        check("/spend weekly 5 is refused (unknown scope)", parsed("weekly 5") == nil)
+        check("/spend turn abc is refused (not an amount)", parsed("turn abc") == nil)
+        check("/spend turn 0.0001 is refused (below the minimum)", parsed("turn 0.0001") == nil)
+        check("/spend turn is refused (missing value)", parsed("turn") == nil)
+        check("/spend turn 1 2 is refused (extra token)", parsed("turn 1 2") == nil)
+        check("stored value is plain decimal text", SLC.storedValue(0.5) == "0.5" && SLC.storedValue(5) == "5" && SLC.storedValue(12.345) == "12.345")
+
         // 5. Terminal /help derives one line per public command, carrying
         // both the invocation and the description.
         let helpLines = ChatCommandRegistry.terminalHelpLines()
