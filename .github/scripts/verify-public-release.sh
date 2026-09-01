@@ -23,7 +23,7 @@
 #                 CANDIDATE_TARBALL, CANDIDATE_ENVELOPE
 # Env (optional): RELEASE_BASE_URL (default https://github.com/$REPO, needs
 #                 REPO), ATTEMPTS (default 10), RETRY_SLEEP seconds (30),
-#                 CHANNEL (ada-cli)
+#                 CHANNEL (briglia-cli)
 set -euo pipefail
 
 : "${VERSION:?VERSION is required}"
@@ -34,7 +34,7 @@ set -euo pipefail
 : "${CANDIDATE_ENVELOPE:?CANDIDATE_ENVELOPE is required}"
 ATTEMPTS="${ATTEMPTS:-10}"
 RETRY_SLEEP="${RETRY_SLEEP:-30}"
-CHANNEL="${CHANNEL:-ada-cli}"
+CHANNEL="${CHANNEL:-briglia-cli}"
 if [ -z "${RELEASE_BASE_URL:-}" ]; then
     : "${REPO:?REPO is required when RELEASE_BASE_URL is unset}"
     RELEASE_BASE_URL="https://github.com/$REPO"
@@ -108,9 +108,9 @@ echo "✔ public asset is byte-identical to the verified candidate"
 # 5. Functional check of the now-authenticated public build.
 mkdir "$WORK/extracted"
 tar -xzf "$WORK/public.tar.gz" -C "$WORK/extracted"
-[ -x "$WORK/extracted/ada" ] || chmod +x "$WORK/extracted/ada"
-"$WORK/extracted/ada" --version | grep -qx "$VERSION" || { echo "✖ public binary does not report version $VERSION"; exit 1; }
-"$WORK/extracted/ada" __verify-envelope "$WORK/public.sig.json" \
+[ -x "$WORK/extracted/briglia" ] || chmod +x "$WORK/extracted/briglia"
+"$WORK/extracted/briglia" --version | grep -qx "$VERSION" || { echo "✖ public binary does not report version $VERSION"; exit 1; }
+"$WORK/extracted/briglia" __verify-envelope "$WORK/public.sig.json" \
     --expect-version "$VERSION" --expect-sequence "$SEQUENCE" || {
     echo "✖ the public binary's own pinned-key verifier rejects the envelope"; exit 1; }
 echo "✔ end-to-end public verification passed for $PLATFORM (v$VERSION, sequence $SEQUENCE)"

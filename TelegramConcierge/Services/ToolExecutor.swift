@@ -996,7 +996,7 @@ actor ToolExecutor {
             let apiKey = (KeychainHelper.load(key: KeychainHelper.openAITranscriptionApiKeyKey) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !apiKey.isEmpty else {
-                return fail("No OpenAI API key is configured for transcription. Run `ada setup` (section 2) to add it.")
+                return fail("No OpenAI API key is configured for transcription. Run `briglia setup` (section 2) to add it.")
             }
             if let size = try? FileManager.default.attributesOfItem(atPath: workURL.path)[.size] as? Int,
                size > 25 * 1024 * 1024 {
@@ -1031,9 +1031,9 @@ actor ToolExecutor {
             }
             guard ready else {
                 let status = await MainActor.run { WhisperKitService.shared.statusMessage }
-                // Unreachable in Ada CLI (stored "local" normalizes to
+                // Unreachable in Briglia CLI (stored "local" normalizes to
                 // OpenAI), kept for upstream-merge compatibility.
-                return fail("Local transcription is not available in Ada CLI (\(status)). OpenAI cloud transcription is used instead.")
+                return fail("Local transcription is not available in Briglia CLI (\(status)). OpenAI cloud transcription is used instead.")
             }
 
             guard let segments = await WhisperKitService.shared.transcribeAudioFileSegments(url: workURL, language: language),
@@ -1428,7 +1428,7 @@ actor ToolExecutor {
                 return jsonObjectString([
                     "success": true,
                     "reminder_id": reminder.id.uuidString,
-                    "trigger_command": "ada trigger \(reminder.id.uuidString) 'optional payload text'",
+                    "trigger_command": "briglia trigger \(reminder.id.uuidString) 'optional payload text'",
                     "message": "External-trigger watcher created. Wire the trigger command into the external system (script, cron job, camera hook — any local process). Delivery: an event after \(cooldownMinutes)+ quiet minutes fires immediately; events arriving within \(cooldownMinutes) minutes of the previous fire are queued and delivered together as one batched fire when the window closes. Events survive daemon restarts.\(routingNote)"
                 ])
             }
@@ -1578,7 +1578,7 @@ actor ToolExecutor {
                 if reminder.isExternal {
                     // No schedule: the row fires on posted events, not a clock.
                     entryFields.append("\"external_trigger\": true")
-                    entryFields.append("\"trigger_command\": \"ada trigger \(idStr)\"")
+                    entryFields.append("\"trigger_command\": \"briglia trigger \(idStr)\"")
                 } else {
                     entryFields.append("\"trigger_datetime\": \"\(triggerLocal)\"")
                     entryFields.append("\"trigger_readable\": \"\(triggerReadable)\"")
@@ -1820,7 +1820,7 @@ actor ToolExecutor {
         // call recorded before a provider switch could still reach here —
         // refuse instead of silently mutating a calendar nothing injects.
         guard EmailCalendarProvider.current == .agentmail else {
-            return #"{"error":"manage_calendar is only available while the AgentMail email/calendar provider is active (rerun `ada setup` to change providers)"}"#
+            return #"{"error":"manage_calendar is only available while the AgentMail email/calendar provider is active (rerun `briglia setup` to change providers)"}"#
         }
         guard let argsData = call.function.arguments.data(using: .utf8),
               let args = try? JSONDecoder().decode(ManageCalendarArguments.self, from: argsData) else {
@@ -2146,7 +2146,7 @@ actor ToolExecutor {
         var output = """
         === ARCHIVED CHUNK SUMMARIES ===
         Showing \(pageChunks.count) of \(totalMatched) matched chunk(s), newest first (max \(maxResults) per call)
-        Plaintext archive folder: ~/.local/share/ada/archive/
+        Plaintext archive folder: ~/.local/share/briglia/archive/
 
         Each Transcript below is the plaintext file with the chunk's original User/Assistant messages. Search all chunks with the grep tool on that folder, or pass an exact Transcript path to read_file.
 
@@ -2164,7 +2164,7 @@ actor ToolExecutor {
             let shortId = String(chunk.id.uuidString.prefix(8))
             let dateRange = "\(dateFormatter.string(from: chunk.startDate)) - \(dateFormatter.string(from: chunk.endDate))"
             let typeLabel = chunk.type == .consolidated ? "CONSOLIDATED" : "TEMPORARY"
-            let sidecarPath = "~/.local/share/ada/archive/\(chunk.id.uuidString).txt"
+            let sidecarPath = "~/.local/share/briglia/archive/\(chunk.id.uuidString).txt"
 
             // The sidecar is the agent's only content path — if the file is
             // missing, say so explicitly. A silently absent sidecar makes
@@ -2195,7 +2195,7 @@ actor ToolExecutor {
             output += "\n\nWARNING: \(missingSidecarCount) chunk(s) above have no transcript file yet — cross-chunk grep sweeps are currently blind to them. Regeneration has been triggered; re-run this tool to confirm before trusting a negative search result."
         }
 
-        output += "\n\nUse grep for content search: path = '~/.local/share/ada/archive/', include = '*.txt', case_insensitive = true, context = 5. Use read_file with the exact Transcript path above to inspect one chunk."
+        output += "\n\nUse grep for content search: path = '~/.local/share/briglia/archive/', include = '*.txt', case_insensitive = true, context = 5. Use read_file with the exact Transcript path above to inspect one chunk."
         if totalMatched > pageChunks.count, let oldestShown = pageChunks.last {
             // Fractional seconds keep the cursor exact: a whole-second cursor
             // rounds down on the round-trip and the strict endDate < before
@@ -2211,7 +2211,7 @@ actor ToolExecutor {
 
     // MARK: - Skills
 
-    /// Load a curated skill from `~/.config/ada/skills/` and return its body.
+    /// Load a curated skill from `~/.config/briglia/skills/` and return its body.
     /// Read-only by design: the agent cannot create or modify skills. If the
     /// skill is missing, return the current index so the agent can recover
     /// and pick a valid name.

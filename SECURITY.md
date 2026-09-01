@@ -7,11 +7,11 @@ form: on this repository, go to **Security → Report a vulnerability**. Do
 not open a public issue for anything you believe is a security problem.
 
 You can expect an acknowledgement within a few days. Please include the
-version (`ada --version`), platform, and reproduction steps.
+version (`briglia --version`), platform, and reproduction steps.
 
 ## Scope
 
-Ada CLI is an autonomous agent that runs with the permissions of the user
+Briglia CLI is an autonomous agent that runs with the permissions of the user
 who installs it, by design. Reports we consider in scope include:
 
 - The release/update channel: signature verification, downgrade or

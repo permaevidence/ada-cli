@@ -22,7 +22,7 @@ import Glibc
 /// Security: the socket is chmod 0600 inside the user's data root, and every
 /// accepted connection must present our own UID (SO_PEERCRED on Linux,
 /// getpeereid on macOS) before a single byte is parsed. A process that
-/// passes that check already holds every privilege `ada` itself has — the
+/// passes that check already holds every privilege `briglia` itself has — the
 /// socket grants nothing new.
 ///
 /// Privacy mode (`/hide`) applies to this window exactly like the terminal:
@@ -107,7 +107,7 @@ final class AppChatSocketServer {
 
     private nonisolated static func makeListener(path: String) -> Int32? {
         // sockaddr_un caps the path (104/108 bytes). The production path
-        // (~/.local/share/ada/app-chat.sock) is far below it; exotic
+        // (~/.local/share/briglia/app-chat.sock) is far below it; exotic
         // $XDG_DATA_HOME overrides get a readable refusal, not a crash.
         var addr = sockaddr_un()
         let capacity = MemoryLayout.size(ofValue: addr.sun_path)
@@ -197,7 +197,7 @@ final class AppChatSocketServer {
     /// gating defeats the importer), so mirror its fixed kernel layout —
     /// pid/uid/gid, three 32-bit fields on every Linux ABI — and read
     /// SO_PEERCRED into it manually. SO_PEERCRED itself is also unexported;
-    /// it is 17 in asm-generic (x86-64, arm64, riscv — every target Ada
+    /// it is 17 in asm-generic (x86-64, arm64, riscv — every target Briglia
     /// ships for; only historic sparc/parisc differ).
     private struct LinuxPeerCred {
         var pid: Int32 = 0
@@ -637,7 +637,7 @@ final class ClientHandle: @unchecked Sendable {
     init(id: Int, fd: Int32) {
         self.id = id
         self.fd = fd
-        self.writeQueue = DispatchQueue(label: "ada.app-chat.write.\(id)")
+        self.writeQueue = DispatchQueue(label: "com.permaevidence.briglia.app-chat.write.\(id)")
     }
 
     func send(_ event: [String: Any]) {

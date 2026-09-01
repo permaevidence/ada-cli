@@ -99,7 +99,7 @@ enum TruncationService {
                 compact["full_output_path"] = path
                 compact["message"] = "Full output saved. Use read_file with offset and limit to inspect specific sections."
             } else {
-                compact["message"] = "Output was truncated, but Ada could not save the full output to a temporary file."
+                compact["message"] = "Output was truncated, but Briglia could not save the full output to a temporary file."
             }
 
             for key in payload.keys.sorted() {

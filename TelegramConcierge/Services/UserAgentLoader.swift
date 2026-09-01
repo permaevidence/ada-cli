@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - User-Defined Subagent Loader
 //
-// Scans `~/.config/ada/agents/*.md` for user-defined subagent definitions.
+// Scans `~/.config/briglia/agents/*.md` for user-defined subagent definitions.
 // Each file must begin with a YAML frontmatter block (`---` delimited) with
 // these fields:
 //   name: kebab-case-name         (required)

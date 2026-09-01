@@ -5,7 +5,7 @@ import FoundationNetworking
 
 // MARK: - Local-transcription shim (CLI)
 //
-// Ada CLI is cloud-only for voice transcription (OpenAI gpt-transcribe).
+// Briglia CLI is cloud-only for voice transcription (OpenAI gpt-transcribe).
 // This shim preserves the WhisperKitService API surface that the core
 // services reference, but never reports a local model as ready, so every
 // caller falls through to its OpenAITranscriptionService branch.
@@ -18,7 +18,7 @@ final class WhisperKitService {
     var isLoading = false
     var isCompiling = false
     var downloadProgress: Float = 0
-    var statusMessage = "Local transcription is not available in Ada CLI; cloud transcription (OpenAI) is used instead"
+    var statusMessage = "Local transcription is not available in Briglia CLI; cloud transcription (OpenAI) is used instead"
     var isModelReady = false
 
     var hasModelOnDisk: Bool { false }

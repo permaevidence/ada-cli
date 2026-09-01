@@ -7,7 +7,7 @@ import Glibc
 ///
 /// Foreground bash previously read its pipes only after the child exited,
 /// which deadlocks once a chatty command fills the ~64KB kernel pipe buffer
-/// (child blocks on write, Ada waits for exit, timeout fires and mislabels
+/// (child blocks on write, Briglia waits for exit, timeout fires and mislabels
 /// the run). These types let the pipes be drained continuously while keeping
 /// two invariants that whole-buffer processing used to provide:
 ///
@@ -376,12 +376,12 @@ final class ForegroundStreamCollector: PipeByteSink, @unchecked Sendable {
             let overBytes = buffered.utf8.count > TruncationService.maxBytes
             let overLines = totalLines > TruncationService.maxLines
             if overBytes || overLines {
-                // Test hook: ADA_TEST_SPILL_FAULT=write closes the handle
+                // Test hook: BRIGLIA_TEST_SPILL_FAULT=write closes the handle
                 // right after open so the first write throws — exercises the
                 // failure path deterministically (same pattern as
-                // ADA_UPGRADE_FAULT).
+                // BRIGLIA_UPGRADE_FAULT).
                 openSpillLocked()
-                if let fault = getenv("ADA_TEST_SPILL_FAULT"), String(cString: fault) == "write",
+                if let fault = getenv("BRIGLIA_TEST_SPILL_FAULT"), String(cString: fault) == "write",
                    let handle = spillHandle {
                     try? handle.close()
                 }

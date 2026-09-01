@@ -11,10 +11,10 @@ import Glibc
 private func ada_syncfs(_ fd: Int32) -> Int32
 #endif
 
-/// Installs Ada's optional media/document tools into a USERDATA prefix —
+/// Installs Briglia's optional media/document tools into a USERDATA prefix —
 /// built for Ubuntu Touch, where the root filesystem is ~3 GB, normally
 /// read-only, easily filled, and replaced wholesale by OTA updates (which
-/// silently deletes anything apt ever installed there, while Ada itself
+/// silently deletes anything apt ever installed there, while Briglia itself
 /// survives on userdata).
 ///
 /// Mechanism (proven on-device, Pixel POC rounds 1–3, 2026-08-28):
@@ -43,7 +43,7 @@ private func ada_syncfs(_ fd: Int32) -> Int32
 ///      Wrappers carry a closure marker — pre-self-contained (v1) wrappers
 ///      found on a later run trigger a full prefix rebuild.
 ///
-/// All commands and lookup paths are injectable via ADA_TOOLCHAIN_* env
+/// All commands and lookup paths are injectable via BRIGLIA_TOOLCHAIN_* env
 /// seams so the selftest can run hermetically on any platform.
 enum UserdataToolchain {
 
@@ -73,7 +73,13 @@ enum UserdataToolchain {
                     tools: ["soffice", "libreoffice"], optional: true),
     ]
 
-    static let wrapperMarker = "# ada-userdata-toolchain wrapper"
+    static let wrapperMarker = "# briglia-userdata-toolchain wrapper"
+    /// Marker written by the previous product identity. Accepted forever:
+    /// wrappers migrated by `briglia migrate` keep it (only their embedded
+    /// prefix path is rebased) until the next toolchain operation rewrites
+    /// them (rename plan §4.5.9).
+    static let legacyWrapperMarker = "# ada-userdata-toolchain wrapper"
+    static var acceptedWrapperMarkers: [String] { [wrapperMarker, legacyWrapperMarker] }
     /// Wrappers whose prefix bundles the full dependency closure. Absence
     /// marks a v1 wrapper that leans on system libraries → rebuild.
     static let closureMarker = "# ada-toolchain-closure: self-contained"
@@ -92,7 +98,7 @@ enum UserdataToolchain {
     // ------------------------------------------------------------ paths
 
     static var root: URL {
-        if let env = ProcessInfo.processInfo.environment["ADA_TOOLCHAIN_ROOT"] {
+        if let env = ProcessInfo.processInfo.environment["BRIGLIA_TOOLCHAIN_ROOT"] {
             return URL(fileURLWithPath: env)
         }
         return StoragePaths.dataRoot.appendingPathComponent("toolchain")
@@ -128,9 +134,9 @@ enum UserdataToolchain {
     }
 
     /// Fault-injection seam for durability tests (same pattern as
-    /// ADA_UPGRADE_FAULT): "snapshot-flush" | "commit-flush".
+    /// BRIGLIA_UPGRADE_FAULT): "snapshot-flush" | "commit-flush".
     private static var faultPoint: String? {
-        ProcessInfo.processInfo.environment["ADA_TOOLCHAIN_FAULT"]
+        ProcessInfo.processInfo.environment["BRIGLIA_TOOLCHAIN_FAULT"]
     }
 
     /// Checked fsync of one existing file or directory. Returns nil on
@@ -217,10 +223,10 @@ enum UserdataToolchain {
         writeDurable(Data(text.utf8), to: url)
     }
 
-    /// Where wrappers go — must be on Ada's PATH; ~/.local/bin is where the
-    /// installer already puts `ada` itself.
+    /// Where wrappers go — must be on Briglia's PATH; ~/.local/bin is where the
+    /// installer already puts `briglia` itself.
     static var wrapperBinDir: URL {
-        if let env = ProcessInfo.processInfo.environment["ADA_TOOLCHAIN_BIN"] {
+        if let env = ProcessInfo.processInfo.environment["BRIGLIA_TOOLCHAIN_BIN"] {
             return URL(fileURLWithPath: env)
         }
         return FileManager.default.homeDirectoryForCurrentUser
@@ -228,7 +234,7 @@ enum UserdataToolchain {
     }
 
     static var dpkgStatusPath: String {
-        ProcessInfo.processInfo.environment["ADA_TOOLCHAIN_DPKG_STATUS"]
+        ProcessInfo.processInfo.environment["BRIGLIA_TOOLCHAIN_DPKG_STATUS"]
             ?? "/var/lib/dpkg/status"
     }
 
@@ -237,11 +243,11 @@ enum UserdataToolchain {
         return findTool(name)
     }
 
-    /// Tool presence lookup. ADA_TOOLCHAIN_PATH (colon-separated dirs)
+    /// Tool presence lookup. BRIGLIA_TOOLCHAIN_PATH (colon-separated dirs)
     /// restricts the search for hermetic tests; otherwise the normal
     /// PATH + standard prefixes rules apply.
     static func findTool(_ name: String) -> String? {
-        if let scoped = ProcessInfo.processInfo.environment["ADA_TOOLCHAIN_PATH"] {
+        if let scoped = ProcessInfo.processInfo.environment["BRIGLIA_TOOLCHAIN_PATH"] {
             for dir in scoped.split(separator: ":") {
                 let candidate = "\(dir)/\(name)"
                 if FileManager.default.isExecutableFile(atPath: candidate) {
@@ -288,7 +294,7 @@ enum UserdataToolchain {
         defer { try? handle.close() }
         let head = handle.readData(ofLength: 256)
         guard let text = String(data: head, encoding: .utf8) else { return false }
-        return text.contains(wrapperMarker)
+        return acceptedWrapperMarkers.contains { text.contains($0) }
     }
 
     // ---------------------------------------------------------- install
@@ -440,7 +446,7 @@ enum UserdataToolchain {
             }
             report.notes.append("recovered the previous toolchain after an interrupted rebuild")
         } else if fm.fileExists(atPath: backupDir.path) {
-            // Pre-state-file layout (older Ada version, or manual meddling):
+            // Pre-state-file layout (older Briglia version, or manual meddling):
             // no snapshot to consult — the old rule applies, the backup is
             // the last verified state.
             try? fm.removeItem(at: prefixDir)
@@ -646,11 +652,11 @@ enum UserdataToolchain {
         }
         progress("missing: \(targetSpecs.map { $0.key }.joined(separator: ", "))")
 
-        guard let apt = externalTool("ADA_TOOLCHAIN_APT", "apt-get") else {
+        guard let apt = externalTool("BRIGLIA_TOOLCHAIN_APT", "apt-get") else {
             report.failures.append("apt-get not found — this installer needs a Debian-family system")
             return abortBuild(report)
         }
-        guard let dpkg = externalTool("ADA_TOOLCHAIN_DPKG", "dpkg") else {
+        guard let dpkg = externalTool("BRIGLIA_TOOLCHAIN_DPKG", "dpkg") else {
             report.failures.append("dpkg not found — this installer needs a Debian-family system")
             return abortBuild(report)
         }
@@ -872,7 +878,7 @@ enum UserdataToolchain {
             // Incremental install: extraction went into the live prefix and
             // the wrappers above are the real ones — nothing to commit.
             // Version manifest: the prefix has no dpkg database, so this
-            // record is what `ada toolchain upgrade` compares against the
+            // record is what `briglia toolchain upgrade` compares against the
             // repo; partial installs merge into it.
             var recorded = loadManifest()
             recorded.merge(extractedVersions) { _, new in new }
@@ -1198,7 +1204,7 @@ enum UserdataToolchain {
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let txt = dir.appendingPathComponent("probe.txt")
         do {
-            try "ada toolchain conversion probe".write(to: txt, atomically: true,
+            try "briglia toolchain conversion probe".write(to: txt, atomically: true,
                                                        encoding: .utf8)
         } catch {
             return RunResult(exitCode: 1,
@@ -1343,14 +1349,14 @@ enum UserdataToolchain {
 
         let recorded = loadManifest()
         guard !recorded.isEmpty else {
-            report.notes.append("no userdata toolchain recorded — run `ada toolchain install` first")
+            report.notes.append("no userdata toolchain recorded — run `briglia toolchain install` first")
             return report
         }
-        guard let apt = externalTool("ADA_TOOLCHAIN_APT", "apt-get") else {
+        guard let apt = externalTool("BRIGLIA_TOOLCHAIN_APT", "apt-get") else {
             report.failures.append("apt-get not found — this installer needs a Debian-family system")
             return report
         }
-        guard let dpkg = externalTool("ADA_TOOLCHAIN_DPKG", "dpkg") else {
+        guard let dpkg = externalTool("BRIGLIA_TOOLCHAIN_DPKG", "dpkg") else {
             report.failures.append("dpkg not found — this installer needs a Debian-family system")
             return report
         }
@@ -1560,8 +1566,8 @@ enum UserdataToolchain {
         // Placeholder tokens keep the two replacements from mangling each
         // other: the relocated registry path itself contains the string
         // "/usr/lib/libreoffice".
-        let loToken = "\u{1}ADA_LO\u{1}"
-        let regToken = "\u{1}ADA_REG\u{1}"
+        let loToken = "\u{1}BRIGLIA_LO\u{1}"
+        let regToken = "\u{1}BRIGLIA_REG\u{1}"
         var rewrote = 0
         for name in (try? fm.contentsOfDirectory(atPath: program.path))?.sorted() ?? []
             where name.hasSuffix("rc") {
@@ -1647,7 +1653,7 @@ enum UserdataToolchain {
     static func run(_ executable: String, _ args: [String],
                     timeout: TimeInterval, cwd: URL? = nil) -> RunResult {
         let process = Process()
-        // The `ada __setsid-exec` trampoline makes the child a session (and
+        // The `briglia __setsid-exec` trampoline makes the child a session (and
         // process-group) leader, so a timeout can kill the WHOLE apt/dpkg
         // tree — terminating only the immediate Process left descendants
         // alive and mutating the prefix after we reported the timeout
@@ -1668,7 +1674,7 @@ enum UserdataToolchain {
         // ESRCH once the shim exited).
         let pgidFile = FileManager.default.temporaryDirectory.appendingPathComponent(
             "ada-toolchain-pgid-\(UUID().uuidString)")
-        env["ADA_SETSID_PGID_FILE"] = pgidFile.path
+        env["BRIGLIA_SETSID_PGID_FILE"] = pgidFile.path
         defer { try? FileManager.default.removeItem(at: pgidFile) }
         process.environment = env
         let pipe = Pipe()

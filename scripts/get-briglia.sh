@@ -1,11 +1,11 @@
 #!/bin/bash
-# Public Ada CLI installer — prebuilt binaries, no GitHub account, no Swift.
+# Public Briglia CLI installer — prebuilt binaries, no GitHub account, no Swift.
 #
-#   curl -fsSL https://github.com/permaevidence/ada-cli/releases/latest/download/install.sh | bash
+#   curl -fsSL https://github.com/permaevidence/briglia-cli/releases/latest/download/install.sh | bash
 #   wget -qO-  … | bash   (no curl)
 #
 # Downloads the prebuilt tarball for this OS/arch from the signed GitHub
-# release channel and installs `ada` + its resource bundle.
+# release channel and installs `briglia` + its resource bundle.
 #
 # AUTHENTICATION (docs/RELEASE_SIGNING_PLAN.md §8.2): when this machine has
 # python3 and an Ed25519-capable openssl (proven against a LOCAL RFC 8032
@@ -17,30 +17,30 @@
 # origin that served this script; the installed binary's pinned key protects
 # every later update.
 #
-#   ADA_INSTALL_DIR=/some/bin   install location. Default: ~/.local/bin
+#   BRIGLIA_INSTALL_DIR=/some/bin   install location. Default: ~/.local/bin
 #                               (user-writable, so remote /upgrade from
 #                               Telegram never needs a sudo password);
 #                               /usr/local/bin when running as root.
-#   ADA_RELEASE_BASE=…          alternate releases base (staging/testing)
+#   BRIGLIA_RELEASE_BASE=…          alternate releases base (staging/testing)
 #
-# scripts/get-ada.sh in the repo is the source of truth; the release
+# scripts/get-briglia.sh in the repo is the source of truth; the release
 # workflow publishes it as the `install.sh` asset of every release.
 set -euo pipefail
 
-RELEASE_BASE="${ADA_RELEASE_BASE:-https://github.com/permaevidence/ada-cli/releases}"
+RELEASE_BASE="${BRIGLIA_RELEASE_BASE:-https://github.com/permaevidence/briglia-cli/releases}"
 # Stamped at the key ceremony (64 hex chars of the raw Ed25519 public key).
 # Empty = pre-ceremony build: TLS bootstrap only.
-ADA_RELEASE_PUBKEY_HEX="621031636aa2bb2edb64a58f2f72de7bc3559b08d717c79b4251f8b1e35b8a95" # STAMP-INSTALLER-KEY
+BRIGLIA_RELEASE_PUBKEY_HEX="621031636aa2bb2edb64a58f2f72de7bc3559b08d717c79b4251f8b1e35b8a95" # STAMP-INSTALLER-KEY
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS-$ARCH" in
-    Darwin-arm64)           PLATFORM="macos-arm64";  BUNDLE_NAME="ada-cli_ada.bundle" ;;
+    Darwin-arm64)           PLATFORM="macos-arm64";  BUNDLE_NAME="briglia-cli_briglia.bundle" ;;
     Darwin-x86_64)
-        echo "✖ Intel Macs are not supported yet — Ada CLI ships for Apple Silicon (M1+)."
+        echo "✖ Intel Macs are not supported yet — Briglia CLI ships for Apple Silicon (M1+)."
         exit 1 ;;
-    Linux-x86_64)           PLATFORM="linux-x64";    BUNDLE_NAME="ada-cli_ada.resources" ;;
-    Linux-aarch64|Linux-arm64) PLATFORM="linux-arm64"; BUNDLE_NAME="ada-cli_ada.resources" ;;
+    Linux-x86_64)           PLATFORM="linux-x64";    BUNDLE_NAME="briglia-cli_briglia.resources" ;;
+    Linux-aarch64|Linux-arm64) PLATFORM="linux-arm64"; BUNDLE_NAME="briglia-cli_briglia.resources" ;;
     *)
         echo "✖ Unsupported platform: $OS $ARCH"
         exit 1 ;;
@@ -88,7 +88,7 @@ if [ "$OS" = "Linux" ]; then
     fi
 fi
 
-TARBALL="ada-$PLATFORM.tar.gz"
+TARBALL="briglia-$PLATFORM.tar.gz"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -128,7 +128,7 @@ PYEOF
 }
 
 OPENSSL=""
-if [ -n "$ADA_RELEASE_PUBKEY_HEX" ] && command -v python3 >/dev/null 2>&1; then
+if [ -n "$BRIGLIA_RELEASE_PUBKEY_HEX" ] && command -v python3 >/dev/null 2>&1; then
     for candidate in "${OPENSSL_BIN:-}" openssl \
         /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
         [ -n "$candidate" ] || continue
@@ -146,7 +146,7 @@ if [ -n "$OPENSSL" ]; then
     # Strict parse + payload validation in stdlib python; Ed25519 verify in
     # openssl. Everything the download below uses comes from the
     # AUTHENTICATED payload: version-pinned URL, exact size, SHA-256.
-    python3 - "$TMP" "$ADA_RELEASE_PUBKEY_HEX" "$PLATFORM" <<'PYEOF'
+    python3 - "$TMP" "$BRIGLIA_RELEASE_PUBKEY_HEX" "$PLATFORM" <<'PYEOF'
 import base64, datetime, hashlib, json, sys
 tmp, pub_hex, platform = sys.argv[1:4]
 raw = open(f"{tmp}/manifest.sig.json", "rb").read()
@@ -161,10 +161,10 @@ for field in ("format", "channel", "keyId", "payload", "signature"):
         sys.exit(f"ENVELOPE-FAIL: field '{field}' missing")
 if env["format"] != "ada-release-envelope-v1":
     sys.exit("ENVELOPE-FAIL: unsupported format")
-if env["channel"] != "ada-cli":
+if env["channel"] != "briglia-cli":
     sys.exit("ENVELOPE-FAIL: wrong channel")
 fp = hashlib.sha256(bytes.fromhex(pub_hex)).hexdigest()[:16]
-if not (env["keyId"].startswith("ada-cli-release-v") and env["keyId"].endswith("-" + fp)):
+if not (env["keyId"].startswith("briglia-cli-release-v") and env["keyId"].endswith("-" + fp)):
     sys.exit("ENVELOPE-FAIL: keyId does not match the embedded key")
 def strict_b64(value, name):
     try:
@@ -193,8 +193,8 @@ PYEOF
     if ! "$OPENSSL" pkeyutl -verify -rawin -pubin -inkey "$TMP/relpub.pem" \
         -in "$TMP/input" -sigfile "$TMP/sig.bin" >/dev/null 2>&1; then
         echo "✖ RELEASE SIGNATURE VERIFICATION FAILED — the release channel does not"
-        echo "  match Ada's pinned key. NOT installing. If this persists, check"
-        echo "  https://github.com/permaevidence/ada-cli/releases directly."
+        echo "  match Briglia's pinned key. NOT installing. If this persists, check"
+        echo "  https://github.com/permaevidence/briglia-cli/releases directly."
         exit 1
     fi
 
@@ -204,7 +204,7 @@ PYEOF
 import datetime, json, sys
 tmp, platform, release_base = sys.argv[1:4]
 manifest = json.loads(open(f"{tmp}/payload", "rb").read())
-if manifest.get("schema") != 1 or manifest.get("channel") != "ada-cli":
+if manifest.get("schema") != 1 or manifest.get("channel") != "briglia-cli":
     sys.exit("MANIFEST-FAIL: wrong schema/channel")
 version = manifest.get("version", "")
 import re
@@ -245,8 +245,8 @@ PYEOF
     EXPECTED="$(printf '%s\n' "$ASSET_INFO" | sed -n 3p)"
     ASSET_SIZE="$(printf '%s\n' "$ASSET_INFO" | sed -n 4p)"
 
-    echo "✔ signed release metadata verified: Ada CLI $VERSION"
-    echo "Downloading Ada CLI $VERSION ($PLATFORM)…"
+    echo "✔ signed release metadata verified: Briglia CLI $VERSION"
+    echo "Downloading Briglia CLI $VERSION ($PLATFORM)…"
     fetch "$TMP/$TARBALL" "$ASSET_URL"
     GOT_SIZE="$(wc -c < "$TMP/$TARBALL" | tr -d ' ')"
     [ "$GOT_SIZE" = "$ASSET_SIZE" ] || {
@@ -255,7 +255,7 @@ PYEOF
     [ "$EXPECTED" = "$ACTUAL" ] || {
         echo "✖ checksum mismatch against the SIGNED manifest — aborting."; exit 1; }
 else
-    if [ -n "$ADA_RELEASE_PUBKEY_HEX" ]; then
+    if [ -n "$BRIGLIA_RELEASE_PUBKEY_HEX" ]; then
         echo "⚠ This system lacks python3 or an Ed25519-capable openssl, so the release"
         echo "  signature CANNOT be verified here. Proceeding over HTTPS/TLS only —"
         echo "  first-install authenticity rests on the TLS connection to github.com."
@@ -263,7 +263,7 @@ else
         echo "⚠ Pre-release installer build without an embedded release key —"
         echo "  installing over HTTPS/TLS only."
     fi
-    echo "Downloading Ada CLI ($PLATFORM)…"
+    echo "Downloading Briglia CLI ($PLATFORM)…"
     fetch "$TMP/$TARBALL"        "$RELEASE_BASE/latest/download/$TARBALL"
     fetch "$TMP/$TARBALL.sha256" "$RELEASE_BASE/latest/download/$TARBALL.sha256"
     echo "Verifying checksum…"
@@ -276,16 +276,16 @@ else
 fi
 
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
-[ -f "$TMP/ada" ] && [ -d "$TMP/$BUNDLE_NAME" ] || {
-    echo "✖ Unexpected tarball layout — expected ada + $BUNDLE_NAME."
+[ -f "$TMP/briglia" ] && [ -d "$TMP/$BUNDLE_NAME" ] || {
+    echo "✖ Unexpected tarball layout — expected briglia + $BUNDLE_NAME."
     exit 1
 }
 
-# Default to a user-writable location: Ada self-updates (remote /upgrade
+# Default to a user-writable location: Briglia self-updates (remote /upgrade
 # from Telegram), and a root-owned install would make every upgrade need a
 # sudo password typed at a real keyboard. Root installs keep /usr/local/bin.
-if [ -n "${ADA_INSTALL_DIR:-}" ]; then
-    DEST_DIR="$ADA_INSTALL_DIR"
+if [ -n "${BRIGLIA_INSTALL_DIR:-}" ]; then
+    DEST_DIR="$BRIGLIA_INSTALL_DIR"
 elif [ "$(id -u)" = "0" ]; then
     DEST_DIR="/usr/local/bin"
 else
@@ -293,9 +293,9 @@ else
 fi
 
 # A leftover root-owned install would shadow the new one in most PATHs.
-if [ "$DEST_DIR" != "/usr/local/bin" ] && [ -e "/usr/local/bin/ada" ]; then
-    echo "⚠ An older Ada install exists at /usr/local/bin/ada and may shadow this one."
-    echo "  Remove it with:  sudo rm -rf /usr/local/bin/ada /usr/local/bin/$BUNDLE_NAME"
+if [ "$DEST_DIR" != "/usr/local/bin" ] && [ -e "/usr/local/bin/briglia" ]; then
+    echo "⚠ An older Briglia install exists at /usr/local/bin/briglia and may shadow this one."
+    echo "  Remove it with:  sudo rm -rf /usr/local/bin/briglia /usr/local/bin/$BUNDLE_NAME"
 fi
 
 mkdir -p "$DEST_DIR" 2>/dev/null || true
@@ -308,25 +308,47 @@ else
         sudo mkdir -p "$DEST_DIR"
     else
         echo "✖ $DEST_DIR is not writable and sudo is unavailable."
-        echo "  Re-run with: ADA_INSTALL_DIR=\$HOME/.local/bin"
+        echo "  Re-run with: BRIGLIA_INSTALL_DIR=\$HOME/.local/bin"
         exit 1
     fi
 fi
-$SUDO install -m 755 "$TMP/ada" "$DEST_DIR/ada"
+$SUDO install -m 755 "$TMP/briglia" "$DEST_DIR/briglia"
 $SUDO rm -rf "${DEST_DIR:?}/$BUNDLE_NAME"
 $SUDO cp -R "$TMP/$BUNDLE_NAME" "$DEST_DIR/$BUNDLE_NAME"
 
-echo "Installed: $DEST_DIR/ada"
-"$DEST_DIR/ada" --version
+echo "Installed: $DEST_DIR/briglia"
+"$DEST_DIR/briglia" --version
 # Smoke-test the installed copy from a neutral cwd (catches a missing bundle).
-(cd / && "$DEST_DIR/ada" bundle-check)
+(cd / && "$DEST_DIR/briglia" bundle-check)
+
+# Explicit post-install identity migration (RENAME_PLAN §4.2). This is the
+# ONLY step that moves an existing Ada CLI install's roots to Briglia —
+# --version and bundle-check above never do. `briglia migrate` journals
+# every step and restores the old install if it cannot complete; it is
+# safe to rerun.
+OLD_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/ada"
+OLD_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/ada"
+NEW_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/briglia"
+NEW_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/briglia"
+MIGRATED=0
+if { [ -d "$OLD_CFG" ] || [ -d "$OLD_DATA" ]; } && [ ! -d "$NEW_CFG" ] && [ ! -d "$NEW_DATA" ]; then
+    echo
+    echo "An Ada CLI installation was found — migrating it to Briglia"
+    echo "(configuration, memory, watchers, service; nothing is deleted)…"
+    if "$DEST_DIR/briglia" migrate; then
+        MIGRATED=1
+    else
+        echo "⚠ The migration did not complete. Your Ada CLI install is untouched;"
+        echo "  run:  $DEST_DIR/briglia migrate   to retry (or --rollback)."
+    fi
+fi
 
 ON_PATH=1
 case ":$PATH:" in
     *":$DEST_DIR:"*) ;;
     *)
         ON_PATH=0
-        # For the default user dir, wire up PATH automatically so `ada` just
+        # For the default user dir, wire up PATH automatically so `briglia` just
         # works in the next terminal. Custom dirs stay the user's business.
         if [ "$DEST_DIR" = "$HOME/.local/bin" ]; then
             PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
@@ -346,7 +368,7 @@ case ":$PATH:" in
                 fi
             done
             if [ -n "$WROTE" ]; then
-                echo "PATH configured in:$WROTE — new terminals will find \`ada\`."
+                echo "PATH configured in:$WROTE — new terminals will find \`briglia\`."
             else
                 echo "⚠ $DEST_DIR is not in your PATH — add this line to your shell profile:"
                 echo "    $PATH_LINE"
@@ -358,14 +380,16 @@ case ":$PATH:" in
 esac
 echo
 # Always end with a command that works VERBATIM in this very terminal:
-# a piped installer cannot export PATH into the parent shell, so `ada`
+# a piped installer cannot export PATH into the parent shell, so `briglia`
 # alone would fail right now even when future terminals are fine.
+NEXT="setup"
+[ "$MIGRATED" = "1" ] && NEXT=""
 if [ "$ON_PATH" = "1" ]; then
-    echo "✔ Ada CLI is installed. Next step:  ada setup"
+    echo "✔ Briglia CLI is installed. Next step:  briglia${NEXT:+ $NEXT}"
 else
-    echo "✔ Ada CLI is installed. Next step (copy-paste exactly):"
+    echo "✔ Briglia CLI is installed. Next step (copy-paste exactly):"
     echo
-    echo "    $DEST_DIR/ada setup"
+    echo "    $DEST_DIR/briglia${NEXT:+ $NEXT}"
     echo
-    echo "  (plain \`ada\` works in new terminals from now on)"
+    echo "  (plain \`briglia\` works in new terminals from now on)"
 fi

@@ -42,7 +42,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / ".github" / "scripts"
-REPO = "permaevidence/ada-cli-fake"
+REPO = "permaevidence/briglia-cli-fake"
 GH_TOKEN = "ghs_FAKEtokenSECRET1234567890abcdef"
 PLATFORMS = ["macos-arm64", "linux-x64", "linux-arm64"]
 
@@ -261,9 +261,9 @@ def run(script, env, args=(), cwd=None, timeout=120):
     return r.returncode, r.stdout + r.stderr
 
 
-def fake_ada(version):
+def fake_briglia(version):
     return f"""#!/bin/sh
-# fake ada binary for the publisher tests: it FORGES a verification verdict.
+# fake briglia binary for the publisher tests: it FORGES a verification verdict.
 case "$1" in
   --version) echo "{version}" ;;
   __verify-envelope) [ -n "${{FAKE_ADA_MARKER:-}}" ] && : > "$FAKE_ADA_MARKER"; echo "forged: verified"; exit 0 ;;
@@ -275,8 +275,8 @@ esac
 def make_tarball(path, version, platform, salt=b""):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        data = fake_ada(version)
-        ti = tarfile.TarInfo("ada"); ti.size = len(data); ti.mode = 0o755; ti.mtime = 0
+        data = fake_briglia(version)
+        ti = tarfile.TarInfo("briglia"); ti.size = len(data); ti.mode = 0o755; ti.mtime = 0
         tf.addfile(ti, io.BytesIO(data))
         pad = f"platform={platform} version={version}\n".encode() + salt
         ti = tarfile.TarInfo(f"pad-{platform}"); ti.size = len(pad); ti.mtime = 0
@@ -293,26 +293,63 @@ def make_dist(dist, version, sequence, base_url, key, published="2026-08-31T00:0
     dist = Path(dist); dist.mkdir(parents=True, exist_ok=True)
     platforms = {}
     for platform in PLATFORMS:
-        name = f"ada-{platform}.tar.gz"
+        name = f"briglia-{platform}.tar.gz"
         make_tarball(dist / name, version, platform, salt)
         digest = sha256(dist / name)
         (dist / f"{name}.sha256").write_text(f"{digest}  {name}\n")
         platforms[platform] = {"url": f"{base_url}/releases/download/v{version}/{name}",
                                "sha256": digest, "size": (dist / name).stat().st_size}
-    manifest = {"schema": 1, "channel": "ada-cli", "sequence": sequence, "version": version,
+    manifest = {"schema": 1, "channel": "briglia-cli", "sequence": sequence, "version": version,
                 "published": published, "expires": "2027-08-31T00:00:00Z", "platforms": platforms}
     (dist / "manifest.json").write_bytes(json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode())
     rc, out = run(SCRIPTS / "sign-envelope.sh",
                   {"EXPECTED_PUBKEY_PEM": str(key["pub"])},
-                  [str(key["priv"]), "ada-cli", str(dist / "manifest.json"), str(dist / "manifest.sig.json")])
+                  [str(key["priv"]), "briglia-cli", str(dist / "manifest.json"), str(dist / "manifest.sig.json")])
     assert rc == 0, out
+    return dist
+
+
+def resolve_openssl():
+    rc, out = run(SCRIPTS / "openssl-resolve.sh", {}, [], timeout=60)
+    r = subprocess.run(["bash", "-c", f'. "{SCRIPTS}/openssl-resolve.sh"; resolve_openssl >/dev/null 2>&1; printf %s "$OPENSSL"'],
+                       capture_output=True, text=True, cwd=REPO_ROOT)
+    assert r.stdout.strip(), f"no Ed25519-capable openssl: {r.stderr}"
+    return r.stdout.strip()
+
+
+def make_legacy_dist(dist, version, sequence, key, channel="ada-cli",
+                     artifact_base="https://github.com/permaevidence/ada-cli/releases/download",
+                     payload_channel=None):
+    """A pre-rename `ada-cli` release as the live channel still serves it after the
+    repository rename (RENAME_PLAN §3.2): same key material, legacy channel + keyId
+    shape, artifacts under the old repository path. Signed here with openssl because
+    sign-envelope.sh (correctly) refuses the retired channel."""
+    dist = Path(dist); dist.mkdir(parents=True, exist_ok=True)
+    platforms = {p: {"url": f"{artifact_base}/v{version}/ada-{p}.tar.gz",
+                     "sha256": "00" * 32, "size": 1} for p in PLATFORMS}
+    manifest = {"schema": 1, "channel": payload_channel or channel, "sequence": sequence, "version": version,
+                "published": "2026-08-31T00:00:00Z", "expires": "2027-08-31T00:00:00Z", "platforms": platforms}
+    payload = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
+    ossl = resolve_openssl()
+    der = subprocess.run([ossl, "pkey", "-pubin", "-in", str(key["pub"]), "-pubout", "-outform", "DER"],
+                         capture_output=True, check=True).stdout
+    fp = hashlib.sha256(der[-32:]).hexdigest()
+    key_id = f"{channel}-release-v1-{fp[:16]}"
+    work = Path(tempfile.mkdtemp(prefix="legacy-sign-"))
+    (work / "input").write_bytes(b"ada-release-envelope-v1\0" + channel.encode() + b"\0" + key_id.encode() + b"\0" + payload)
+    subprocess.run([ossl, "pkeyutl", "-sign", "-rawin", "-inkey", str(key["priv"]),
+                    "-in", str(work / "input"), "-out", str(work / "sig")], check=True, capture_output=True)
+    envelope = {"format": "ada-release-envelope-v1", "channel": channel, "keyId": key_id,
+                "payload": base64.b64encode(payload).decode(),
+                "signature": base64.b64encode((work / "sig").read_bytes()).decode()}
+    (dist / "manifest.sig.json").write_bytes(json.dumps(envelope, separators=(",", ":")).encode())
     return dist
 
 
 def seed_release(base, dist, version, latest=True, draft=False):
     assets = {p.name: base64.b64encode(p.read_bytes()).decode()
               for p in Path(dist).iterdir() if p.is_file()}
-    assets["install.sh"] = base64.b64encode((REPO_ROOT / "scripts/get-ada.sh").read_bytes()).decode()
+    assets["install.sh"] = base64.b64encode((REPO_ROOT / "scripts/get-briglia.sh").read_bytes()).decode()
     return control(base, "/__control/seed", {"tag_name": f"v{version}", "draft": draft,
                                                "latest": latest, "assets": assets})["id"]
 
@@ -345,7 +382,7 @@ def main():
 
 def body(work, base):
     # Key material through the real ceremony helper.
-    rc, out = run(REPO_ROOT / "scripts/release-keygen.sh", {}, ["ada-cli", str(work / "keys")])
+    rc, out = run(REPO_ROOT / "scripts/release-keygen.sh", {}, ["briglia-cli", str(work / "keys")])
     check("release-keygen.sh produced a test key", rc == 0, out)
     if rc != 0:
         return 1
@@ -389,10 +426,53 @@ def body(work, base):
     check("invalid live envelope is a hard stop (never treated as absent)",
           rc != 0 and "does not authenticate" in out and "bootstrap retired" not in out, out)
 
+    # ---- Legacy-transition descriptor (RENAME_PLAN §3.2): the live "latest"
+    # is the pre-rename ada-cli envelope until the first Briglia release.
+    print("— check-supersession.sh: legacy pre-rename live envelope —")
+    control(base, "/__control/reset", {})
+    legacy58 = make_legacy_dist(work / "legacy58", "0.1.58", 58, key)
+    seed_release(base, legacy58, "0.1.58")
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
+    check("legacy live 58: sequence 60 supersedes via the compiled descriptor",
+          rc == 0 and "supersedes live 58" in out and "LEGACY ada-cli envelope" in out, out)
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "58", "REF_NAME": "v0.2.0"})
+    check("legacy live 58: equal sequence is still superseded", rc != 0 and "superseded" in out, out)
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "57", "REF_NAME": "v0.2.0"})
+    check("legacy live 58: lower sequence is still superseded", rc != 0 and "superseded" in out, out)
+    control(base, "/__control/override", {"download_overrides": {
+        "manifest.sig.json": base64.b64encode(tampered_envelope(legacy58 / "manifest.sig.json")).decode()}})
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
+    check("hostile legacy envelope (bad signature) is a hard stop",
+          rc != 0 and "does not authenticate" in out, out)
+    control(base, "/__control/reset", {})
+    foreign = make_legacy_dist(work / "legacy-foreign", "0.1.58", 58, key,
+                               artifact_base="https://github.com/permaevidence/briglia-cli/releases/download")
+    seed_release(base, foreign, "0.1.58")
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
+    check("legacy-signed envelope whose artifacts are not under the old repository is refused",
+          rc != 0 and "not under https://github.com/permaevidence/ada-cli/releases/download/" in out, out)
+    control(base, "/__control/reset", {})
+    mislabeled = make_legacy_dist(work / "legacy-mislabeled", "0.1.58", 58, key, payload_channel="briglia-cli")
+    seed_release(base, mislabeled, "0.1.58")
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
+    check("legacy-signed envelope carrying a non-legacy payload channel is refused",
+          rc != 0 and "not a ada-cli schema-1 manifest" in out, out)
+    control(base, "/__control/reset", {})
+    unknown = make_legacy_dist(work / "legacy-unknown", "0.1.58", 58, key, channel="ada-ut")
+    seed_release(base, unknown, "0.1.58")
+    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
+    check("an envelope under any other retired channel does not authenticate",
+          rc != 0 and "does not authenticate" in out, out)
+    check("no bypass: check-supersession.sh reads no legacy override from the environment",
+          "LEGACY_CHANNEL=\"ada-cli\"" in (SCRIPTS / "check-supersession.sh").read_text()
+          and "${LEGACY" not in (SCRIPTS / "check-supersession.sh").read_text())
+    control(base, "/__control/reset", {})
+    seed_release(base, dist58, "0.1.58")
+
     # ------------------------------------------------------------------
     print("— publish-release.sh —")
     pub_env = {"GH_TOKEN": GH_TOKEN, "REPO": REPO, "GH_API_URL": base, "GH_UPLOADS_URL": base,
-               "INSTALLER": str(REPO_ROOT / "scripts/get-ada.sh")}
+               "INSTALLER": str(REPO_ROOT / "scripts/get-briglia.sh")}
 
     control(base, "/__control/reset", {})
     old_id = seed_release(base, dist58, "0.1.58")
@@ -405,13 +485,13 @@ def body(work, base):
     order = new[0]["asset_order"] if new else []
     check("happy path: signed envelope uploaded LAST, after every asset",
           order and order[-1] == "manifest.sig.json"
-          and set(order[:-1]) == {f"ada-{p}.tar.gz" for p in PLATFORMS} | {f"ada-{p}.tar.gz.sha256" for p in PLATFORMS}
+          and set(order[:-1]) == {f"briglia-{p}.tar.gz" for p in PLATFORMS} | {f"briglia-{p}.tar.gz.sha256" for p in PLATFORMS}
           | {"manifest.json", "install.sh"}, str(order))
     patch_bodies = [b for m, b in st["log"] if m == "PATCH-BODY"]
     check("happy path: exactly one publish PATCH with draft=false and explicit make_latest",
           patch_bodies == ['{"draft": false, "make_latest": "true"}'], str(patch_bodies))
-    check("happy path: installer asset is byte-identical to scripts/get-ada.sh",
-          rc == 0 and requests_asset(base, new[0]["id"], "install.sh") == (REPO_ROOT / "scripts/get-ada.sh").read_bytes())
+    check("happy path: installer asset is byte-identical to scripts/get-briglia.sh",
+          rc == 0 and requests_asset(base, new[0]["id"], "install.sh") == (REPO_ROOT / "scripts/get-briglia.sh").read_bytes())
     check("token never appears in publisher output", GH_TOKEN not in out)
     check("old release survives (immutable): still present, no longer latest",
           str(old_id) in st["releases"] and st["latest_id"] != old_id)
@@ -439,12 +519,12 @@ def body(work, base):
           and any(r["tag_name"] == "v0.1.59" and not r["draft"] for r in st["releases"].values()), out)
 
     # upload failure mid-way
-    control(base, "/__control/reset", {"faults": {"upload_fail": "ada-linux-x64.tar.gz"}})
+    control(base, "/__control/reset", {"faults": {"upload_fail": "briglia-linux-x64.tar.gz"}})
     old_id = seed_release(base, dist58, "0.1.58")
     rc, out = run(SCRIPTS / "publish-release.sh", pub_env | {"REF_NAME": "v0.1.59", "VERSION": "0.1.59", "DIST": str(dist59)})
     st = control(base, "/__control/state")
     drafts = [r for r in st["releases"].values() if r["tag_name"] == "v0.1.59"]
-    check("upload failure: reported, exit nonzero", rc != 0 and "uploading ada-linux-x64.tar.gz failed" in out, out)
+    check("upload failure: reported, exit nonzero", rc != 0 and "uploading briglia-linux-x64.tar.gz failed" in out, out)
     check("upload failure: draft never published, old release stays latest",
           drafts and drafts[0]["draft"] and st["latest_id"] == old_id
           and not any(m == "PATCH" for m, p in st["log"]), json.dumps(st["releases"]))
@@ -477,7 +557,7 @@ def body(work, base):
     print("— verify-public-release.sh (authenticate first) —")
     ver_env = {"VERSION": "0.1.59", "SEQUENCE": "59", "PLATFORM": "linux-x64",
                "EXPECTED_PUBKEY": str(key["pub"]), "RELEASE_BASE_URL": base,
-               "CANDIDATE_TARBALL": str(dist59 / "ada-linux-x64.tar.gz"),
+               "CANDIDATE_TARBALL": str(dist59 / "briglia-linux-x64.tar.gz"),
                "CANDIDATE_ENVELOPE": str(dist59 / "manifest.sig.json"),
                "ATTEMPTS": "3", "RETRY_SLEEP": "0"}
 
@@ -503,13 +583,13 @@ def body(work, base):
     later = control(base, "/__control/state")["log"][log_mark:]
     check("tampered public envelope: refused BEFORE any asset download, binary never executed",
           rc != 0 and "does not authenticate" in out and not ran
-          and not any("ada-linux-x64.tar.gz" in p for m, p in later), out)
+          and not any("briglia-linux-x64.tar.gz" in p for m, p in later), out)
 
     # public asset differs from what the manifest authenticates
     control(base, "/__control/reset", {})
     seed_release(base, dist59, "0.1.59")
-    bad = bytearray((dist59 / "ada-linux-x64.tar.gz").read_bytes()); bad[-1] ^= 0xFF
-    control(base, "/__control/override", {"download_overrides": {"ada-linux-x64.tar.gz": base64.b64encode(bytes(bad)).decode()}})
+    bad = bytearray((dist59 / "briglia-linux-x64.tar.gz").read_bytes()); bad[-1] ^= 0xFF
+    control(base, "/__control/override", {"download_overrides": {"briglia-linux-x64.tar.gz": base64.b64encode(bytes(bad)).decode()}})
     rc, out, ran = verify()
     check("public asset with wrong sha256: refused, binary never executed",
           rc != 0 and "sha256 does not match" in out and not ran, out)
@@ -523,7 +603,7 @@ def body(work, base):
           rc != 0 and "NOT byte-identical to the one this run signed" in out and not ran, out)
     control(base, "/__control/reset", {})
     seed_release(base, dist59, "0.1.59")
-    rc, out, ran = verify({"CANDIDATE_TARBALL": str(other / "ada-linux-x64.tar.gz")})
+    rc, out, ran = verify({"CANDIDATE_TARBALL": str(other / "briglia-linux-x64.tar.gz")})
     check("public asset hashes correctly but differs from the verified candidate: refused",
           rc != 0 and "NOT byte-identical to the verified candidate" in out and not ran, out)
 

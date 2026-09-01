@@ -1,7 +1,7 @@
 import ArgumentParser
 import Foundation
 
-/// `ada toolchain` — status / install / remove for the userdata media
+/// `briglia toolchain` — status / install / remove for the userdata media
 /// toolchain (see UserdataToolchain.swift). Built for Ubuntu Touch, where
 /// apt-to-rootfs is a trap (tiny, read-only, wiped by OTA); works on any
 /// Debian-family system without root.
@@ -34,12 +34,12 @@ struct ToolchainCommand: AsyncParsableCommand {
                 print("Everything present.")
             } else {
                 print("Missing: \(missing.map { $0.name }.joined(separator: ", "))")
-                print("Install without touching the rootfs:  ada toolchain install")
+                print("Install without touching the rootfs:  briglia toolchain install")
             }
             if !missingOptional.isEmpty {
                 print("Optional, not installed: "
                       + Set(missingOptional.map { $0.package }).sorted().joined(separator: ", ")
-                      + "  (ada toolchain install --pandoc / --libreoffice)")
+                      + "  (briglia toolchain install --pandoc / --libreoffice)")
             }
         }
     }
@@ -58,6 +58,7 @@ struct ToolchainCommand: AsyncParsableCommand {
         var includeLibreOffice = false
 
         func run() async throws {
+            try IdentityMigration.gateMutatingEntry()
             let report = await Task.detached(priority: .userInitiated) {
                 UserdataToolchain.installSync(includePandoc: includePandoc,
                                               includeLibreOffice: includeLibreOffice) {
@@ -86,6 +87,7 @@ struct ToolchainCommand: AsyncParsableCommand {
             abstract: "Compare the prefix against the repo and rebuild it when security/bug fixes are available.")
 
         func run() async throws {
+            try IdentityMigration.gateMutatingEntry()
             let report = await Task.detached(priority: .userInitiated) {
                 UserdataToolchain.upgradeSync {
                     print("  \($0)")
@@ -107,9 +109,10 @@ struct ToolchainCommand: AsyncParsableCommand {
     struct Remove: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "remove",
-            abstract: "Remove the userdata prefix and every wrapper Ada created.")
+            abstract: "Remove the userdata prefix and every wrapper Briglia created.")
 
         func run() throws {
+            try IdentityMigration.gateMutatingEntry()
             let result = UserdataToolchain.removeAll()
             if !result.removed.isEmpty {
                 print("Removed: \(result.removed.joined(separator: ", "))")
@@ -119,7 +122,7 @@ struct ToolchainCommand: AsyncParsableCommand {
                 throw ExitCode(1)
             }
             if result.removed.isEmpty {
-                print("Nothing to remove — no Ada-created wrappers or prefix found.")
+                print("Nothing to remove — no Briglia-created wrappers or prefix found.")
             }
         }
     }

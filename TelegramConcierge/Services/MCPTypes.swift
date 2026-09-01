@@ -1,6 +1,6 @@
 import Foundation
 
-/// Raw config entry for a single MCP server, loaded from `~/.config/ada/mcp.json`.
+/// Raw config entry for a single MCP server, loaded from `~/.config/briglia/mcp.json`.
 ///
 /// The file format matches Claude Desktop's conventional shape so users can
 /// copy existing configurations directly:
@@ -120,6 +120,6 @@ public enum MCPFrameError: Error, CustomStringConvertible {
 /// accepted by every public server in the wild as of mid-2026.
 public enum MCPProtocol {
     public static let version = "2024-11-05"
-    public static let clientName = "Ada"
+    public static let clientName = "Briglia"
     public static let clientVersion = "1.0"
 }

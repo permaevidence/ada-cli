@@ -5,7 +5,7 @@ import FoundationNetworking
 
 // MARK: - Persistent Web Pipeline Log
 
-/// Appends web-pipeline diagnostics to ~/.local/share/ada/logs/
+/// Appends web-pipeline diagnostics to ~/.local/share/briglia/logs/
 /// web-pipeline.log — stdout prints vanish for Finder-launched installs, so
 /// this is the only forensic trail in production. Rotates daily: the first
 /// write of a new day moves the file to web-pipeline.previous.log, keeping at
@@ -14,7 +14,7 @@ import FoundationNetworking
 final class WebPipelineLog: @unchecked Sendable {
     static let shared = WebPipelineLog()
 
-    private let queue = DispatchQueue(label: "com.permaevidence.ada.web-pipeline-log")
+    private let queue = DispatchQueue(label: "com.permaevidence.briglia.web-pipeline-log")
     private let maxBytes = 10_000_000
 
     private static let stampFormatter: DateFormatter = {

@@ -5,12 +5,12 @@
 #   <out>/<keyId>.priv.pem   private key, mode 0600 — NEVER commit
 #   <out>/<keyId>.pub.pem    public key PEM (committed as the expected key)
 #   <out>/<keyId>.json       key record: keyId, fingerprint, created, channel
-# Usage: release-keygen.sh <channel: ada-cli|ada-ut> <output-dir>
+# Usage: release-keygen.sh <channel: briglia-cli|briglia-ut> <output-dir>
 set -euo pipefail
 
-CHANNEL="${1:?usage: release-keygen.sh <ada-cli|ada-ut> <output-dir>}"
-OUT="${2:?usage: release-keygen.sh <ada-cli|ada-ut> <output-dir>}"
-case "$CHANNEL" in ada-cli|ada-ut) ;; *) echo "✖ channel must be ada-cli or ada-ut"; exit 1;; esac
+CHANNEL="${1:?usage: release-keygen.sh <briglia-cli|briglia-ut> <output-dir>}"
+OUT="${2:?usage: release-keygen.sh <briglia-cli|briglia-ut> <output-dir>}"
+case "$CHANNEL" in briglia-cli|briglia-ut) ;; *) echo "✖ channel must be briglia-cli or briglia-ut"; exit 1;; esac
 
 # Ed25519-capable openssl, proven by the RFC 8032 known vector (LibreSSL on
 # macOS /usr/bin cannot do Ed25519; OpenSSL 1.1.1 fails pkeyutl -rawin).

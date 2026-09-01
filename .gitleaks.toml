@@ -1,4 +1,4 @@
-# Gitleaks config for ada-cli. Extends the default ruleset; the allowlist
+# Gitleaks config for briglia-cli. Extends the default ruleset; the allowlist
 # names the exact synthetic fixture values used by selftests, value-scoped
 # on purpose — a real credential pasted into a selftest must still fail
 # the scan. Add new fixture values here explicitly when writing tests.

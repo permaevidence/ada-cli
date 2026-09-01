@@ -144,12 +144,12 @@ struct BashPipelineSelftest: AsyncParsableCommand {
             // through and overwrite the rescued tail with the emptied
             // buffer, losing all output. Inject the write fault and assert
             // the tail survives.
-            setenv("ADA_TEST_SPILL_FAULT", "write", 1)
+            setenv("BRIGLIA_TEST_SPILL_FAULT", "write", 1)
             let collector = ForegroundStreamCollector(streamLabel: "faulttest", secrets: [:])
             collector.ingest(Data(String(repeating: "y", count: 60_000).utf8))
             collector.ingest(Data("TAIL_MARKER_XYZ\n".utf8))
             let final = collector.finalize()
-            unsetenv("ADA_TEST_SPILL_FAULT")
+            unsetenv("BRIGLIA_TEST_SPILL_FAULT")
             check("spill write fault keeps the rescued tail",
                   final.spillPath == nil && final.truncated
                   && final.text.contains("TAIL_MARKER_XYZ") && final.text.contains("yyyy"),

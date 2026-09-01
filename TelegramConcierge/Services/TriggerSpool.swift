@@ -5,7 +5,7 @@ import Glibc
 import Darwin
 #endif
 
-/// One event posted to an external-trigger watcher via `ada trigger`.
+/// One event posted to an external-trigger watcher via `briglia trigger`.
 struct ExternalTriggerEvent: Codable {
     let watcherId: UUID
     let timestamp: Date
@@ -18,9 +18,9 @@ struct ExternalTriggerEvent: Codable {
     }
 }
 
-/// File-based spool connecting the short-lived `ada trigger` process to the
+/// File-based spool connecting the short-lived `briglia trigger` process to the
 /// running daemon. Each event is one JSON file written atomically (temp +
-/// rename) into `~/.local/share/ada/trigger-events/`; the daemon's poll loop
+/// rename) into `~/.local/share/briglia/trigger-events/`; the daemon's poll loop
 /// scans the directory, applies the per-watcher cooldown/batching rules, and
 /// deletes files only AFTER the fire message is saved to durable
 /// conversation history — so a crash between pickup and delivery re-delivers
@@ -37,7 +37,7 @@ struct ExternalTriggerEvent: Codable {
 /// (`overflow_<watcherUUID>.count`, a single integer) instead of stored —
 /// truly bounded disk however long the storm lasts. All counter mutations
 /// and the count-then-write cap decision run under an flock(2) on
-/// `.spool.lock`, so concurrent `ada trigger` processes can neither race the
+/// `.spool.lock`, so concurrent `briglia trigger` processes can neither race the
 /// cap nor lose counter increments. The counter is decremented (never
 /// deleted blind) when its batch is CONFIRMED delivered, so overflow counts
 /// share the same crash-redelivery guarantee as event files, and increments
@@ -49,7 +49,7 @@ enum TriggerSpool {
 
     /// Spooled-file cap per watcher. Env override is an internal test hook.
     static let maxEventsPerWatcher: Int = {
-        if let raw = ProcessInfo.processInfo.environment["ADA_TRIGGER_SPOOL_CAP"],
+        if let raw = ProcessInfo.processInfo.environment["BRIGLIA_TRIGGER_SPOOL_CAP"],
            let value = Int(raw), value > 0 {
             return value
         }
@@ -86,7 +86,7 @@ enum TriggerSpool {
     // MARK: - Cross-process lock
 
     /// Run `body` holding an exclusive flock on the spool's lock file. Both
-    /// the `ada trigger` intake (cap check + write/increment) and the
+    /// the `briglia trigger` intake (cap check + write/increment) and the
     /// daemon's counter mutations go through this, making the cap decision
     /// and every read-modify-write of a counter atomic across processes.
     /// Held for microseconds; if the lock file cannot even be opened the

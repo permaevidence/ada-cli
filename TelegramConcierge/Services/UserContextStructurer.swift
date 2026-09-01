@@ -216,7 +216,7 @@ struct UserContextStructurer {
             request.timeoutInterval = 1200
         case .openRouter:
             request.setValue("Bearer \(trimmedOpenRouterAPIKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("Ada/1.0", forHTTPHeaderField: "HTTP-Referer")
+            request.setValue("Briglia/1.0", forHTTPHeaderField: "HTTP-Referer")
             request.setValue("Telegram Concierge Bot", forHTTPHeaderField: "X-Title")
             request.timeoutInterval = 360
         }

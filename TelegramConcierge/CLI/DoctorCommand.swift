@@ -3,7 +3,7 @@ import Foundation
 
 struct Doctor: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Check Ada's configuration, permissions and toolchain."
+        abstract: "Check Briglia's configuration, permissions and toolchain."
     )
 
     @Flag(name: .long, help: "Also probe the configured services over the network.")
@@ -19,6 +19,20 @@ struct Doctor: AsyncParsableCommand {
             }
         }
         func note(_ label: String) { print("  · \(label)") }
+
+        // Identity migration (read-only: doctor reports and points at the
+        // recovery command, never mutates — rename plan §4.3).
+        let migrationFindings = IdentityMigration.doctorFindings()
+        if !migrationFindings.isEmpty {
+            print("\nMigration")
+            for finding in migrationFindings {
+                if finding.problem {
+                    check(finding.text, ok: false, hint: finding.hint)
+                } else {
+                    note(finding.text)
+                }
+            }
+        }
 
         print("\nConfiguration")
         let provider = LLMProvider.fromStoredValue(KeychainHelper.load(key: KeychainHelper.llmProviderKey))
@@ -37,13 +51,13 @@ struct Doctor: AsyncParsableCommand {
         }
         check("main agent endpoint configured (\(model.isEmpty ? "—" : model))",
               ok: !baseURL.isEmpty && !model.isEmpty && (provider == .lmStudio || !(mainKey ?? "").isEmpty),
-              hint: "run `ada setup`, section 1")
+              hint: "run `briglia setup`, section 1")
         let openAIKey = KeychainHelper.load(key: KeychainHelper.openAITranscriptionApiKeyKey) ?? ""
-        check("OpenAI key present", ok: !openAIKey.isEmpty, hint: "run `ada setup`, section 2")
+        check("OpenAI key present", ok: !openAIKey.isEmpty, hint: "run `briglia setup`, section 2")
         let serperKey = KeychainHelper.load(key: KeychainHelper.serperApiKeyKey) ?? ""
-        check("Serper key present", ok: !serperKey.isEmpty, hint: "run `ada setup`, section 3")
+        check("Serper key present", ok: !serperKey.isEmpty, hint: "run `briglia setup`, section 3")
         let jinaKey = KeychainHelper.load(key: KeychainHelper.jinaApiKeyKey) ?? ""
-        check("Jina key present", ok: !jinaKey.isEmpty, hint: "run `ada setup`, section 4")
+        check("Jina key present", ok: !jinaKey.isEmpty, hint: "run `briglia setup`, section 4")
         note("Telegram: \(TelegramConfig.isConfigured ? "configured" : "not configured (optional)")")
         let backendSource = WebSearchBackend.explicitlyStored != nil
             ? "explicit" : "inferred from keys — set with /websearch"
@@ -71,13 +85,13 @@ struct Doctor: AsyncParsableCommand {
         } else {
             let sleepStatus = PermissionsService.linuxSleepStatus()
             check("automatic suspend disabled", ok: sleepStatus.neverSuspends,
-                  hint: "run `ada setup`, section 6 — a suspended machine stops Ada completely")
+                  hint: "run `briglia setup`, section 6 — a suspended machine stops Briglia completely")
             if sleepStatus.sleepTargetsMasked {
                 note("systemd sleep targets: masked (machine can never suspend)")
             }
         }
 
-        // Background service (ada service): optional, but when installed it
+        // Background service (briglia service): optional, but when installed it
         // should be healthy — and on Ubuntu Touch the wakelock is essential.
         let unitPath = AgentServiceSupport.userUnitDirectory(
             home: FileManager.default.homeDirectoryForCurrentUser.path)
@@ -86,12 +100,12 @@ struct Doctor: AsyncParsableCommand {
             let active = AgentServiceSupport.run(
                 "systemctl", ["--user", "is-active", AgentServiceSupport.userUnitName]).output
             check("background service active", ok: active == "active",
-                  hint: "ada service status — journalctl --user -u ada.service -n 50")
+                  hint: "briglia service status — journalctl --user -u briglia.service -n 50")
             check("linger enabled (service survives logout/boot)",
                   ok: AgentServiceSupport.lingerEnabled(),
                   hint: "loginctl enable-linger \(NSUserName()) (sudo may be needed)")
         } else {
-            note("background service: not installed (optional — ada service install)")
+            note("background service: not installed (optional — briglia service install)")
         }
         if AgentServiceSupport.isUbuntuTouch() {
             if AgentServiceSupport.wakelockUnitInstalled() {
@@ -101,7 +115,7 @@ struct Doctor: AsyncParsableCommand {
                       hint: "sudo systemctl restart \(AgentServiceSupport.wakelockUnitName)")
             } else {
                 check("keep-awake unit installed (phone must not suspend)", ok: false,
-                      hint: "ada service install — an OTA update may also have removed it")
+                      hint: "briglia service install — an OTA update may also have removed it")
             }
         }
         #endif
@@ -124,8 +138,8 @@ struct Doctor: AsyncParsableCommand {
         // On Linux the media pipeline (PDF page counts, slicing, OCR
         // rasterization, image downscaling) runs on these two suites.
         let mediaHint = AgentServiceSupport.isUbuntuTouch()
-            ? "ada toolchain install — installs to userdata, no sudo, survives OS updates"
-            : "sudo apt install poppler-utils — without it Ada cannot read or OCR PDFs"
+            ? "briglia toolchain install — installs to userdata, no sudo, survives OS updates"
+            : "sudo apt install poppler-utils — without it Briglia cannot read or OCR PDFs"
         check("poppler-utils (pdfinfo/pdftotext/pdftoppm/pdfseparate/pdfunite)",
               ok: ["pdfinfo", "pdftotext", "pdftoppm", "pdfseparate", "pdfunite"]
                   .allSatisfy { PlatformBinary.find($0) != nil },
@@ -134,8 +148,8 @@ struct Doctor: AsyncParsableCommand {
               ok: PlatformBinary.find("magick") != nil
                   || (PlatformBinary.find("identify") != nil && PlatformBinary.find("convert") != nil),
               hint: AgentServiceSupport.isUbuntuTouch()
-                  ? "ada toolchain install — installs to userdata, no sudo, survives OS updates"
-                  : "sudo apt install imagemagick — without it Ada cannot inspect or resize images")
+                  ? "briglia toolchain install — installs to userdata, no sudo, survives OS updates"
+                  : "sudo apt install imagemagick — without it Briglia cannot inspect or resize images")
         // Attribute prefix-sourced tools so it's visible which survive OTA.
         let prefixTools = UserdataToolchain.status().filter { $0.source == "prefix" }
         if !prefixTools.isEmpty {
@@ -143,7 +157,7 @@ struct Doctor: AsyncParsableCommand {
         }
         // Dangling system apt-state symlinks (seen on a UT device
         // 2026-08-28: /var/cache/apt → deleted /userdata/apt/…): every
-        // rootfs apt run fails with confusing errors. Ada's own installer
+        // rootfs apt run fails with confusing errors. Briglia's own installer
         // is unaffected (fully redirected) — just surface the repair.
         let fmDoctor = FileManager.default
         for path in ["/var/cache/apt", "/var/lib/apt/lists"] {
@@ -151,34 +165,34 @@ struct Doctor: AsyncParsableCommand {
                   !fmDoctor.fileExists(atPath: path) else { continue }
             note("system apt state is a dangling symlink: \(path) → \(target) — "
                  + "system apt/apt-get commands will fail until the target is "
-                 + "recreated (sudo mkdir -p \(target)/partial \(target)/archives/partial). Ada's userdata "
+                 + "recreated (sudo mkdir -p \(target)/partial \(target)/archives/partial). Briglia's userdata "
                  + "toolchain installer is unaffected")
         }
         #endif
         switch EmailCalendarProvider.current {
         case .none:
-            note("email/calendar: none (default) — enable AgentMail or gws via `ada setup`, toolchain step")
+            note("email/calendar: none (default) — enable AgentMail or gws via `briglia setup`, toolchain step")
         case .agentmail:
             if AgentMailService.isConfigured() {
                 let inbox = EmailCalendarProvider.agentMailInboxAddress
                 note("email/calendar: AgentMail\(inbox.isEmpty ? "" : " (\(inbox))") + local calendar — key configured")
             } else {
-                note("email/calendar: AgentMail selected but NO API key stored — rerun `ada setup`, toolchain step")
+                note("email/calendar: AgentMail selected but NO API key stored — rerun `briglia setup`, toolchain step")
             }
             if !AgentMailService.agentMailBrokerInstalled() {
-                note("agentmail CLI (key broker) not installed — inbox context/alerts still work; email ACTIONS need it (`ada setup`, toolchain step). A bare agentmail binary from npm/brew cannot authenticate: Ada never puts the key in bash environments")
+                note("agentmail CLI (key broker) not installed — inbox context/alerts still work; email ACTIONS need it (`briglia setup`, toolchain step). A bare agentmail binary from npm/brew cannot authenticate: Briglia never puts the key in bash environments")
             }
             let foreign = AgentMailService.foreignAgentMailInstalls()
             if !foreign.isEmpty {
-                note("foreign agentmail install at \(foreign.joined(separator: ", ")) — no access to Ada's key; may shadow Ada's wrapper depending on PATH order")
+                note("foreign agentmail install at \(foreign.joined(separator: ", ")) — no access to Briglia's key; may shadow Briglia's wrapper depending on PATH order")
             }
         case .gws:
             if !GoogleWorkspaceService.gwsInstalled() {
-                note("email/calendar: gws selected but the binary is not installed — `ada setup`, toolchain step")
+                note("email/calendar: gws selected but the binary is not installed — `briglia setup`, toolchain step")
             } else if await GoogleWorkspaceService.shared.gwsUsable() {
                 note("gws (Google Workspace) installed and authorized — email/calendar context enabled")
             } else {
-                note("gws (Google Workspace) installed but NOT authorized — email/calendar context stays disabled until `gws auth login` + Ada restart")
+                note("gws (Google Workspace) installed but NOT authorized — email/calendar context stays disabled until `gws auth login` + Briglia restart")
             }
         }
 
@@ -213,7 +227,7 @@ struct Doctor: AsyncParsableCommand {
             case .agentmail where AgentMailService.isConfigured():
                 let reachable = await AgentMailService.shared.verifyAccess()
                 check("AgentMail key valid", ok: reachable,
-                      hint: "check the key at agentmail.to (rerun `ada setup`, toolchain step) — until then email context is empty")
+                      hint: "check the key at agentmail.to (rerun `briglia setup`, toolchain step) — until then email context is empty")
             default:
                 break
             }

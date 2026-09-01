@@ -7,7 +7,7 @@ import Foundation
 /// into `SubagentType.defaultMaxTurns` or `ConversationManager`'s safety cap.
 ///
 /// Resolution order:
-///   1. Per-agent override from `~/.config/ada/agent-turns.json` (this file).
+///   1. Per-agent override from `~/.config/briglia/agent-turns.json` (this file).
 ///   2. Built-in default (SubagentType.defaultMaxTurns or main-agent constant).
 ///
 /// Config format:

@@ -78,7 +78,7 @@ enum FileTimeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notRead(let path):
-            return "You must read \(path) with read_file before overwriting or editing it. Use read_file first. (Read history resets when Ada restarts — a file read before a restart must be re-read, since it may have changed while Ada was down.)"
+            return "You must read \(path) with read_file before overwriting or editing it. Use read_file first. (Read history resets when Briglia restarts — a file read before a restart must be re-read, since it may have changed while Briglia was down.)"
         case .vanished(let path):
             return "\(path) was read this session but no longer exists on disk (deleted or replaced externally). Re-read it or list the directory before modifying it."
         case .stale(let path, let snapMtime, let curMtime, let snapSize, let curSize):

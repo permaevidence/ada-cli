@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Ada CLI smoke test — runs on macOS and Linux (CI runs both).
+"""Briglia CLI smoke test — runs on macOS and Linux (CI runs both).
 
-Usage: python3 scripts/smoke_test.py [path/to/ada]
+Usage: python3 scripts/smoke_test.py [path/to/briglia]
 
 Checks, in order:
-  1. `ada --version` prints the version string
-  2. `ada doctor` on a pristine home: exits 1, prints all report sections
-  3. `ada media-selftest`: the cross-platform PDF/image pipeline is healthy
+  1. `briglia --version` prints the version string
+  2. `briglia doctor` on a pristine home: exits 1, prints all report sections
+  3. `briglia media-selftest`: the cross-platform PDF/image pipeline is healthy
      (poppler/ImageMagick on Linux, PDFKit/ImageIO on macOS)
-  4. `ada bundle-check`: passes next to the build bundle; a binary copied
+  4. `briglia bundle-check`: passes next to the build bundle; a binary copied
      WITHOUT the resource bundle fails with a readable error (not SIGTRAP)
   5. A real chat session against a local mock OpenAI-compatible server:
      chat turn, single-instance lock, /hide privacy mode, quoted /attach
@@ -24,10 +24,10 @@ Checks, in order:
      duplicate updates dropped, offset persisted across restart (no
      re-delivery, polling resumes at the right offset), and the
      documented week-of-silence id reset adopted instead of dropped
-  9. `ada __setsid-exec` trampoline (every bash tool child runs through
+  9. `briglia __setsid-exec` trampoline (every bash tool child runs through
      it): a child given a real controlling pty ends up with NO
      controlling terminal — so sudo-style /dev/tty password prompts fail
-     fast instead of writing `Password:` into Ada's own terminal and
+     fast instead of writing `Password:` into Briglia's own terminal and
      blocking the turn — and exit codes pass through unchanged
  10. TerminalHandoff (the trampoline's inverse, for wizard/upgrade
      children that MUST prompt on the terminal — sudo, apt): a
@@ -49,7 +49,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ADA = sys.argv[1] if len(sys.argv) > 1 else ".build/debug/ada"
+ADA = sys.argv[1] if len(sys.argv) > 1 else ".build/debug/briglia"
 # Repo root for selftests that scan the source tree (midturn invariant scan).
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -118,7 +118,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Ada binary: {ADA}")
+    print(f"Briglia binary: {ADA}")
 
     # 1. --version
     result = subprocess.run([ADA, "--version"], capture_output=True, text=True, timeout=60)
@@ -323,14 +323,14 @@ def main():
     check("web-agent-selftest", result.returncode == 0,
           (result.stdout + result.stderr)[-1500:])
 
-    # 3d. `ada trigger` CLI surface: unknown watcher fails at the caller;
+    # 3d. `briglia trigger` CLI surface: unknown watcher fails at the caller;
     # a valid external watcher gets a spooled event file.
     with tempfile.TemporaryDirectory() as home:
         env = isolated_env(home)
         result = subprocess.run([ADA, "trigger", "11111111-2222-3333-4444-555555555555", "x"],
                                 capture_output=True, text=True, timeout=60, env=env)
         unknown_ok = result.returncode == 1 and "no watcher" in result.stdout
-        data_dir = os.path.join(env["XDG_DATA_HOME"], "ada")
+        data_dir = os.path.join(env["XDG_DATA_HOME"], "briglia")
         os.makedirs(data_dir, exist_ok=True)
         wid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
         with open(os.path.join(data_dir, "reminders.json"), "w") as f:
@@ -351,7 +351,7 @@ def main():
               f"unknown_ok={unknown_ok} spooled={spooled} payload_ok={payload_ok} out={result.stdout!r}")
 
     # 3e. Service unit generation + Ubuntu Touch detection (pure checks,
-    # both platforms), and the `ada service` platform gate: real systemd
+    # both platforms), and the `briglia service` platform gate: real systemd
     # management on Linux, a readable refusal on macOS. On Linux the status
     # subcommand must stay exit-0 with no unit installed AND with no
     # reachable systemd user bus (the CI container case).
@@ -396,7 +396,7 @@ def main():
           (result.stdout + result.stderr)[-1500:])
     with tempfile.TemporaryDirectory() as home:
         env = isolated_env(home)
-        env["ADA_IGNORE_LEGACY_SETUP_FLAG"] = "1"
+        env["BRIGLIA_IGNORE_LEGACY_SETUP_FLAG"] = "1"
         result = subprocess.run([ADA, "setup-api", "status"], capture_output=True,
                                 text=True, timeout=60, env=env)
         try:
@@ -405,7 +405,7 @@ def main():
             payload = None
         check("setup-api status: pure JSON on stdout, virgin install",
               result.returncode == 0 and payload is not None
-              and payload.get("schema") == 1 and payload.get("ok") is True
+              and payload.get("schema") == 2 and payload.get("ok") is True
               and payload.get("setup", {}).get("complete") is False,
               f"rc={result.returncode} out={result.stdout[:300]!r}")
         req = json.dumps({"provider": {"profile": "local", "base_url": "http://localhost:9/v1",
@@ -447,8 +447,8 @@ def main():
     check("bundle-check: passes next to build bundle", result.returncode == 0,
           result.stdout + result.stderr)
     with tempfile.TemporaryDirectory() as bindir:
-        shutil.copy2(ADA, os.path.join(bindir, "ada"))
-        result = subprocess.run([os.path.join(bindir, "ada"), "bundle-check"],
+        shutil.copy2(ADA, os.path.join(bindir, "briglia"))
+        result = subprocess.run([os.path.join(bindir, "briglia"), "bundle-check"],
                                 capture_output=True, text=True, timeout=60, cwd="/")
         check("bundle-check: missing bundle fails readably",
               result.returncode == 1 and "resource bundle missing" in result.stdout,
@@ -462,7 +462,7 @@ def main():
     home = tempfile.mkdtemp(prefix="ada-smoke-")
     try:
         env = isolated_env(home)
-        config_dir = os.path.join(home, ".config", "ada")
+        config_dir = os.path.join(home, ".config", "briglia")
         os.makedirs(config_dir, exist_ok=True)
         secrets = {
             "llm_provider": "openai_compatible",
@@ -470,7 +470,7 @@ def main():
             "openai_compatible_model": "mock-model",
             "openai_compatible_api_key": "smoke-test-key",
             "openai_compatible_reasoning_effort": "high",
-            "assistant_name": "Ada",
+            "assistant_name": "Bree",
             "user_name": "Smoke",
         }
         with open(os.path.join(config_dir, "secrets.json"), "w") as f:
@@ -542,7 +542,7 @@ def main():
             second = subprocess.run([ADA], capture_output=True, text=True,
                                     timeout=60, env=env, stdin=subprocess.DEVNULL)
             check("lock: second instance refused",
-                  second.returncode == 1 and "another Ada instance" in second.stdout,
+                  second.returncode == 1 and "another Briglia instance" in second.stdout,
                   f"rc={second.returncode} out={second.stdout!r}")
 
             # /hide: replies must not render while privacy mode is on…
@@ -606,7 +606,7 @@ def main():
         env = isolated_env(home)
         # macOS UserDefaults ignores the HOME override — without this, a real
         # completed install on the host machine routes setup to the rerun menu.
-        env["ADA_IGNORE_LEGACY_SETUP_FLAG"] = "1"
+        env["BRIGLIA_IGNORE_LEGACY_SETUP_FLAG"] = "1"
         server = ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
         port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -656,10 +656,10 @@ def main():
 
     if sys.platform == "darwin":
         cdn_platform = "macos-arm64"
-        bundle_name = "ada-cli_ada.bundle"
+        bundle_name = "briglia-cli_briglia.bundle"
     else:
         cdn_platform = "linux-arm64" if platform_mod.machine() in ("arm64", "aarch64") else "linux-x64"
-        bundle_name = "ada-cli_ada.resources"
+        bundle_name = "briglia-cli_briglia.resources"
 
     build_dir = os.path.dirname(os.path.abspath(ADA))
     bundle_src = os.path.join(build_dir, bundle_name)
@@ -671,13 +671,13 @@ def main():
             # A user-writable "install": the exact layout install.sh produces.
             install_dir = os.path.join(home, "bin")
             os.makedirs(install_dir)
-            shutil.copy2(ADA, os.path.join(install_dir, "ada"))
+            shutil.copy2(ADA, os.path.join(install_dir, "briglia"))
             shutil.copytree(bundle_src, os.path.join(install_dir, bundle_name))
 
             # Release tarball with the same binary, served by a mock CDN as 9.9.9.
-            tar_path = os.path.join(home, "ada.tar.gz")
+            tar_path = os.path.join(home, "briglia.tar.gz")
             subprocess.run(["tar", "-czf", tar_path, "-C", build_dir,
-                            "ada", bundle_name], check=True)
+                            "briglia", bundle_name], check=True)
             with open(tar_path, "rb") as f:
                 tar_bytes = f.read()
             tar_sha = hashlib.sha256(tar_bytes).hexdigest()
@@ -685,7 +685,7 @@ def main():
             # SIGNED mock channel (the client is signed-only): the harness
             # signs each mock manifest with a deterministic test key through
             # the binary's own -dev-gated `__test-sign-envelope`, and hands
-            # the client the matching pinned key via ADA_RELEASE_TEST_KEY.
+            # the client the matching pinned key via BRIGLIA_RELEASE_TEST_KEY.
             # Mutable so later checks can re-point the channel at a
             # downgrade version or a corrupted build.
             cdn_state = {"envelope": b"", "tar": tar_bytes}
@@ -697,7 +697,7 @@ def main():
                     if self.path == "/manifest.sig.json":
                         body = cdn_state["envelope"]
                         ctype = "application/json"
-                    elif self.path.endswith("/ada.tar.gz"):
+                    elif self.path.endswith("/briglia.tar.gz"):
                         body = cdn_state["tar"]
                         ctype = "application/gzip"
                     else:
@@ -723,12 +723,12 @@ def main():
             def sign_mock(version, sequence, tar, sha):
                 now = dt.datetime.now(dt.timezone.utc)
                 manifest = {
-                    "schema": 1, "channel": "ada-cli", "sequence": sequence,
+                    "schema": 1, "channel": "briglia-cli", "sequence": sequence,
                     "version": version,
                     "published": (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "expires": (now + dt.timedelta(days=180)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "platforms": {cdn_platform: {
-                        "url": f"http://127.0.0.1:{cdn_port}/dl/v{version}/ada.tar.gz",
+                        "url": f"http://127.0.0.1:{cdn_port}/dl/v{version}/briglia.tar.gz",
                         "sha256": sha, "size": len(tar),
                     }},
                 }
@@ -756,10 +756,10 @@ def main():
             threading.Thread(target=llm.serve_forever, daemon=True).start()
 
             env = isolated_env(home)
-            env["ADA_ENVELOPE_URL"] = f"http://127.0.0.1:{cdn_port}/manifest.sig.json"
-            env["ADA_RELEASE_URL_PREFIX"] = f"http://127.0.0.1:{cdn_port}/dl/v{{version}}/"
-            env["ADA_RELEASE_TEST_KEY"] = f"{test_key_id}:{test_pub_hex}"
-            config_dir = os.path.join(home, ".config", "ada")
+            env["BRIGLIA_ENVELOPE_URL"] = f"http://127.0.0.1:{cdn_port}/manifest.sig.json"
+            env["BRIGLIA_RELEASE_URL_PREFIX"] = f"http://127.0.0.1:{cdn_port}/dl/v{{version}}/"
+            env["BRIGLIA_RELEASE_TEST_KEY"] = f"{test_key_id}:{test_pub_hex}"
+            config_dir = os.path.join(home, ".config", "briglia")
             os.makedirs(config_dir, exist_ok=True)
             with open(os.path.join(config_dir, "secrets.json"), "w") as f:
                 json.dump({
@@ -767,12 +767,12 @@ def main():
                     "openai_compatible_base_url": f"http://127.0.0.1:{llm_port}/v1",
                     "openai_compatible_model": "mock-model",
                     "openai_compatible_api_key": "smoke-test-key",
-                    "assistant_name": "Ada",
+                    "assistant_name": "Bree",
                 }, f)
             os.chmod(os.path.join(config_dir, "secrets.json"), 0o600)
 
             proc = subprocess.Popen(
-                [os.path.join(install_dir, "ada")],
+                [os.path.join(install_dir, "briglia")],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, env=env,
             )
@@ -812,9 +812,9 @@ def main():
 
                 # The process must survive its own exec: banner again, marker
                 # announcement, and a live REPL — all in the SAME pid.
-                restarted = wait_for("Update 9.9.9 installed — Ada restarted.", 120)
+                restarted = wait_for("Update 9.9.9 installed — Briglia restarted.", 120)
                 check("upgrade: exec restart announced", restarted, out()[-1200:])
-                wait_for("Ada CLI", 60, count=2)
+                wait_for("Briglia CLI", 60, count=2)
                 wait_for("› ", 60, count=2)
                 proc.stdin.write(b"/status\n")
                 proc.stdin.flush()
@@ -837,12 +837,12 @@ def main():
                 os.makedirs(os.path.join(corrupt_dir, bundle_name))
                 with open(os.path.join(corrupt_dir, bundle_name, "stub"), "w") as f:
                     f.write("not a real bundle\n")
-                with open(os.path.join(corrupt_dir, "ada"), "w") as f:
+                with open(os.path.join(corrupt_dir, "briglia"), "w") as f:
                     f.write("#!/bin/sh\nexit 1\n")
-                os.chmod(os.path.join(corrupt_dir, "ada"), 0o755)
+                os.chmod(os.path.join(corrupt_dir, "briglia"), 0o755)
                 corrupt_tar = os.path.join(home, "corrupt.tar.gz")
                 subprocess.run(["tar", "-czf", corrupt_tar, "-C", corrupt_dir,
-                                "ada", bundle_name], check=True)
+                                "briglia", bundle_name], check=True)
                 with open(corrupt_tar, "rb") as f:
                     corrupt_bytes = f.read()
                 sign_mock("8.8.8", BASE_SEQ + 3, corrupt_bytes,
@@ -850,7 +850,7 @@ def main():
                 proc.stdin.write(b"/upgrade\n")
                 proc.stdin.flush()
                 rejected = wait_for("failed verification", 120)
-                with open(os.path.join(install_dir, "ada"), "rb") as f:
+                with open(os.path.join(install_dir, "briglia"), "rb") as f:
                     intact = f.read(64) != b"#!/bin/sh\nexit 1\n"[:64]
                 check("upgrade: corrupt build rejected, install untouched",
                       rejected and intact, out()[-1200:])
@@ -870,12 +870,12 @@ def main():
                 def sha256_of(path):
                     with open(path, "rb") as f:
                         return hashlib.sha256(f.read()).hexdigest()
-                pre_hash = sha256_of(os.path.join(install_dir, "ada"))
+                pre_hash = sha256_of(os.path.join(install_dir, "briglia"))
                 sign_mock("7.7.7", BASE_SEQ + 4, tar_bytes, tar_sha)
                 env2 = dict(env)
-                env2["ADA_UPGRADE_FAULT"] = "bundle-move"
+                env2["BRIGLIA_UPGRADE_FAULT"] = "bundle-move"
                 proc2 = subprocess.Popen(
-                    [os.path.join(install_dir, "ada")],
+                    [os.path.join(install_dir, "briglia")],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, env=env2,
                 )
@@ -911,10 +911,10 @@ def main():
                     proc2.stdin.write(b"/upgrade\n")
                     proc2.stdin.flush()
                     rolled_back = wait2("previous version restored", 120)
-                    post_hash = sha256_of(os.path.join(install_dir, "ada"))
+                    post_hash = sha256_of(os.path.join(install_dir, "briglia"))
                     bundle_ok = os.path.isdir(os.path.join(install_dir, bundle_name))
                     leftovers = [n for n in os.listdir(install_dir)
-                                 if n.startswith(".ada-upgrade-")]
+                                 if n.startswith(".briglia-upgrade-")]
                     check("upgrade: mid-swap fault rolls back both components",
                           rolled_back and post_hash == pre_hash and bundle_ok
                           and not leftovers,
@@ -949,7 +949,7 @@ def main():
 
     # 8. Telegram poller: dedup, offset persistence, week-reset adoption
     # Short /tmp home, NOT the platform temp dir: macOS's per-user temp root
-    # is long enough that <home>/.local/share/ada/app-chat.sock overflows
+    # is long enough that <home>/.local/share/briglia/app-chat.sock overflows
     # sockaddr_un's 104-byte path cap and phase 10's chat socket can't bind.
     home = tempfile.mkdtemp(prefix="ada-smoke-poller-", dir="/tmp")
     try:
@@ -993,7 +993,7 @@ def main():
                         # a pop-once queue let the phantom twin eat batches).
                         # "updates" serves normally (id >= offset); "force"
                         # serves regardless of offset — re-delivery and reset
-                        # scenarios — and relies on Ada's dedup to ignore
+                        # scenarios — and relies on Briglia's dedup to ignore
                         # repeats.
                         batch = [u for u in tg_state["updates"]
                                  if u["update_id"] >= offset]
@@ -1080,8 +1080,8 @@ def main():
                 return list(llm_state["bodies"])
 
         env = isolated_env(home)
-        env["ADA_TELEGRAM_API_BASE"] = f"http://127.0.0.1:{tg_port}/bot"
-        config_dir = os.path.join(home, ".config", "ada")
+        env["BRIGLIA_TELEGRAM_API_BASE"] = f"http://127.0.0.1:{tg_port}/bot"
+        config_dir = os.path.join(home, ".config", "briglia")
         os.makedirs(config_dir, exist_ok=True)
         with open(os.path.join(config_dir, "secrets.json"), "w") as f:
             json.dump({
@@ -1089,7 +1089,7 @@ def main():
                 "openai_compatible_base_url": f"http://127.0.0.1:{llm_port}/v1",
                 "openai_compatible_model": "mock-model",
                 "openai_compatible_api_key": "smoke-test-key",
-                "assistant_name": "Ada",
+                "assistant_name": "Bree",
                 "telegram_bot_token": "TESTTOKEN",
                 "telegram_chat_id": "12345",
             }, f)
@@ -1113,7 +1113,7 @@ def main():
             # report what leaked — the trigger id and startedAt pin down the
             # phase that wrote it — then remove it.
             stale_marker = os.path.join(
-                home, ".local", "share", "ada", "active_turn.json")
+                home, ".local", "share", "briglia", "active_turn.json")
             if not keep_marker and os.path.exists(stale_marker):
                 try:
                     with open(stale_marker) as f:
@@ -1176,7 +1176,7 @@ def main():
                     # the marker to clear before the graceful quit;
                     # kill-scenario phases never reach this path.
                     marker = os.path.join(
-                        home, ".local", "share", "ada", "active_turn.json")
+                        home, ".local", "share", "briglia", "active_turn.json")
                     mdeadline = time.time() + 15
                     while time.time() < mdeadline and os.path.exists(marker):
                         time.sleep(0.2)
@@ -1214,7 +1214,7 @@ def main():
               out1.count("Dropping re-delivered update 100") >= 2 and rc1 == 0,
               tg_timeline() + f"\nrc={rc1}\n" + out1[-2500:])
 
-        state_path = os.path.join(home, ".local", "share", "ada",
+        state_path = os.path.join(home, ".local", "share", "briglia",
                                   "telegram_offset.json")
         persisted = {}
         if os.path.exists(state_path):
@@ -1255,7 +1255,7 @@ def main():
                 time.sleep(0.3)
 
         tg_mark("phase3-start")
-        out3, rc3 = run_poller_phase({"ADA_TELEGRAM_RESET_WINDOW_SECONDS": "1"}, phase3)
+        out3, rc3 = run_poller_phase({"BRIGLIA_TELEGRAM_RESET_WINDOW_SECONDS": "1"}, phase3)
         with tg_lock:
             saw_51 = 51 in tg_state["offsets"]
         check("poller: week-reset id adopted, polling follows new sequence",
@@ -1268,7 +1268,7 @@ def main():
         # queued update is already confirmed to Telegram (never re-served), so
         # only the durable queue file can save it. Kill -9 mid-turn, restart,
         # and require the message to be recovered and actually answered.
-        data_dir = os.path.join(home, ".local", "share", "ada")
+        data_dir = os.path.join(home, ".local", "share", "briglia")
         midturn_path = os.path.join(data_dir, "pending_midturn.json")
         with tg_lock:
             tg_state["updates"].clear()  # retire phase 1-3 ids for good
@@ -1341,20 +1341,20 @@ def main():
         import hashlib as hashlib5
         import platform as platform5
         if sys.platform == "darwin":
-            p5_platform, p5_bundle = "macos-arm64", "ada-cli_ada.bundle"
+            p5_platform, p5_bundle = "macos-arm64", "briglia-cli_briglia.bundle"
         else:
             p5_platform = ("linux-arm64" if platform5.machine() in ("arm64", "aarch64")
                            else "linux-x64")
-            p5_bundle = "ada-cli_ada.resources"
+            p5_bundle = "briglia-cli_briglia.resources"
         p5_build_dir = os.path.dirname(os.path.abspath(ADA))
         p5_install = os.path.join(home, "bin")
         os.makedirs(p5_install, exist_ok=True)
-        shutil.copy2(ADA, os.path.join(p5_install, "ada"))
+        shutil.copy2(ADA, os.path.join(p5_install, "briglia"))
         shutil.copytree(os.path.join(p5_build_dir, p5_bundle),
                         os.path.join(p5_install, p5_bundle))
         p5_tar = os.path.join(home, "p5.tar.gz")
         subprocess.run(["tar", "-czf", p5_tar, "-C", p5_build_dir,
-                        "ada", p5_bundle], check=True)
+                        "briglia", p5_bundle], check=True)
         with open(p5_tar, "rb") as f:
             p5_tar_bytes = f.read()
         p5_sha = hashlib5.sha256(p5_tar_bytes).hexdigest()
@@ -1392,7 +1392,7 @@ def main():
         import datetime as p5_dt
         p5_now = p5_dt.datetime.now(p5_dt.timezone.utc)
         p5_manifest = {
-            "schema": 1, "channel": "ada-cli", "sequence": BASE_SEQ + 1, "version": "9.9.9",
+            "schema": 1, "channel": "briglia-cli", "sequence": BASE_SEQ + 1, "version": "9.9.9",
             "published": (p5_now - p5_dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "expires": (p5_now + p5_dt.timedelta(days=180)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "platforms": {p5_platform: {
@@ -1426,7 +1426,7 @@ def main():
             # restarted process's own announcement.
             push([tg_update(500, "/upgrade"),
                   tg_update(501, "tail message survives")])
-            pwait("Update 9.9.9 installed — Ada restarted", 240)
+            pwait("Update 9.9.9 installed — Briglia restarted", 240)
             # The tail message must arrive at the RESTARTED process.
             pwait("[Telegram] tail message survives", 60)
             # ...and be confirmed by a poll at 502.
@@ -1440,14 +1440,14 @@ def main():
         tg_mark("phase5-start")
         try:
             out5, rc5 = run_poller_phase(
-                {"ADA_ENVELOPE_URL": f"http://127.0.0.1:{p5_cdn_port}/manifest.sig.json",
-                 "ADA_RELEASE_URL_PREFIX": f"http://127.0.0.1:{p5_cdn_port}/dl/v{{version}}/",
-                 "ADA_RELEASE_TEST_KEY": f"{p5_key_id}:{p5_pub_hex}"}, phase5,
-                binary=os.path.join(p5_install, "ada"))
+                {"BRIGLIA_ENVELOPE_URL": f"http://127.0.0.1:{p5_cdn_port}/manifest.sig.json",
+                 "BRIGLIA_RELEASE_URL_PREFIX": f"http://127.0.0.1:{p5_cdn_port}/dl/v{{version}}/",
+                 "BRIGLIA_RELEASE_TEST_KEY": f"{p5_key_id}:{p5_pub_hex}"}, phase5,
+                binary=os.path.join(p5_install, "briglia"))
         finally:
             p5_cdn.shutdown()
         tail_pos = out5.find("[Telegram] tail message survives")
-        restart_pos = out5.find("Update 9.9.9 installed — Ada restarted")
+        restart_pos = out5.find("Update 9.9.9 installed — Briglia restarted")
         with tg_lock:
             p5_offsets = list(tg_state["offsets"])
         check("poller: /upgrade confirms only its own update; same-batch tail survives restart",
@@ -1467,7 +1467,7 @@ def main():
         def phase5b(pwait, push, pout, proc):
             push([tg_update(550, "/restart"),
                   tg_update(551, "restart tail survives")])
-            pwait("✔ Ada restarted.", 120)
+            pwait("✔ Briglia restarted.", 120)
             pwait("[Telegram] restart tail survives", 60)
             deadline = time.time() + 15
             while time.time() < deadline:
@@ -1478,13 +1478,13 @@ def main():
 
         tg_mark("phase5b-start")
         out5b, rc5b = run_poller_phase({}, phase5b)
-        restart5b = out5b.find("✔ Ada restarted.")
+        restart5b = out5b.find("✔ Briglia restarted.")
         tail5b = out5b.find("[Telegram] restart tail survives")
         with tg_lock:
             p5b_offsets = list(tg_state["offsets"])
         check("poller: /restart re-execs in place; same-batch tail survives, no update announce",
               restart5b != -1 and tail5b > restart5b
-              and "installed — Ada restarted" not in out5b
+              and "installed — Briglia restarted" not in out5b
               and 551 in p5b_offsets and 552 in p5b_offsets and rc5b == 0,
               f"restart_pos={restart5b} tail_pos={tail5b} rc={rc5b} "
               f"offsets={p5b_offsets[-12:]}\n" + tg_timeline() + "\n" + out5b[-3000:])
@@ -1533,21 +1533,21 @@ def main():
 
         def phase6b(pwait, push, pout, proc):
             pwait("Resuming turn interrupted by shutdown", 30)
-            pwait("Ada ▸", 60)
+            pwait("Briglia ▸", 60)
 
         tg_mark("phase6b-start")
         out6b, rc6b = run_poller_phase({}, phase6b, keep_marker=True)
         resumed_reached_llm = any("resume-me-stall" in b for b in llm_bodies())
         check("poller: interrupted single-message turn auto-resumes after restart",
               "Resuming turn interrupted by shutdown" in out6b
-              and resumed_reached_llm and "Ada ▸" in out6b
+              and resumed_reached_llm and "Briglia ▸" in out6b
               and not os.path.exists(marker_path) and rc6b == 0,
               f"resumed_reached_llm={resumed_reached_llm} rc={rc6b} "
               f"marker_gone={not os.path.exists(marker_path)}\n" + out6b[-2500:])
 
         # Phase 7: durable-write failure must PAUSE polling entirely. The
         # offset of any getUpdates request is itself the acknowledgment —
-        # if Ada keeps polling at fetchedThroughId+1 while "not confirming",
+        # if Briglia keeps polling at fetchedThroughId+1 while "not confirming",
         # Telegram deletes the supposedly protected updates anyway.
         fault_flag = os.path.join(home, "durability_fault_flag")
         with open(fault_flag, "w") as f:
@@ -1586,7 +1586,7 @@ def main():
 
         tg_mark("phase7-start")
         out7, rc7 = run_poller_phase(
-            {"ADA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase7)
+            {"BRIGLIA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase7)
         with tg_lock:
             resumed_701 = 701 in tg_state["offsets"]
         persisted7 = {}
@@ -1610,7 +1610,7 @@ def main():
         # Phase 8: /upgrade behind a stalled update in the SAME batch must be
         # refused — its own confirmProcessed(higher id) would implicitly
         # confirm the stalled update, bypassing the whole stall. /status as
-        # the stall trigger keeps Ada idle so the refusal exercises the stall
+        # the stall trigger keeps Briglia idle so the refusal exercises the stall
         # guard, not the turn-running guard.
         with open(fault_flag, "w") as f:
             f.write("x")
@@ -1634,7 +1634,7 @@ def main():
 
         tg_mark("phase8-start")
         out8, rc8 = run_poller_phase(
-            {"ADA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase8)
+            {"BRIGLIA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase8)
         with tg_lock:
             sent_texts = [m.get("text", "") for m in tg_state["sent"]]
             resumed_802 = 802 in tg_state["offsets"]
@@ -1646,7 +1646,7 @@ def main():
             pass
         upgrade_refused = any("deferred until storage recovers" in t for t in sent_texts)
         check("poller: /upgrade refused during durability stall (no implicit confirm)",
-              upgrade_refused and "Ada restarted" not in out8
+              upgrade_refused and "Briglia restarted" not in out8
               and "Durable writes recovered — confirmed update 801" in out8
               and resumed_802 and persisted8.get("lastUpdateId") == 801
               and rc8 == 0,
@@ -1681,16 +1681,16 @@ def main():
                 os.path.exists(marker_path)
             with tg_lock:
                 llm_state["marker"] = "-- done stalling --"
-            pwait("Ada ▸", 60)  # turn finishes normally afterwards
+            pwait("Briglia ▸", 60)  # turn finishes normally afterwards
 
         tg_mark("phase9-start")
         out9, rc9 = run_poller_phase(
-            {"ADA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase9)
+            {"BRIGLIA_TEST_DURABILITY_FAULT_FLAG": fault_flag}, phase9)
         check("poller: stall recovery recreates the active-turn marker before confirming",
               phase9_state["marker_absent_during_stall"] is True
               and phase9_state["marker_present_after_recovery"] is True
               and "Durable writes recovered — confirmed update 900" in out9
-              and "Ada ▸" in out9 and rc9 == 0,
+              and "Briglia ▸" in out9 and rc9 == 0,
               f"{phase9_state} rc={rc9}\n" + out9[-2500:])
 
         # Phase 10: companion-app chat socket, end-to-end over the real
@@ -1703,7 +1703,7 @@ def main():
             llm_state["marker"] = "-- no stall in phase 10 --"
             llm_state["bodies"].clear()
 
-        sock_path = os.path.join(home, ".local", "share", "ada", "app-chat.sock")
+        sock_path = os.path.join(home, ".local", "share", "briglia", "app-chat.sock")
         chat_state = {}
 
         def phase10(pwait, push, pout, proc):
@@ -1847,7 +1847,7 @@ def main():
                     phase11_state["saw_request2"] = True
                     break
                 time.sleep(0.2)
-            pwait("Ada ▸", 60)  # turn completes with the mock reply
+            pwait("Briglia ▸", 60)  # turn completes with the mock reply
             phase11_state["queue_empty_at_end"] = not os.path.exists(midturn_path)
 
         tg_mark("phase11-start")

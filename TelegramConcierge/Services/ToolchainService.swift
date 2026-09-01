@@ -233,7 +233,7 @@ enum ToolchainService {
     ///
     /// `pipBreakSystemPackages`: on PEP 668 machines the only way to make the
     /// agent's `python3 -m pip install …` line work unattended is to relax the
-    /// externally-managed guard. Ada's onboarding already recommends a
+    /// externally-managed guard. Briglia's onboarding already recommends a
     /// dedicated Mac, where that trade-off is acceptable and explicit.
     static func install(
         _ entry: DoctorEntry,

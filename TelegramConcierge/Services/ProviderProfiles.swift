@@ -251,7 +251,7 @@ enum ProviderProfiles {
         var message: String {
             switch self {
             case .notConfigured(let profile):
-                return "\(profile.displayName) is not configured yet — run `ada setup` (step 1) to add it."
+                return "\(profile.displayName) is not configured yet — run `briglia setup` (step 1) to add it."
             }
         }
         var errorDescription: String? { message }

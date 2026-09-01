@@ -1,17 +1,17 @@
 import Foundation
 
 /// Default destinations for files the agent receives or generates.
-/// Created on first launch under `~/Documents/AdaCLI/`.
+/// Created on first launch under `~/Documents/Briglia/`.
 /// The agent can move files elsewhere via bash or write_file; this is just the default drop.
 ///
-/// NOT `~/Documents/Ada` — that is Ada.app's landing zone, and the CLI's
+/// NOT Ada.app's own landing zone (`~/Ada`), and the CLI's
 /// coexistence contract says the two products never share storage. (Kept
 /// under ~/Documents rather than the XDG data root because these are files
 /// the USER browses, not internal state.)
 enum LandingZone {
     static let root: URL = {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent("Documents/AdaCLI", isDirectory: true)
+        return home.appendingPathComponent("Documents/Briglia", isDirectory: true)
     }()
 
     enum Kind: String, CaseIterable {

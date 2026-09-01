@@ -123,7 +123,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
         }
 
         do {
-            let empty = ReleasePolicy(keys: [], channel: "ada-cli",
+            let empty = ReleasePolicy(keys: [], channel: "briglia-cli",
                                       artifactURLPrefix: policy.artifactURLPrefix)
             _ = try ReleaseSigning.verifyEnvelope(goodEnvelope, policy: empty)
             check("empty pinned key set fails closed", false, "unexpectedly succeeded")
@@ -141,7 +141,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
             if case .badSignature = $0 { return true }; return false
         }
         expectError("unknown keyId rejected",
-                    signer.envelope(manifest: goodManifest, keyIdOverride: "ada-cli-release-v1-ffffffffffffffff")) {
+                    signer.envelope(manifest: goodManifest, keyIdOverride: "briglia-cli-release-v1-ffffffffffffffff")) {
             if case .unknownKey = $0 { return true }; return false
         }
         expectError("known keyId with mismatched domain rejected",
@@ -153,12 +153,24 @@ struct ReleaseSigningSelftest: ParsableCommand {
             if case .unsupportedFormat = $0 { return true }; return false
         }
         expectError("cross-channel envelope rejected",
-                    signer.envelope(manifest: goodManifest, channelOverride: "ada-ut")) {
+                    signer.envelope(manifest: goodManifest, channelOverride: "briglia-ut")) {
             if case .wrongChannel = $0 { return true }; return false
         }
-        expectError("ada-cli envelope signed under ada-ut domain rejected",
-                    signer.envelope(manifest: goodManifest, signDomainChannel: "ada-ut")) {
+        expectError("briglia-cli envelope signed under briglia-ut domain rejected",
+                    signer.envelope(manifest: goodManifest, signDomainChannel: "briglia-ut")) {
             if case .badSignature = $0 { return true }; return false
+        }
+        // Rename plan §3.1: a genuine PRE-RENAME envelope (retired channel
+        // `ada-cli`, same key material, matching keyId shape) is structurally
+        // a foreign domain — an installed Briglia never accepts it, whatever
+        // the channel serves during the transition window.
+        expectError("legacy ada-cli envelope (same key, legacy channel + keyId) rejected",
+                    signer.envelope(manifest: goodManifest,
+                                    keyIdOverride: "ada-cli-release-v1-" + String(signer.keyId.suffix(16)),
+                                    channelOverride: "ada-cli",
+                                    signDomainChannel: "ada-cli",
+                                    signDomainKeyId: "ada-cli-release-v1-" + String(signer.keyId.suffix(16)))) {
+            if case .wrongChannel = $0 { return true }; return false
         }
         expectError("noncanonical base64 payload rejected",
                     signer.envelope(manifest: goodManifest, noncanonicalPayload: true)) {
@@ -202,7 +214,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
         expectManifestError("schema 2 rejected", Self.manifestJSON(schema: 2)) {
             if case .malformedManifest = $0 { return true }; return false
         }
-        expectManifestError("wrong manifest channel rejected", Self.manifestJSON(channel: "ada-ut")) {
+        expectManifestError("wrong manifest channel rejected", Self.manifestJSON(channel: "briglia-ut")) {
             if case .wrongChannel = $0 { return true }; return false
         }
         expectManifestError("non-positive sequence rejected", Self.manifestJSON(sequence: 0)) {
@@ -236,23 +248,23 @@ struct ReleaseSigningSelftest: ParsableCommand {
             if case .malformedManifest = $0 { return true }; return false
         }
         expectManifestError("http URL rejected", Self.manifestJSON(
-            platformsJSON: Self.platformJSON(url: "http://github.com/permaevidence/ada-cli/releases/download/v0.1.59/a.tar.gz"))) {
+            platformsJSON: Self.platformJSON(url: "http://github.com/permaevidence/briglia-cli/releases/download/v0.1.59/a.tar.gz"))) {
             if case .badPlatformEntry = $0 { return true }; return false
         }
         expectManifestError("wrong host rejected", Self.manifestJSON(
-            platformsJSON: Self.platformJSON(url: "https://evil.example.com/permaevidence/ada-cli/releases/download/v0.1.59/a.tar.gz"))) {
+            platformsJSON: Self.platformJSON(url: "https://evil.example.com/permaevidence/briglia-cli/releases/download/v0.1.59/a.tar.gz"))) {
             if case .badPlatformEntry = $0 { return true }; return false
         }
         expectManifestError("wrong repo path rejected", Self.manifestJSON(
-            platformsJSON: Self.platformJSON(url: "https://github.com/evil/ada-cli/releases/download/v0.1.59/a.tar.gz"))) {
+            platformsJSON: Self.platformJSON(url: "https://github.com/evil/briglia-cli/releases/download/v0.1.59/a.tar.gz"))) {
             if case .badPlatformEntry = $0 { return true }; return false
         }
         expectManifestError("version-mismatched asset path rejected", Self.manifestJSON(
-            platformsJSON: Self.platformJSON(url: "https://github.com/permaevidence/ada-cli/releases/download/v0.0.1/a.tar.gz"))) {
+            platformsJSON: Self.platformJSON(url: "https://github.com/permaevidence/briglia-cli/releases/download/v0.0.1/a.tar.gz"))) {
             if case .badPlatformEntry = $0 { return true }; return false
         }
         expectManifestError("path traversal in asset name rejected", Self.manifestJSON(
-            platformsJSON: Self.platformJSON(url: "https://github.com/permaevidence/ada-cli/releases/download/v0.1.59/../evil.tar.gz"))) {
+            platformsJSON: Self.platformJSON(url: "https://github.com/permaevidence/briglia-cli/releases/download/v0.1.59/../evil.tar.gz"))) {
             if case .badPlatformEntry = $0 { return true }; return false
         }
         expectManifestError("uppercase sha256 rejected", Self.manifestJSON(
@@ -315,17 +327,17 @@ struct ReleaseSigningSelftest: ParsableCommand {
         // ------------------------------------------------------------------
         print("— trust store —")
         let trustFile = work.appendingPathComponent("release_trust.json")
-        setenv("ADA_RELEASE_TRUST_FILE", trustFile.path, 1)
-        defer { unsetenv("ADA_RELEASE_TRUST_FILE") }
+        setenv("BRIGLIA_RELEASE_TRUST_FILE", trustFile.path, 1)
+        defer { unsetenv("BRIGLIA_RELEASE_TRUST_FILE") }
         // "prod" = whatever repository THIS build is stamped for (the staging
         // pipeline stamps its own), "staging" = any other pinned location.
         let prod = ReleasePolicy.production.trustDomain
         let staging = ReleasePolicy(
-            keys: ReleaseKeys.active, channel: "ada-cli",
-            artifactURLPrefix: "https://github.com/permaevidence/ada-cli-other-channel/releases/download/v{version}/"
+            keys: ReleaseKeys.active, channel: "briglia-cli",
+            artifactURLPrefix: "https://github.com/permaevidence/briglia-cli-other-channel/releases/download/v{version}/"
         ).trustDomain
         check("trust domain = channel + pinned artifact location",
-              prod == "ada-cli|https://github.com/\(adaCLIReleaseRepository)/releases/download/v{version}/"
+              prod == "briglia-cli|https://github.com/\(adaCLIReleaseRepository)/releases/download/v{version}/"
               && prod != staging, prod)
         check("absent file loads as absent, not corrupt",
               ReleaseTrustStore.load(domain: prod).sequence == nil
@@ -469,14 +481,14 @@ struct ReleaseSigningSelftest: ParsableCommand {
         var publicKey: Data { privateKey.publicKey.rawRepresentation }
         var keyId: String {
             let fp = SHA256.hash(data: publicKey).map { String(format: "%02x", $0) }.joined()
-            return "ada-cli-release-v1-\(fp.prefix(16))"
+            return "briglia-cli-release-v1-\(fp.prefix(16))"
         }
         var policy: ReleasePolicy {
             ReleasePolicy(
                 keys: [ReleaseKey(keyId: keyId,
                                   publicKeyHex: publicKey.map { String(format: "%02x", $0) }.joined())!],
-                channel: "ada-cli",
-                artifactURLPrefix: "https://github.com/permaevidence/ada-cli/releases/download/v{version}/")
+                channel: "briglia-cli",
+                artifactURLPrefix: "https://github.com/permaevidence/briglia-cli/releases/download/v{version}/")
         }
 
         func envelope(
@@ -488,7 +500,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
             noncanonicalPayload: Bool = false, whitespacePayload: Bool = false,
             truncateSignature: Bool = false
         ) -> Data {
-            let channel = channelOverride ?? "ada-cli"
+            let channel = channelOverride ?? "briglia-cli"
             let usedKeyId = keyIdOverride ?? keyId
             let message = ReleaseSigning.domainInput(
                 channel: signDomainChannel ?? channel,
@@ -523,7 +535,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
     }
 
     static func platformJSON(
-        url: String = "https://github.com/permaevidence/ada-cli/releases/download/v{version}/ada-macos-arm64.tar.gz",
+        url: String = "https://github.com/permaevidence/briglia-cli/releases/download/v{version}/briglia-macos-arm64.tar.gz",
         sha256: String = String(repeating: "ab", count: 32),
         size: Int64 = 1000
     ) -> String {
@@ -531,7 +543,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
     }
 
     static func manifestJSON(
-        schema: Int = 1, channel: String = "ada-cli", sequence: Int = 59,
+        schema: Int = 1, channel: String = "briglia-cli", sequence: Int = 59,
         version: String = "0.1.59",
         published: String = "2026-08-01T00:00:00Z",
         expires: String = "2199-01-01T00:00:00Z",
@@ -719,7 +731,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
         }
 
         let keyDir = work.appendingPathComponent("keys")
-        let (keygenStatus, keygenOut) = try run(keygen.path, ["ada-cli", keyDir.path])
+        let (keygenStatus, keygenOut) = try run(keygen.path, ["briglia-cli", keyDir.path])
         if keygenStatus != 0 {
             #if os(Linux)
             check("release-keygen.sh generates a key", false, keygenOut)
@@ -747,7 +759,7 @@ struct ReleaseSigningSelftest: ParsableCommand {
         }
         check("key record parses and pins", true, "")
         check("keyId embeds the fingerprint prefix",
-              keyId.hasPrefix("ada-cli-release-v1-") && keyId.count == "ada-cli-release-v1-".count + 16, keyId)
+              keyId.hasPrefix("briglia-cli-release-v1-") && keyId.count == "briglia-cli-release-v1-".count + 16, keyId)
         let fingerprint = SHA256.hash(data: pinned.publicKey).map { String(format: "%02x", $0) }.joined()
         check("fingerprint matches raw public key", keyId.hasSuffix(String(fingerprint.prefix(16))), "")
 
@@ -757,15 +769,15 @@ struct ReleaseSigningSelftest: ParsableCommand {
         let privPEM = keyDir.appendingPathComponent("\(keyId).priv.pem")
         let pubPEM = keyDir.appendingPathComponent("\(keyId).pub.pem")
         let (signStatus, signOut) = try run(
-            signer.path, [privPEM.path, "ada-cli", manifestFile.path, envelopeFile.path],
+            signer.path, [privPEM.path, "briglia-cli", manifestFile.path, envelopeFile.path],
             env: ["EXPECTED_PUBKEY_PEM": pubPEM.path])
         check("sign-envelope.sh signs (known-vector + wrong-key guards pass)",
               signStatus == 0 && signOut.contains("known-vector check passed"), signOut)
         guard signStatus == 0 else { return }
 
         let interopPolicy = ReleasePolicy(
-            keys: [pinned], channel: "ada-cli",
-            artifactURLPrefix: "https://github.com/permaevidence/ada-cli/releases/download/v{version}/")
+            keys: [pinned], channel: "briglia-cli",
+            artifactURLPrefix: "https://github.com/permaevidence/briglia-cli/releases/download/v{version}/")
         do {
             let envelopeData = try Data(contentsOf: envelopeFile)
             let manifest = try ReleaseSigning.verifyEnvelope(envelopeData, policy: interopPolicy)
@@ -778,11 +790,11 @@ struct ReleaseSigningSelftest: ParsableCommand {
         // wrong-key guard: signing with a key that doesn't match the expected
         // public key must refuse.
         let otherDir = work.appendingPathComponent("keys2")
-        _ = try run(keygen.path, ["ada-cli", otherDir.path])
+        _ = try run(keygen.path, ["briglia-cli", otherDir.path])
         if let otherPriv = try fm.contentsOfDirectory(at: otherDir, includingPropertiesForKeys: nil)
             .first(where: { $0.lastPathComponent.hasSuffix(".priv.pem") }) {
             let (mismatchStatus, mismatchOut) = try run(
-                signer.path, [otherPriv.path, "ada-cli", manifestFile.path,
+                signer.path, [otherPriv.path, "briglia-cli", manifestFile.path,
                               work.appendingPathComponent("bad.sig.json").path],
                 env: ["EXPECTED_PUBKEY_PEM": pubPEM.path])
             check("sign-envelope.sh refuses a mismatched private key",

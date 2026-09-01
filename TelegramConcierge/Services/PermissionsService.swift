@@ -7,7 +7,7 @@ import Network
 import Security
 #endif
 
-/// Checks and requests the operating-system permissions Ada needs to operate
+/// Checks and requests the operating-system permissions Briglia needs to operate
 /// unattended.
 ///
 /// macOS: TCC permissions (Full Disk Access, Accessibility, Screen Recording,
@@ -290,7 +290,7 @@ enum PermissionsService {
 
     // MARK: - Linux
 
-    /// No TCC on Linux: whatever the invoking user can read, Ada can read.
+    /// No TCC on Linux: whatever the invoking user can read, Briglia can read.
     static func fullDiskAccessGranted() -> Bool { true }
 
     /// Everything the wizard and doctor need to reason about automatic

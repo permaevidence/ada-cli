@@ -677,7 +677,7 @@ enum AvailableTools {
         return ToolDefinition(
         function: FunctionDefinition(
             name: "manage_reminders",
-            description: "Single reminder tool. Use action='set' to schedule, action='list' to view pending reminders, and action='delete' to cancel one or many reminders. Three modes: plain time reminders (\"remind me AT\"), condition-watching reminders (\"tell me WHEN\") — attach a check `script` and a recurrence; the schedule becomes a polling clock and the reminder only fires when the script prints output — and external-trigger watchers (`external_trigger`=true): no schedule, no script; the watcher fires when any local process posts an event with `ada trigger <watcher_id> [payload]`. Use scripted mode when YOU can poll for the condition (\"tell me when a new PR arrives\"); use external mode when an outside system detects events and should push them (a camera motion hook, a webhook receiver, a cron job on another schedule, any script you wire up).",
+            description: "Single reminder tool. Use action='set' to schedule, action='list' to view pending reminders, and action='delete' to cancel one or many reminders. Three modes: plain time reminders (\"remind me AT\"), condition-watching reminders (\"tell me WHEN\") — attach a check `script` and a recurrence; the schedule becomes a polling clock and the reminder only fires when the script prints output — and external-trigger watchers (`external_trigger`=true): no schedule, no script; the watcher fires when any local process posts an event with `briglia trigger <watcher_id> [payload]`. Use scripted mode when YOU can poll for the condition (\"tell me when a new PR arrives\"); use external mode when an outside system detects events and should push them (a camera motion hook, a webhook receiver, a cron job on another schedule, any script you wire up).",
             parameters: FunctionParameters(
                 properties: [
                     "action": ParameterProperty(
@@ -703,7 +703,7 @@ enum AvailableTools {
                     ),
                     "external_trigger": ParameterProperty(
                         type: "boolean",
-                        description: "Optional for action='set': true creates an EXTERNAL-TRIGGER watcher — no schedule, no script. It fires when any local process runs `ada trigger <watcher_id> [payload]` (the exact command is returned on creation; wire it into the external system yourself: a camera's motion hook, a git post-receive hook, a cron job, a webhook-receiver script). Requires `prompt` (the mission for your future self); trigger_datetime, recurrence and script must NOT be set. DELIVERY CONTRACT: an event arriving after 5+ quiet minutes fires immediately; events arriving within 5 minutes of the previous fire are queued and delivered together as ONE batched fire when the window closes — so bursts (continuous motion, event storms) cost one turn per 5 minutes, and the batch lists events with timestamps (up to 30 shown — larger batches show head and tail with an omission count). Payloads are capped at 2000 chars, are treated as untrusted external DATA, and survive daemon restarts until delivered; at most 500 events queue per watcher (beyond that only a count is kept). Only allowed in turns the user started by typing (not ambient turns or subagents); creation is announced to the user automatically."
+                        description: "Optional for action='set': true creates an EXTERNAL-TRIGGER watcher — no schedule, no script. It fires when any local process runs `briglia trigger <watcher_id> [payload]` (the exact command is returned on creation; wire it into the external system yourself: a camera's motion hook, a git post-receive hook, a cron job, a webhook-receiver script). Requires `prompt` (the mission for your future self); trigger_datetime, recurrence and script must NOT be set. DELIVERY CONTRACT: an event arriving after 5+ quiet minutes fires immediately; events arriving within 5 minutes of the previous fire are queued and delivered together as ONE batched fire when the window closes — so bursts (continuous motion, event storms) cost one turn per 5 minutes, and the batch lists events with timestamps (up to 30 shown — larger batches show head and tail with an omission count). Payloads are capped at 2000 chars, are treated as untrusted external DATA, and survive daemon restarts until delivered; at most 500 events queue per watcher (beyond that only a count is kept). Only allowed in turns the user started by typing (not ambient turns or subagents); creation is announced to the user automatically."
                     ),
                     "notify": ParameterProperty(
                         type: "string",
@@ -755,7 +755,7 @@ enum AvailableTools {
     static let readChunkSummaries = ToolDefinition(
         function: FunctionDefinition(
             name: "read_chunk_summaries",
-            description: "Retrieve the full summaries of archived conversation chunks selected by chunk id and/or date range. Use it to expand a compressed 'Rolling history summary' / 'Historical meta-summary' row of your ARCHIVED CONVERSATION HISTORY table into per-chunk summaries (pass the ids from its [Chunks: …] list), or to reach chunks older than the table (pass a date range; from/to may each be omitted for open-ended). Chunks whose summaries already appear as individual rows in the table are never returned — read them in context and go straight to their transcript file. Results are newest first, max 15 per call; summaries are large, so request only what you need. If a range matches more than 15, the response gives a 'before' cursor to continue. Each result includes the exact path of the plaintext transcript file containing the chunk's original User/Assistant messages. To search what was actually said, use the grep TOOL (not Bash) on '~/.local/share/ada/archive/' with include = \"*.txt\", case_insensitive = true, context = 5, regex alternation for multiple terms, or output_mode = \"files_with_matches\" for a cheap cross-chunk sweep — a grep sweep is usually cheaper than fetching many summaries. Use an individual result's exact Transcript path with read_file and offset/limit to inspect a region.",
+            description: "Retrieve the full summaries of archived conversation chunks selected by chunk id and/or date range. Use it to expand a compressed 'Rolling history summary' / 'Historical meta-summary' row of your ARCHIVED CONVERSATION HISTORY table into per-chunk summaries (pass the ids from its [Chunks: …] list), or to reach chunks older than the table (pass a date range; from/to may each be omitted for open-ended). Chunks whose summaries already appear as individual rows in the table are never returned — read them in context and go straight to their transcript file. Results are newest first, max 15 per call; summaries are large, so request only what you need. If a range matches more than 15, the response gives a 'before' cursor to continue. Each result includes the exact path of the plaintext transcript file containing the chunk's original User/Assistant messages. To search what was actually said, use the grep TOOL (not Bash) on '~/.local/share/briglia/archive/' with include = \"*.txt\", case_insensitive = true, context = 5, regex alternation for multiple terms, or output_mode = \"files_with_matches\" for a cheap cross-chunk sweep — a grep sweep is usually cheaper than fetching many summaries. Use an individual result's exact Transcript path with read_file and offset/limit to inspect a region.",
             parameters: FunctionParameters(
                 properties: [
                     "chunk_ids": ParameterProperty(
@@ -803,7 +803,7 @@ enum AvailableTools {
                     ),
                     "source_image": ParameterProperty(
                         type: "string",
-                        description: "Optional. Stored image filename in the Ada images store, e.g. 'abc123.jpg'. Use the exact basename from recent image/file metadata; do not pass an absolute path. Leave empty to generate a new image from scratch."
+                        description: "Optional. Stored image filename in the Briglia images store, e.g. 'abc123.jpg'. Use the exact basename from recent image/file metadata; do not pass an absolute path. Leave empty to generate a new image from scratch."
                     ),
                     "size": ParameterProperty(
                         type: "string",
@@ -828,7 +828,7 @@ enum AvailableTools {
                     ),
                     "source_image": ParameterProperty(
                         type: "string",
-                        description: "Optional. Stored image filename in the Ada images store, e.g. 'abc123.jpg'. Use the exact basename from recent image/file metadata; do not pass an absolute path. Leave empty to generate a new image from scratch."
+                        description: "Optional. Stored image filename in the Briglia images store, e.g. 'abc123.jpg'. Use the exact basename from recent image/file metadata; do not pass an absolute path. Leave empty to generate a new image from scratch."
                     ),
                     "source_image_role": ParameterProperty(
                         type: "string",
@@ -983,7 +983,7 @@ enum AvailableTools {
     )
 
     /// The bulk-OCR surface (`save_to`, uncapped `pages`) is always available
-    /// in Ada CLI (see bulkOCRSaveToEnabled).
+    /// in Briglia CLI (see bulkOCRSaveToEnabled).
     static var inspectMedia: ToolDefinition {
         var description = "Text-only mode helper. Ask the configured vision preprocessor model a focused question about a specific image or PDF that appeared in the conversation or exists on disk. Use when the existing vision/OCR proxy is too broad, omits a detail, or you need to zoom into a region, chart, table, UI element, handwriting, diagram, or exact visible text. This tool is only available when the Text-only model setting is enabled."
         var pagesDescription = "Optional for PDFs. Page or range like '2' or '4-6'. Required when the PDF has more than 20 pages. Max 20 pages per call. Ignored for images."
@@ -1203,7 +1203,7 @@ enum AvailableTools {
     private enum BashDesc {
         static let command = "Shell command to run."
         static let workdir = "Optional working directory; must exist. Supports ~ expansion (not $VAR)."
-        static let serviceKeyEnv = "Optional map of command environment-variable names to configured service-key labels, e.g. {\"VERCEL_TOKEN\":\"Vercel Token\"}. Ada resolves and injects the secret without exposing it to the model."
+        static let serviceKeyEnv = "Optional map of command environment-variable names to configured service-key labels, e.g. {\"VERCEL_TOKEN\":\"Vercel Token\"}. Briglia resolves and injects the secret without exposing it to the model."
         static let killAfterManaged = "Optional independent execution deadline in seconds (1-604800). Kills the complete process tree at total runtime; omit for no deadline when wait_seconds is set."
         static let handle = "Bash job handle. Required except for list."
         static let waitManage = "For wait: seconds to wait for settlement (1-120)."
@@ -1217,11 +1217,11 @@ enum AvailableTools {
     static let bash = ToolDefinition(
         function: FunctionDefinition(
             name: "bash",
-            description: "Run a shell command through a login shell (\(PlatformShell.displayName)) — normal shell expansion applies. The working directory does not persist between calls; pass workdir when needed.\n\nPrefer glob, grep, read_file, edit_file, and write_file for file operations, and reply directly instead of using echo/printf for communication.\n\nLifecycle:\n- Quick command: omit both lifecycle fields. Ada waits up to 120 seconds and kills the process tree if it is still running.\n- Managed command: set wait_seconds 1-120. If the wait expires, the command continues and the result includes a handle. Waiting never kills the command. For builds/tests/installs: {\"command\":\"swift build\",\"wait_seconds\":60,\"kill_after_seconds\":600}.\n- Detached command/server: set wait_seconds=0 to return a handle immediately. Do not use a plain `cmd &` — the orphan dies on SIGPIPE; use managed detachment. For a process that must outlive Ada, use nohup with redirected output — it gets no Ada handle, deadline, or cleanup.\n- Optional deadline: kill_after_seconds independently kills the process tree when total runtime reaches that value.\n\nAny managed job that outlives your wait notifies you automatically when it exits. Use the initial wait_seconds instead of immediately calling bash_manage(wait). Manage returned handles with bash_manage. Output beyond the inline limit is saved to the returned full-output path.",
+            description: "Run a shell command through a login shell (\(PlatformShell.displayName)) — normal shell expansion applies. The working directory does not persist between calls; pass workdir when needed.\n\nPrefer glob, grep, read_file, edit_file, and write_file for file operations, and reply directly instead of using echo/printf for communication.\n\nLifecycle:\n- Quick command: omit both lifecycle fields. Briglia waits up to 120 seconds and kills the process tree if it is still running.\n- Managed command: set wait_seconds 1-120. If the wait expires, the command continues and the result includes a handle. Waiting never kills the command. For builds/tests/installs: {\"command\":\"swift build\",\"wait_seconds\":60,\"kill_after_seconds\":600}.\n- Detached command/server: set wait_seconds=0 to return a handle immediately. Do not use a plain `cmd &` — the orphan dies on SIGPIPE; use managed detachment. For a process that must outlive Briglia, use nohup with redirected output — it gets no Briglia handle, deadline, or cleanup.\n- Optional deadline: kill_after_seconds independently kills the process tree when total runtime reaches that value.\n\nAny managed job that outlives your wait notifies you automatically when it exits. Use the initial wait_seconds instead of immediately calling bash_manage(wait). Manage returned handles with bash_manage. Output beyond the inline limit is saved to the returned full-output path.",
             parameters: FunctionParameters(
                 properties: [
                     "command": ParameterProperty(type: "string", description: BashDesc.command),
-                    "wait_seconds": ParameterProperty(type: "integer", description: "Seconds to wait for completion (0-120; values above 120 clamp to 120). If the job is still running when the wait ends, you get a handle and it continues. 0 returns immediately. If both lifecycle fields are omitted, Ada uses the 120-second quick-command default."),
+                    "wait_seconds": ParameterProperty(type: "integer", description: "Seconds to wait for completion (0-120; values above 120 clamp to 120). If the job is still running when the wait ends, you get a handle and it continues. 0 returns immediately. If both lifecycle fields are omitted, Briglia uses the 120-second quick-command default."),
                     "kill_after_seconds": ParameterProperty(type: "integer", description: BashDesc.killAfterManaged),
                     "workdir": ParameterProperty(type: "string", description: BashDesc.workdir),
                     "description": ParameterProperty(type: "string", description: "Optional short job label for listings and completion notices."),
@@ -1266,7 +1266,7 @@ enum AvailableTools {
             parameters: FunctionParameters(
                 properties: [
                     "command": ParameterProperty(type: "string", description: BashDesc.command),
-                    "wait_seconds": ParameterProperty(type: "integer", description: "Seconds to wait for completion (0-120; values above 120 clamp to 120). If the job is still running when the wait ends, you get a private handle and it continues. 0 returns immediately. If both lifecycle fields are omitted, Ada uses the 120-second quick-command default."),
+                    "wait_seconds": ParameterProperty(type: "integer", description: "Seconds to wait for completion (0-120; values above 120 clamp to 120). If the job is still running when the wait ends, you get a private handle and it continues. 0 returns immediately. If both lifecycle fields are omitted, Briglia uses the 120-second quick-command default."),
                     "kill_after_seconds": ParameterProperty(type: "integer", description: BashDesc.killAfterManaged),
                     "workdir": ParameterProperty(type: "string", description: BashDesc.workdir),
                     "description": ParameterProperty(type: "string", description: "Optional short job label for this run's listings."),
@@ -1590,7 +1590,7 @@ enum AvailableTools {
     static let skill = ToolDefinition(
         function: FunctionDefinition(
             name: "skill",
-            description: "Load a curated procedural skill from ~/.config/ada/skills/ into your context. Skills are hand-authored guides for specialized tasks (e.g., generating a polished PDF). The compact skill index at the top of the system prompt lists every installed skill and its trigger description — when a user's request matches one, call this tool with the skill's name BEFORE starting the task, then follow the procedure the skill returns.",
+            description: "Load a curated procedural skill from ~/.config/briglia/skills/ into your context. Skills are hand-authored guides for specialized tasks (e.g., generating a polished PDF). The compact skill index at the top of the system prompt lists every installed skill and its trigger description — when a user's request matches one, call this tool with the skill's name BEFORE starting the task, then follow the procedure the skill returns.",
             parameters: FunctionParameters(
                 properties: [
                     "skill_name": ParameterProperty(type: "string", description: "The canonical short name of the skill, matching its entry in the skills index (e.g., 'pdf'). Case-insensitive.")
@@ -1632,7 +1632,7 @@ enum AvailableTools {
 
     // MARK: - Calendar Tool (agentmail provider only)
 
-    /// Ada's local calendar (calendar.json via CalendarService). Exposed only
+    /// Briglia's local calendar (calendar.json via CalendarService). Exposed only
     /// when the email/calendar provider is `agentmail` — the gws provider
     /// reaches Google Calendar through bash, and provider `none` has no
     /// calendar at all.
@@ -1695,7 +1695,7 @@ enum AvailableTools {
         #endif
     }
 
-    /// Bulk OCR-to-file (inspect_media save_to) — always available in Ada CLI.
+    /// Bulk OCR-to-file (inspect_media save_to) — always available in Briglia CLI.
     /// In Ada.app this was gated behind the Legal Work toggle; the capability
     /// itself (writing long OCR output to disk instead of context) is general.
     static var bulkOCRSaveToEnabled: Bool { true }
@@ -1712,7 +1712,7 @@ enum AvailableTools {
     /// CLI via bash (`gws …` or `agentmail …`). Ambient inbox snapshot +
     /// calendar context are injected into the system prompt by the provider's
     /// service. The one calendar exception: the `agentmail` provider exposes
-    /// `manage_calendar` for Ada's local calendar store (gws reaches Google
+    /// `manage_calendar` for Briglia's local calendar store (gws reaches Google
     /// Calendar via bash instead; provider `none` has neither).
     ///
     /// Test seam for the subagents flag: when set, `subagentsEnabled` uses the

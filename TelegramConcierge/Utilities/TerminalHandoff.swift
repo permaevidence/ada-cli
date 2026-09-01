@@ -19,9 +19,9 @@ import Glibc
 /// foreground job.
 ///
 /// Only call it where no other thread of this process is reading stdin:
-/// while the child holds the foreground, Ada itself is background, and a
+/// while the child holds the foreground, Briglia itself is background, and a
 /// concurrent REPL read would SIGTTIN-stop the whole process. The setup
-/// wizard and the standalone `ada upgrade` command qualify; the in-chat
+/// wizard and the standalone `briglia upgrade` command qualify; the in-chat
 /// upgrade path (REPL/Telegram) must not use it — it never runs sudo.
 enum TerminalHandoff {
     /// Launches the process and waits for it, giving it the terminal's

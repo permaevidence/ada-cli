@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "ada-cli",
+    name: "briglia-cli",
     platforms: [.macOS(.v14)],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
@@ -14,7 +14,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "ada",
+            name: "briglia",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Crypto", package: "swift-crypto", condition: .when(platforms: [.linux])),

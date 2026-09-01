@@ -107,14 +107,14 @@ struct EmailCalendarSelftest: AsyncParsableCommand {
 
         // 4b. Credential broker: the key never rides in bash environments at
         // all — the installed `agentmail` command is a wrapper that fetches
-        // the key itself (via `ada __agentmail-key`) and execs the real
+        // the key itself (via `briglia __agentmail-key`) and execs the real
         // binary, so only the actual AgentMail process sees it (Codex,
         // 2026-08-22: substring matching is not a credential boundary).
         let wrapper = AgentMailService.wrapperScript(
             adaPath: "/home/u/.local/bin/ada",
             realBinaryPath: "/home/u/.local/bin/agentmail-bin")
         check("wrapper is a plain sh script", wrapper.hasPrefix("#!/bin/sh"))
-        check("wrapper brokers the key through ada __agentmail-key",
+        check("wrapper brokers the key through briglia __agentmail-key",
               wrapper.contains("'/home/u/.local/bin/ada' __agentmail-key"))
         check("wrapper execs the real binary with all arguments",
               wrapper.contains("exec '/home/u/.local/bin/agentmail-bin' \"$@\""))
@@ -206,7 +206,7 @@ struct EmailCalendarSelftest: AsyncParsableCommand {
 
         // 4h. ~/.local/bin leads the agent-shell PATH even when the
         // inherited PATH already lists it after Homebrew — otherwise a
-        // foreign agentmail shadows Ada's key-broker wrapper.
+        // foreign agentmail shadows Briglia's key-broker wrapper.
         let home = NSHomeDirectory()
         check("~/.local/bin moved to the front of an inherited PATH (rest preserved)",
               BashTools.augmentedPath("/opt/homebrew/bin:\(home)/.local/bin:/usr/bin")
@@ -216,7 +216,7 @@ struct EmailCalendarSelftest: AsyncParsableCommand {
               == "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
 
         // 4f. Broker detection is content-based: a bare binary named
-        // `agentmail` (pre-broker Ada, npm, brew) must NOT count as
+        // `agentmail` (pre-broker Briglia, npm, brew) must NOT count as
         // installed — it cannot authenticate.
         let binDir = tempRoot.appendingPathComponent("bin")
         try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)

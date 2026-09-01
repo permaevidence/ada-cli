@@ -18,7 +18,7 @@ CHANNEL="${2:?missing channel}"
 MANIFEST="${3:?missing manifest.json}"
 OUT="${4:?missing output path}"
 : "${EXPECTED_PUBKEY_PEM:?EXPECTED_PUBKEY_PEM is required (committed expected public key)}"
-case "$CHANNEL" in ada-cli|ada-ut) ;; *) echo "✖ channel must be ada-cli or ada-ut"; exit 1;; esac
+case "$CHANNEL" in briglia-cli|briglia-ut) ;; *) echo "✖ channel must be briglia-cli or briglia-ut"; exit 1;; esac
 [ -f "$MANIFEST" ] || { echo "✖ manifest not found: $MANIFEST"; exit 1; }
 
 # Resolve an openssl PROVEN against the RFC 8032 TEST 2 vector (sign +

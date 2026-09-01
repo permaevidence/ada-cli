@@ -1,8 +1,8 @@
 #!/bin/bash
-# Build Ada CLI in release mode and install the `ada` command.
+# Build Briglia CLI in release mode and install the `briglia` command.
 # Usage: ./scripts/install.sh            → installs to ~/.local/bin (no sudo;
 #                                          /usr/local/bin when run as root)
-#        ADA_INSTALL_DIR=/some/bin ./scripts/install.sh
+#        BRIGLIA_INSTALL_DIR=/some/bin ./scripts/install.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,27 +16,27 @@ if ! command -v swift >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "Building Ada CLI (release)…"
+echo "Building Briglia CLI (release)…"
 swift build -c release
 
-BIN=".build/release/ada"
+BIN=".build/release/briglia"
 # SwiftPM puts bundled resources (skills, WhatsApp bridge, toolchain scripts)
 # in a separate artifact that MUST travel with the binary — without it the
 # installed executable traps (exit 133) on first resource access. The
 # artifact name is platform-specific: .bundle on macOS, .resources on Linux.
 case "$(uname -s)" in
-    Darwin) BUNDLE_NAME="ada-cli_ada.bundle" ;;
-    *)      BUNDLE_NAME="ada-cli_ada.resources" ;;
+    Darwin) BUNDLE_NAME="briglia-cli_briglia.bundle" ;;
+    *)      BUNDLE_NAME="briglia-cli_briglia.resources" ;;
 esac
 BUNDLE=".build/release/$BUNDLE_NAME"
 if [ ! -d "$BUNDLE" ]; then
     echo "✖ build output missing $BUNDLE — SwiftPM layout changed?"
     exit 1
 fi
-# User-writable default: Ada self-updates (remote /upgrade from Telegram),
+# User-writable default: Briglia self-updates (remote /upgrade from Telegram),
 # and a root-owned install would make every upgrade need a sudo password.
-if [ -n "${ADA_INSTALL_DIR:-}" ]; then
-    DEST_DIR="$ADA_INSTALL_DIR"
+if [ -n "${BRIGLIA_INSTALL_DIR:-}" ]; then
+    DEST_DIR="$BRIGLIA_INSTALL_DIR"
 elif [ "$(id -u)" = "0" ]; then
     DEST_DIR="/usr/local/bin"
 else
@@ -45,21 +45,43 @@ fi
 mkdir -p "$DEST_DIR" 2>/dev/null || true
 
 if [ -w "$DEST_DIR" ]; then
-    cp "$BIN" "$DEST_DIR/ada"
+    cp "$BIN" "$DEST_DIR/briglia"
     rm -rf "${DEST_DIR:?}/$BUNDLE_NAME"
     cp -R "$BUNDLE" "$DEST_DIR/$BUNDLE_NAME"
 else
     echo "Installing to $DEST_DIR (may ask for your password)…"
-    sudo cp "$BIN" "$DEST_DIR/ada"
+    sudo cp "$BIN" "$DEST_DIR/briglia"
     sudo rm -rf "${DEST_DIR:?}/$BUNDLE_NAME"
     sudo cp -R "$BUNDLE" "$DEST_DIR/$BUNDLE_NAME"
 fi
 
-echo "Installed: $DEST_DIR/ada"
-"$DEST_DIR/ada" --version
+echo "Installed: $DEST_DIR/briglia"
+"$DEST_DIR/briglia" --version
 # Smoke-test the INSTALLED copy from a neutral cwd so it cannot lean on the
 # build directory: verifies the resource bundle deployed correctly.
-(cd / && "$DEST_DIR/ada" bundle-check)
+(cd / && "$DEST_DIR/briglia" bundle-check)
+
+# Explicit post-install identity migration (RENAME_PLAN §4.2). This is the
+# ONLY step that moves an existing Ada CLI install's roots to Briglia —
+# --version and bundle-check above never do. `briglia migrate` journals
+# every step and restores the old install if it cannot complete; it is
+# safe to rerun.
+OLD_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/ada"
+OLD_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/ada"
+NEW_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/briglia"
+NEW_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/briglia"
+MIGRATED=0
+if { [ -d "$OLD_CFG" ] || [ -d "$OLD_DATA" ]; } && [ ! -d "$NEW_CFG" ] && [ ! -d "$NEW_DATA" ]; then
+    echo
+    echo "An Ada CLI installation was found — migrating it to Briglia"
+    echo "(configuration, memory, watchers, service; nothing is deleted)…"
+    if "$DEST_DIR/briglia" migrate; then
+        MIGRATED=1
+    else
+        echo "⚠ The migration did not complete. Your Ada CLI install is untouched;"
+        echo "  run:  $DEST_DIR/briglia migrate   to retry (or --rollback)."
+    fi
+fi
 case ":$PATH:" in
     *":$DEST_DIR:"*) ;;
     *) echo "⚠ $DEST_DIR is not in your PATH — add it to your shell profile." ;;

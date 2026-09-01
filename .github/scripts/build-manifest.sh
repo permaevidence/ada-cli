@@ -4,7 +4,7 @@
 #
 # Usage: build-manifest.sh <version> <sequence> <out-manifest.json>
 # Env:   RELEASE_REPO   owner/repo the asset URLs point at (default
-#                       permaevidence/ada-cli; staging overrides)
+#                       permaevidence/briglia-cli; staging overrides)
 #        PUBLISHED_AT   ISO8601 override for reproducibility tests
 #        EXPIRES_DAYS   metadata validity window (default 180, plan §5.2)
 set -euo pipefail
@@ -12,14 +12,14 @@ set -euo pipefail
 VERSION="${1#v}"; VERSION="${VERSION:?usage: build-manifest.sh <version> <sequence> <out>}"
 SEQUENCE="${2:?missing sequence}"
 OUT="${3:?missing output path}"
-REPO="${RELEASE_REPO:-permaevidence/ada-cli}"
+REPO="${RELEASE_REPO:-permaevidence/briglia-cli}"
 DAYS="${EXPIRES_DAYS:-180}"
 
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "✖ '$VERSION' is not exact SemVer"; exit 1; }
 [[ "$SEQUENCE" =~ ^[1-9][0-9]*$ ]] || { echo "✖ '$SEQUENCE' is not a positive integer"; exit 1; }
 
 shopt -s nullglob
-TARBALLS=(dist/ada-*.tar.gz)
+TARBALLS=(dist/briglia-*.tar.gz)
 [ "${#TARBALLS[@]}" -gt 0 ] || { echo "✖ no tarballs found in dist/"; exit 1; }
 
 python3 - "$VERSION" "$SEQUENCE" "$REPO" "$DAYS" "$OUT" "${TARBALLS[@]}" <<'PYEOF'
@@ -37,7 +37,7 @@ def iso(dt):
 platforms = {}
 for path in sorted(tarballs):
     name = os.path.basename(path)
-    platform = name[len("ada-"):-len(".tar.gz")]
+    platform = name[len("briglia-"):-len(".tar.gz")]
     digest = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -49,7 +49,7 @@ for path in sorted(tarballs):
     }
 manifest = {
     "schema": 1,
-    "channel": "ada-cli",
+    "channel": "briglia-cli",
     "sequence": int(sequence),
     "version": version,
     "published": iso(published_dt),

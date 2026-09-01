@@ -218,7 +218,7 @@ struct Reminder: Codable, Identifiable {
     /// can never forget a quarantine.
     var importQuarantined: Bool?
     /// External-trigger watchers: no schedule and no script — the watcher
-    /// fires when an external process posts an event via `ada trigger <id>`.
+    /// fires when an external process posts an event via `briglia trigger <id>`.
     /// `triggerDate` is pinned to the distant future so the clock-based due
     /// check never picks these rows up.
     let externalTrigger: Bool?

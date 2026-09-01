@@ -34,7 +34,7 @@ struct SubagentType {
     let preferredModel: SubagentModelChoice
     /// Default MCP tool-name patterns this subagent type can see (e.g.
     /// `["mcp__playwright__*"]`). Overridden per-agent by
-    /// `~/.config/ada/mcp-routing.json` when an entry for this agent exists.
+    /// `~/.config/briglia/mcp-routing.json` when an entry for this agent exists.
     /// nil = no MCP tools visible unless the routing file opts them in.
     let mcpToolPatterns: [String]?
     /// True forcibly disables ALL MCP tools for this type, regardless of the
@@ -131,7 +131,7 @@ enum SubagentTypes {
         staticBuiltIns + activeDynamicBuiltIns()
     }
 
-    /// Built-ins plus any user-defined agents from `~/.config/ada/agents/*.md`.
+    /// Built-ins plus any user-defined agents from `~/.config/briglia/agents/*.md`.
     /// Built-ins win on name collision.
     static func all() -> [SubagentType] {
         let user = UserAgentLoader.loadAll()

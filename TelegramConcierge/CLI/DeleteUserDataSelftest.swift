@@ -237,10 +237,10 @@ struct DeleteUserDataSelftest: AsyncParsableCommand {
             // Regression (review round 5): with structured context present,
             // both prompt paths used to drop the explicitly stored name
             // entirely — /setname changed the wipe token but not the name
-            // Ada actually saw.
+            // Briglia actually saw.
             let profile = "USER PROFILE: The user's name is OldName, a developer from Italy."
             let overlaid = OpenRouterService.buildPersonaIntro(
-                assistantName: "Ada", userName: "NewName",
+                assistantName: "Briglia", userName: "NewName",
                 structuredUserContext: profile, bareFallback: "fb")
             check("explicit name overlays structured context",
                   overlaid.hasPrefix("The user's name is NewName."), String(overlaid.prefix(120)))
@@ -248,13 +248,42 @@ struct DeleteUserDataSelftest: AsyncParsableCommand {
                   overlaid.contains("OldName"))
             check("structured context without an explicit name passes through verbatim",
                   OpenRouterService.buildPersonaIntro(
-                      assistantName: "Ada", userName: "  ",
+                      assistantName: "Briglia", userName: "  ",
                       structuredUserContext: profile, bareFallback: "fb") == profile)
             check("no structured context → basic intro from names",
                   OpenRouterService.buildPersonaIntro(
-                      assistantName: "Ada", userName: "NewName",
+                      assistantName: "Briglia", userName: "NewName",
                       structuredUserContext: nil, bareFallback: "fb")
+                    == "Your name is Briglia. You are assisting NewName.")
+            // Persona memory bridge (rename plan §4.4): on a migrated install
+            // the prior name is stated once, authoritatively; never when the
+            // names coincide, never without a current name.
+            check("bridge: plain intro states the previous name",
+                  OpenRouterService.buildPersonaIntro(
+                      assistantName: "Bree", userName: "NewName",
+                      structuredUserContext: nil, bareFallback: "fb", previousName: "Ada")
+                    == "Your name is Bree. You were previously called Ada; Bree is your current name. You are assisting NewName.")
+            let bridged = OpenRouterService.buildPersonaIntro(
+                assistantName: "Bree", userName: "NewName",
+                structuredUserContext: profile, bareFallback: "fb", previousName: "Ada")
+            check("bridge: structured context gets an authoritative identity line first",
+                  bridged.hasPrefix("Your name is Bree. You were previously called Ada; Bree is your current name.")
+                  && bridged.contains("The user's name is NewName.") && bridged.hasSuffix(profile),
+                  String(bridged.prefix(160)))
+            check("bridge: same name → no bridge line",
+                  OpenRouterService.buildPersonaIntro(
+                      assistantName: "Ada", userName: "NewName",
+                      structuredUserContext: nil, bareFallback: "fb", previousName: "Ada")
                     == "Your name is Ada. You are assisting NewName.")
+            check("bridge: custom current name is preserved verbatim",
+                  OpenRouterService.buildPersonaIntro(
+                      assistantName: "Nina", userName: nil,
+                      structuredUserContext: nil, bareFallback: "fb", previousName: "Ada")
+                    == "Your name is Nina. You were previously called Ada; Nina is your current name.")
+            check("bridge: structured context unchanged without a bridge",
+                  OpenRouterService.buildPersonaIntro(
+                      assistantName: "Ada", userName: "  ",
+                      structuredUserContext: profile, bareFallback: "fb", previousName: nil) == profile)
             check("nothing stored → the caller's fallback",
                   OpenRouterService.buildPersonaIntro(
                       assistantName: nil, userName: nil,

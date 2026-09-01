@@ -104,6 +104,9 @@ struct AppChatSocketSelftest: AsyncParsableCommand {
         let seededReply = Message(role: .assistant, content: "seeded answer")
         do {
             let data = try JSONEncoder().encode([seededUser, seededReply])
+            // Roots are no longer created on resolution (diagnostics must not
+            // materialize them) — a fixture that seeds state creates them.
+            StoragePaths.ensureRoots()
             let conversationURL = StoragePaths.dataRoot.appendingPathComponent("conversation.json")
             try data.write(to: conversationURL)
         }

@@ -7,7 +7,7 @@ import FoundationNetworking
 import Glibc
 #endif
 
-// MARK: - `ada setup-api` — machine-readable setup surface for GUI frontends
+// MARK: - `briglia setup-api` — machine-readable setup surface for GUI frontends
 //
 // Hidden JSON-over-stdio counterpart of the interactive wizard, built for the
 // Ubuntu Touch companion app. Contract:
@@ -25,7 +25,7 @@ import Glibc
 //     failures (argv payload, unparseable stdin, unknown verb).
 //   • Validation, probing and persistence are the wizard's own code paths
 //     (Probes, KeychainHelper, ProviderProfiles), so GUI setup can never
-//     drift from `ada setup`. Where the wizard would exit(1) on a failed
+//     drift from `briglia setup`. Where the wizard would exit(1) on a failed
 //     save, this returns {"error": {"code": "save_failed"}} instead.
 //   • Every apply section is re-applicable at any time — there are no
 //     "first run only" semantics (this backs the app's Settings screen).
@@ -37,7 +37,7 @@ struct SetupAPI: AsyncParsableCommand {
         shouldDisplay: false
     )
 
-    @Argument(help: "status | probe | apply | service")
+    @Argument(help: "status | probe | apply | service | migrate")
     var verb: String
 
     @Argument(parsing: .remaining, help: .hidden)
@@ -65,6 +65,19 @@ struct SetupAPI: AsyncParsableCommand {
         switch verb {
         case "status":
             respond(await SetupAPICore.status())
+        case "migrate":
+            // Optional request object ({"rollback": true}); an empty stdin
+            // means a forward migration/recovery.
+            let data = FileHandle.standardInput.readDataToEndOfFile()
+            var request: [String: Any] = [:]
+            if !data.isEmpty {
+                guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                    respond(SetupAPICore.transportError(
+                        "stdin must carry one JSON request object (or nothing)"), exitCode: 64)
+                }
+                request = object
+            }
+            respond(SetupAPICore.migrate(request))
         case "probe", "apply", "service":
             let data = FileHandle.standardInput.readDataToEndOfFile()
             guard !data.isEmpty,
@@ -79,7 +92,7 @@ struct SetupAPI: AsyncParsableCommand {
             }
         default:
             respond(SetupAPICore.transportError(
-                "unknown verb '\(verb)' — expected status | probe | apply | service"), exitCode: 64)
+                "unknown verb '\(verb)' — expected status | probe | apply | service | migrate"), exitCode: 64)
         }
     }
 }
@@ -87,7 +100,7 @@ struct SetupAPI: AsyncParsableCommand {
 // MARK: - Core (selftest-callable, no process I/O of its own)
 
 enum SetupAPICore {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
     static let argvRefusalMessage =
         "unexpected extra arguments — requests (and any secrets in them) must arrive "
@@ -191,6 +204,7 @@ enum SetupAPICore {
         payload["paths"] = ["config": StoragePaths.configRootDisplay,
                             "data": StoragePaths.dataRootDisplay]
         payload["daemon_running"] = daemonRunning()
+        payload["migration"] = migrationBlock()
         // Where a running agent serves the companion-app chat protocol.
         // Existence of the socket file ≠ liveness (a crashed process leaves
         // it behind); the app must treat a failed connect as "not running".
@@ -240,7 +254,7 @@ enum SetupAPICore {
 
         payload["identity"] = [
             "user_name": KeychainHelper.load(key: KeychainHelper.userNameKey) ?? "",
-            "assistant_name": KeychainHelper.load(key: KeychainHelper.assistantNameKey) ?? "Ada",
+            "assistant_name": KeychainHelper.load(key: KeychainHelper.assistantNameKey) ?? "Bree",
         ]
 
         var email: [String: Any] = ["provider": EmailCalendarProvider.current.rawValue]
@@ -379,6 +393,7 @@ enum SetupAPICore {
     /// atomic batch), so a failure aborts the REMAINING sections and reports
     /// what already committed via "applied".
     static func apply(_ request: [String: Any]) async -> [String: Any] {
+        if let refusal = migrationRefusal() { return refusal }
         ProviderProfiles.ensureMigrated()
         var applied: [String] = []
         var warnings: [String] = []
@@ -586,7 +601,7 @@ enum SetupAPICore {
 
     /// The companion app Settings screen's delete path:
     /// forget a profile's stored configuration. The ACTIVE profile is
-    /// refused — Ada cannot run without a main agent, so the caller must
+    /// refused — Briglia cannot run without a main agent, so the caller must
     /// activate another profile first.
     private static func removeProvider(_ profile: ProviderProfiles.Profile) throws {
         guard ProviderProfiles.activeProfile() != profile else {
@@ -678,7 +693,7 @@ enum SetupAPICore {
         do {
             try KeychainHelper.saveBatch([
                 KeychainHelper.userNameKey: name,
-                KeychainHelper.assistantNameKey: "Ada",  // fixed, same as the wizard
+                KeychainHelper.assistantNameKey: "Bree",  // fixed, same as the wizard
             ])
         } catch { throw saveFailed(error) }
     }
@@ -726,7 +741,7 @@ enum SetupAPICore {
             // /deleteuserdata wipe (EmailCredentialWipe): AgentMail key +
             // inbox, gws OAuth client fields, AND the whole ~/.config/gws
             // directory (client_secret.json + gws's OAuth token store —
-            // Codex, 2026-08-27: deleting only Ada's stored fields left the
+            // Codex, 2026-08-27: deleting only Briglia's stored fields left the
             // live Google tokens behind). Plain provider:none keeps
             // credentials so re-enabling is one tap.
             if section["remove_credentials"] as? Bool == true {
@@ -768,7 +783,7 @@ enum SetupAPICore {
             do { try KeychainHelper.saveBatch(changes) } catch { throw saveFailed(error) }
             if let failure {
                 warnings.append("agentmail: could not list inboxes (\(failure)) — continuing; "
-                                + "Ada retries at runtime")
+                                + "Briglia retries at runtime")
             }
             if section["install_cli"] as? Bool == true, !AgentMailService.agentMailBrokerInstalled() {
                 if let installFailure = await AgentMailService.installAgentMailBinary() {
@@ -818,6 +833,7 @@ enum SetupAPICore {
     // MARK: service
 
     static func service(_ request: [String: Any]) async -> [String: Any] {
+        if let refusal = migrationRefusal() { return refusal }
         #if os(Linux)
         let action = nonEmptyString(request["action"])
         let wantScripts = request["keepawake_script"] as? Bool == true
@@ -826,7 +842,7 @@ enum SetupAPICore {
         case "install":
             guard TelegramConfig.isConfigured else {
                 return errorResponse(code: "telegram_required",
-                                     message: "the service runs `ada daemon`, which needs the "
+                                     message: "the service runs `briglia daemon`, which needs the "
                                      + "Telegram channel — apply the telegram section first")
             }
             // Non-interactive: a GUI has no terminal to lend sudo, so the
@@ -936,8 +952,8 @@ enum SetupAPICore {
         #else
         _ = request
         return errorResponse(code: "unsupported_platform",
-                             message: "`ada setup-api service` manages a systemd service — Linux "
-                             + "only; on macOS run `ada daemon` in a terminal")
+                             message: "`briglia setup-api service` manages a systemd service — Linux "
+                             + "only; on macOS run `briglia daemon` in a terminal")
         #endif
     }
 
@@ -948,6 +964,72 @@ enum SetupAPICore {
     /// themselves.
     static func restartLeftUnitHealthy(isActiveOutput: String) -> Bool {
         isActiveOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+    }
+
+    // MARK: identity migration (rename plan §4.2 — explicit, never implicit)
+
+    /// Read-only detection for the status payload: the companion app shows
+    /// its consent flow and calls the `migrate` verb; nothing here writes.
+    static func migrationBlock() -> [String: Any] {
+        let status = IdentityMigration.status()
+        var block: [String: Any] = [
+            "needed": status.pending,
+            "old_roots_present": [status.roots.oldConfig, status.roots.oldData]
+                .enumerated().compactMap { index, path in
+                    (index == 0 ? status.oldConfigPresent : status.oldDataPresent) ? path : nil
+                },
+            "recovery_command": IdentityMigration.recoveryCommand,
+        ]
+        if let state = status.journalState { block["journal_state"] = state }
+        if status.oldResidue { block["old_residue"] = true }
+        return block
+    }
+
+    /// Mutating verbs refuse while a migration is pending: writing the new
+    /// roots now would mask detection and strand the old install.
+    static func migrationRefusal() -> [String: Any]? {
+        let status = IdentityMigration.status()
+        guard status.pending else { return nil }
+        return errorResponse(code: "migration_needed",
+                             message: IdentityMigration.pendingMessage(status))
+    }
+
+    /// The explicit migration, as a setup-api verb for GUI frontends. Same
+    /// engine and spec as `briglia migrate`; the response carries the
+    /// engine's outcome verbatim.
+    static func migrate(_ request: [String: Any]) -> [String: Any] {
+        let rollback = request["rollback"] as? Bool ?? false
+        let status = IdentityMigration.status()
+        guard status.pending else {
+            var payload = base(ok: true)
+            payload["outcome"] = "nothing_to_do"
+            payload["migration"] = migrationBlock()
+            return payload
+        }
+        var log: [String] = []
+        let outcome = MigrationEngine.run(spec: IdentityMigration.productionSpec(),
+                                          mode: rollback ? .rollback : .auto) { log.append($0) }
+        switch outcome {
+        case .ok(let notes):
+            var payload = base(ok: true)
+            payload["outcome"] = rollback ? "rolled_back" : "migrated"
+            payload["notes"] = notes
+            payload["log"] = log
+            payload["migration"] = migrationBlock()
+            return payload
+        case .refused(let why):
+            var payload = errorResponse(code: "migration_refused", message: why)
+            payload["log"] = log
+            return payload
+        case .corrupt(let why):
+            var payload = errorResponse(code: "migration_journal_corrupt", message: why)
+            payload["log"] = log
+            return payload
+        case .failed(let why):
+            var payload = errorResponse(code: "migration_failed", message: why)
+            payload["log"] = log
+            return payload
+        }
     }
 
     #if os(Linux)
@@ -1011,12 +1093,12 @@ enum SetupAPICore {
     static func wakelockInstallScript() -> String {
         """
         #!/bin/sh
-        # Ada keep-awake unit installer (Ubuntu Touch). Run as root: sudo sh <this-file>
+        # Briglia keep-awake unit installer (Ubuntu Touch). Run as root: sudo sh <this-file>
         set -e
         mount -o remount,rw /
         trap 'mount -o remount,ro / || echo "note: / stays read-write until reboot (busy)"' EXIT INT TERM HUP
-        cat > \(AgentServiceSupport.wakelockUnitPath) <<'ADA_UNIT'
-        \(AgentServiceSupport.wakelockUnitText())ADA_UNIT
+        cat > \(AgentServiceSupport.wakelockUnitPath) <<'BRIGLIA_UNIT'
+        \(AgentServiceSupport.wakelockUnitText())BRIGLIA_UNIT
         chmod 644 \(AgentServiceSupport.wakelockUnitPath)
         systemctl daemon-reload
         systemctl enable --now \(AgentServiceSupport.wakelockUnitName)
@@ -1026,7 +1108,7 @@ enum SetupAPICore {
     static func wakelockUninstallScript() -> String {
         """
         #!/bin/sh
-        # Ada keep-awake unit removal (Ubuntu Touch). Run as root: sudo sh <this-file>
+        # Briglia keep-awake unit removal (Ubuntu Touch). Run as root: sudo sh <this-file>
         set -e
         mount -o remount,rw /
         trap 'mount -o remount,ro / || echo "note: / stays read-write until reboot (busy)"' EXIT INT TERM HUP

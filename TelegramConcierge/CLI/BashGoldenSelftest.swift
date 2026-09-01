@@ -194,7 +194,7 @@ struct BashGoldenSelftest: AsyncParsableCommand {
         func section7() async throws {
             // Attached stdin is the null device: a `read` sees EOF at
             // once and fails with rc=1 on both zsh and bash — the child
-            // must never share (or block on) Ada's terminal.
+            // must never share (or block on) Briglia's terminal.
             let result = await BashTools.runAttached(command: "read x; echo rc=$?")
             golden("attached stdin: null device, read fails immediately", result.content, [
                 "cancelled_by_user": false, "command": "read x; echo rc=$?", "description": "",

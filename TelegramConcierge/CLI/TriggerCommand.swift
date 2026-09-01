@@ -1,8 +1,8 @@
 import ArgumentParser
 import Foundation
 
-/// `ada trigger <watcher-id> [payload...]` — post one event to an
-/// external-trigger watcher of the running (or later-running) Ada.
+/// `briglia trigger <watcher-id> [payload...]` — post one event to an
+/// external-trigger watcher of the running (or later-running) Briglia.
 ///
 /// This is the public wiring point for external systems: a camera's motion
 /// hook, a git post-receive hook, a cron job — anything that can run a
@@ -13,7 +13,7 @@ import Foundation
 struct Trigger: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "trigger",
-        abstract: "Post an event to an external-trigger watcher (created via Ada's manage_reminders)."
+        abstract: "Post an event to an external-trigger watcher (created via Briglia's manage_reminders)."
     )
 
     @Argument(help: "The external watcher's UUID (shown when the watcher is created, and in the watcher list).")
@@ -23,6 +23,7 @@ struct Trigger: ParsableCommand {
     var payload: [String] = []
 
     func run() throws {
+        try IdentityMigration.gateMutatingEntry()
         guard let uuid = UUID(uuidString: watcherId.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw ValidationError("'\(watcherId)' is not a valid watcher UUID.")
         }
@@ -36,7 +37,7 @@ struct Trigger: ParsableCommand {
         guard let data = try? Data(contentsOf: remindersURL),
               let reminders = try? decoder.decode([Reminder].self, from: data),
               let watcher = reminders.first(where: { $0.id == uuid && !$0.triggered }) else {
-            print("✖ no watcher with id \(uuid.uuidString) — list watchers inside Ada (manage_reminders action='list').")
+            print("✖ no watcher with id \(uuid.uuidString) — list watchers inside Briglia (manage_reminders action='list').")
             throw ExitCode(1)
         }
         guard watcher.isExternal else {
@@ -73,8 +74,8 @@ struct TriggerSelftest: AsyncParsableCommand {
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempRoot) }
         setenv("XDG_DATA_HOME", tempRoot.path, 1)
-        setenv("ADA_TRIGGER_COOLDOWN_SECONDS", "2", 1)
-        setenv("ADA_TRIGGER_SPOOL_CAP", "3", 1)
+        setenv("BRIGLIA_TRIGGER_COOLDOWN_SECONDS", "2", 1)
+        setenv("BRIGLIA_TRIGGER_SPOOL_CAP", "3", 1)
 
         var failures = 0
         func check(_ label: String, _ ok: Bool, _ detail: String = "") {
@@ -203,7 +204,7 @@ struct WatcherTriageSelftest: AsyncParsableCommand {
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempRoot) }
         setenv("XDG_DATA_HOME", tempRoot.path, 1)
-        setenv("ADA_TRIGGER_COOLDOWN_SECONDS", "2", 1)
+        setenv("BRIGLIA_TRIGGER_COOLDOWN_SECONDS", "2", 1)
 
         var failures = 0
         func check(_ label: String, _ ok: Bool, _ detail: String = "") {

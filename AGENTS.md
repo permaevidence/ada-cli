@@ -1,10 +1,10 @@
-# Ada CLI repository instructions
+# Briglia CLI repository instructions
 
 ## Build and verification
 
 - Build implementation changes with `swift build`.
-- Run `.build/debug/ada __midturn-selftest` for changes touching provider-visible text, prompt assembly, tool-result serialization, mid-turn delivery, OCR/derived text, or the annotation model.
-- Run `python3 scripts/smoke_test.py .build/debug/ada` before declaring a release-affecting implementation complete. CI runs the same build and smoke suite on macOS and Linux.
+- Run `.build/debug/briglia __midturn-selftest` for changes touching provider-visible text, prompt assembly, tool-result serialization, mid-turn delivery, OCR/derived text, or the annotation model.
+- Run `python3 scripts/smoke_test.py .build/debug/briglia` before declaring a release-affecting implementation complete. CI runs the same build and smoke suite on macOS and Linux.
 
 ## Mid-turn user-authority boundary
 

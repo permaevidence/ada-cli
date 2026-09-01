@@ -746,9 +746,9 @@ actor AgentMailService {
 // MARK: - Native CLI binary install (model-facing bash surface)
 
 extension AgentMailService {
-    /// Is Ada's key-brokered install complete: the `agentmail` wrapper at
+    /// Is Briglia's key-brokered install complete: the `agentmail` wrapper at
     /// ~/.local/bin (verified by content, not just name) plus the real
-    /// binary beside it. A bare binary named `agentmail` — a pre-broker Ada
+    /// binary beside it. A bare binary named `agentmail` — a pre-broker Briglia
     /// install, npm, or Homebrew — does NOT count: without the broker it
     /// cannot authenticate, so setup must not skip installation for it
     /// (Codex, 2026-08-22).
@@ -769,8 +769,8 @@ extension AgentMailService {
     }
 
     /// Foreign `agentmail` executables on the standard prefix dirs. These
-    /// have no access to Ada's key and — depending on the user's PATH — can
-    /// shadow Ada's wrapper; surfaced as a warning by setup and doctor.
+    /// have no access to Briglia's key and — depending on the user's PATH — can
+    /// shadow Briglia's wrapper; surfaced as a warning by setup and doctor.
     static func foreignAgentMailInstalls() -> [String] {
         ["/opt/homebrew/bin/agentmail", "/usr/local/bin/agentmail", "/usr/bin/agentmail"]
             .filter { FileManager.default.isExecutableFile(atPath: $0) }
@@ -791,7 +791,7 @@ extension AgentMailService {
         do {
             var lookup = URLRequest(url: apiURL)
             lookup.timeoutInterval = 30
-            lookup.setValue("ada-cli", forHTTPHeaderField: "User-Agent")
+            lookup.setValue("briglia-cli", forHTTPHeaderField: "User-Agent")
             let (data, response) = try await URLSession.shared.data(for: lookup)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -912,12 +912,12 @@ extension AgentMailService {
 
     /// The broker wrapper installed as `agentmail`. Pure so the selftest can
     /// pin its shape. Respects a caller-provided AGENTMAIL_API_KEY (a user
-    /// testing another account), falls back to Ada's stored key, and execs
+    /// testing another account), falls back to Briglia's stored key, and execs
     /// the real binary so no extra process lingers.
     static func wrapperScript(adaPath: String, realBinaryPath: String) -> String {
         """
         #!/bin/sh
-        # Installed by Ada CLI. Launches the AgentMail CLI with Ada's stored
+        # Installed by Briglia CLI. Launches the AgentMail CLI with Briglia's stored
         # API key fetched at exec time, so the key never rides ambiently in
         # other processes' environments.
         if [ -z "${AGENTMAIL_API_KEY:-}" ]; then

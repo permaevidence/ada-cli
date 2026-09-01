@@ -36,12 +36,12 @@ struct WebLiveTest: AsyncParsableCommand {
 
         let serperKey = KeychainHelper.load(key: KeychainHelper.serperApiKeyKey) ?? ""
         let jinaKey = KeychainHelper.load(key: KeychainHelper.jinaApiKeyKey) ?? ""
-        // ADA_TEST_OPENROUTER_KEY lets a one-off OpenRouter verification run
+        // BRIGLIA_TEST_OPENROUTER_KEY lets a one-off OpenRouter verification run
         // without persisting a key into secrets.json.
-        let openRouterKey = ProcessInfo.processInfo.environment["ADA_TEST_OPENROUTER_KEY"]
+        let openRouterKey = ProcessInfo.processInfo.environment["BRIGLIA_TEST_OPENROUTER_KEY"]
             ?? KeychainHelper.load(key: KeychainHelper.openRouterApiKeyKey) ?? ""
         guard !serperKey.isEmpty else {
-            throw ValidationError("No Serper key configured — run `ada setup` first.")
+            throw ValidationError("No Serper key configured — run `briglia setup` first.")
         }
 
         let orchestrator = WebOrchestrator()

@@ -19,7 +19,7 @@ jobs:
       - name: Build
         run: swift build
       - name: Smoke test
-        run: python3 scripts/smoke_test.py .build/debug/ada
+        run: python3 scripts/smoke_test.py .build/debug/briglia
 
   macos:
     name: macOS
@@ -29,4 +29,4 @@ jobs:
       - name: Build
         run: swift build
       - name: Smoke test
-        run: python3 scripts/smoke_test.py .build/debug/ada
+        run: python3 scripts/smoke_test.py .build/debug/briglia

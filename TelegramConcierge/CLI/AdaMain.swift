@@ -21,8 +21,8 @@ struct AdaCLI: AsyncParsableCommand {
     }
 
     static let configuration = CommandConfiguration(
-        commandName: "ada",
-        abstract: "Ada — your personal AI agent, in the terminal.",
+        commandName: "briglia",
+        abstract: "Briglia — your personal AI agent, in the terminal.",
         version: adaCLIVersion,
         subcommands: [Chat.self, Setup.self, SetupAPI.self, Daemon.self, Doctor.self, Upgrade.self,
                       AdaService.self, Trigger.self, MediaSelftest.self, BundleCheck.self,
@@ -37,6 +37,7 @@ struct AdaCLI: AsyncParsableCommand {
                       VerifyEnvelopeCommand.self, TestSignEnvelopeCommand.self,
                       MindSelftest.self, SetupAPISelftest.self,
                       MigrationRunCommand.self, MigrationSelftest.self,
+                      Migrate.self, MigrateProbe.self,
                       AppChatSocketSelftest.self,
                       CommandMenuSelftest.self, BotSwitchSelftest.self,
                       EmailCalendarSelftest.self, AgentMailKeyCommand.self,
@@ -67,9 +68,9 @@ private func forwardSignalToSetsidChild(_ signum: Int32) {
 /// BashTools routes every model-driven shell command through this. Without
 /// it, a child that prompts on /dev/tty (sudo — observed live when the Browse
 /// subagent ran Playwright's Chrome installer — ssh, security(1)) writes
-/// `Password:` into Ada's own terminal and blocks the turn forever, invisible
+/// `Password:` into Briglia's own terminal and blocks the turn forever, invisible
 /// to a Telegram-driven session. Worse, typed input then races byte-by-byte
-/// between the prompting child and Ada's REPL reader. Detached, such tools
+/// between the prompting child and Briglia's REPL reader. Detached, such tools
 /// fail fast with "no tty" and the failure surfaces to the model as ordinary
 /// command output.
 struct SetsidExec: ParsableCommand {
@@ -89,7 +90,7 @@ struct SetsidExec: ParsableCommand {
     /// otherwise never learn (killing the tracked pid's group only reaches
     /// this shim). Used by UserdataToolchain's timeout enforcement.
     private func reportDetachedLeader(_ pid: pid_t) {
-        guard let path = ProcessInfo.processInfo.environment["ADA_SETSID_PGID_FILE"],
+        guard let path = ProcessInfo.processInfo.environment["BRIGLIA_SETSID_PGID_FILE"],
               !path.isEmpty else { return }
         try? "\(pid)".write(toFile: path, atomically: true, encoding: .utf8)
     }
@@ -97,7 +98,7 @@ struct SetsidExec: ParsableCommand {
     func run() throws {
         guard let exe = argv.first, exe.hasPrefix("/") else {
             FileHandle.standardError.write(Data(
-                "ada __setsid-exec: usage: ada __setsid-exec -- /abs/path arg...\n".utf8))
+                "briglia __setsid-exec: usage: briglia __setsid-exec -- /abs/path arg...\n".utf8))
             throw ExitCode(64)
         }
         var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
@@ -109,14 +110,14 @@ struct SetsidExec: ParsableCommand {
             reportDetachedLeader(getpid())
             execv(exe, cargs)
             FileHandle.standardError.write(Data(
-                "ada __setsid-exec: exec \(exe) failed: \(String(cString: strerror(errno)))\n".utf8))
+                "briglia __setsid-exec: exec \(exe) failed: \(String(cString: strerror(errno)))\n".utf8))
             Foundation.exit(127)
         }
 
         // setsid() fails (EPERM) when this process is already a process-group
         // leader — some spawn paths make it one. Re-spawn the target with
         // POSIX_SPAWN_SETSID (detaches in the child, where it can't fail for
-        // that reason) and mirror its exit status. Tree kills in Ada walk
+        // that reason) and mirror its exit status. Tree kills in Briglia walk
         // pgrep -P descendants, so the extra hop stays killable.
         #if os(Linux)
         let setsidFlag: Int16 = 0x80          // glibc spawn.h, glibc >= 2.26
@@ -147,7 +148,7 @@ struct SetsidExec: ParsableCommand {
         posix_spawnattr_destroy(&attr)
         guard rc == 0 else {
             FileHandle.standardError.write(Data(
-                "ada __setsid-exec: spawn \(exe) failed: \(String(cString: strerror(rc)))\n".utf8))
+                "briglia __setsid-exec: spawn \(exe) failed: \(String(cString: strerror(rc)))\n".utf8))
             Foundation.exit(127)
         }
         // Forward termination signals to the detached child: a parent that
@@ -193,13 +194,13 @@ struct TTYHandoffSelftest: ParsableCommand {
     }
 }
 
-/// Hidden credential broker for the `agentmail` wrapper script: prints Ada's
+/// Hidden credential broker for the `agentmail` wrapper script: prints Briglia's
 /// stored AgentMail API key so the wrapper can hand it ONLY to the real
 /// AgentMail binary at exec time — no ambient env injection into other bash
 /// subprocesses (Codex, 2026-08-22: a shell-string heuristic is not a
 /// credential boundary). Any same-user process could equally read
-/// ~/.config/ada/secrets.json (0600), so this exposes nothing new; stdout is
-/// still covered by the SecretRedactor when echoed through Ada's tools.
+/// ~/.config/briglia/secrets.json (0600), so this exposes nothing new; stdout is
+/// still covered by the SecretRedactor when echoed through Briglia's tools.
 struct AgentMailKeyCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "__agentmail-key",
@@ -209,7 +210,7 @@ struct AgentMailKeyCommand: ParsableCommand {
 
     func run() throws {
         guard let key = KeychainHelper.load(key: KeychainHelper.agentMailApiKeyKey), !key.isEmpty else {
-            FileHandle.standardError.write(Data("no AgentMail API key stored — run `ada setup` (email step)\n".utf8))
+            FileHandle.standardError.write(Data("no AgentMail API key stored — run `briglia setup` (email step)\n".utf8))
             throw ExitCode(1)
         }
         print(key)
@@ -217,7 +218,7 @@ struct AgentMailKeyCommand: ParsableCommand {
 }
 
 /// Hidden installer smoke test: verify the SwiftPM resource bundle
-/// (ada-cli_ada.bundle — bundled skills, WhatsApp bridge, toolchain scripts)
+/// (briglia-cli_briglia.bundle — bundled skills, WhatsApp bridge, toolchain scripts)
 /// is deployed next to this executable. `--version` alone cannot catch a
 /// missing bundle, and Bundle.module TRAPS (SIGTRAP, exit 133) on first
 /// resource access — so this probes for the bundle manually before touching
@@ -225,7 +226,7 @@ struct AgentMailKeyCommand: ParsableCommand {
 struct BundleCheck: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "bundle-check",
-        abstract: "Verify the resource bundle is installed next to the ada binary.",
+        abstract: "Verify the resource bundle is installed next to the briglia binary.",
         shouldDisplay: false
     )
 
@@ -233,14 +234,14 @@ struct BundleCheck: ParsableCommand {
     /// Darwin, a `.resources` directory on Linux.
     static let bundleName: String = {
         #if os(Linux)
-        "ada-cli_ada.resources"
+        "briglia-cli_briglia.resources"
         #else
-        "ada-cli_ada.bundle"
+        "briglia-cli_briglia.bundle"
         #endif
     }()
 
     func run() throws {
-        // argv[0] can be a bare "ada" resolved via PATH; Bundle.main knows the
+        // argv[0] can be a bare "briglia" resolved via PATH; Bundle.main knows the
         // real executable path on both macOS and Linux (/proc/self/exe).
         let executable = (Bundle.main.executableURL
             ?? URL(fileURLWithPath: CommandLine.arguments[0]))
@@ -250,9 +251,9 @@ struct BundleCheck: ParsableCommand {
         guard FileManager.default.fileExists(atPath: bundleURL.path) else {
             print("""
             ✖ resource bundle missing: \(bundleURL.path)
-              The installer must copy \(Self.bundleName) next to the ada binary
+              The installer must copy \(Self.bundleName) next to the briglia binary
               (scripts/install.sh does this). Without it, skills and the
-              WhatsApp bridge are unavailable and Ada crashes on first use.
+              WhatsApp bridge are unavailable and Briglia crashes on first use.
             """)
             throw ExitCode(1)
         }
@@ -269,11 +270,13 @@ struct BundleCheck: ParsableCommand {
 
 struct Chat: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Interactive chat with Ada (default command)."
+        abstract: "Interactive chat with Briglia (default command)."
     )
 
     func run() async throws {
         AdaCLI.prepareIO()
+        try IdentityMigration.gateMutatingEntry()
+        IdentityMigration.warnLegacyEnvironment()
         let session = await TerminalSession()
         try await session.runChat()
     }
@@ -281,11 +284,13 @@ struct Chat: AsyncParsableCommand {
 
 struct Daemon: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Run Ada headless: no local chat, messaging channels (Telegram) only."
+        abstract: "Run Briglia headless: no local chat, messaging channels (Telegram) only."
     )
 
     func run() async throws {
         AdaCLI.prepareIO()
+        try IdentityMigration.gateMutatingEntry()
+        IdentityMigration.warnLegacyEnvironment()
         let session = await TerminalSession()
         try await session.runDaemon()
     }

@@ -280,16 +280,16 @@ struct ToolchainPrefixSelftest: AsyncParsableCommand {
             for dir in [root, bin, sys] {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }
-            setenv("ADA_TOOLCHAIN_ROOT", root.path, 1)
-            setenv("ADA_TOOLCHAIN_BIN", bin.path, 1)
-            setenv("ADA_TOOLCHAIN_PATH", "\(bin.path):\(sys.path)", 1)
-            setenv("ADA_TOOLCHAIN_APT", fakeApt.path, 1)
-            setenv("ADA_TOOLCHAIN_DPKG", fakeDpkg.path, 1)
-            setenv("ADA_TOOLCHAIN_DPKG_STATUS", statusFile.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_ROOT", root.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_BIN", bin.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_PATH", "\(bin.path):\(sys.path)", 1)
+            setenv("BRIGLIA_TOOLCHAIN_APT", fakeApt.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_DPKG", fakeDpkg.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_DPKG_STATUS", statusFile.path, 1)
             for knob in ["FAKE_APT_EMPTY", "FAKE_APT_EXIT", "FAKE_APT_NOGUI_MISSING",
                          "FAKE_APT_ADD_LIBC", "FAKE_APT_NO_DOWNLOAD",
                          "FAKE_FFMPEG_NEEDS_BLAS", "FAKE_SOFFICE_NO_PDF",
-                         "FAKE_REPO_VERSION", "ADA_TOOLCHAIN_FAULT"] {
+                         "FAKE_REPO_VERSION", "BRIGLIA_TOOLCHAIN_FAULT"] {
                 unsetenv(knob)
             }
             try? fm.removeItem(at: aptLog)
@@ -349,6 +349,23 @@ struct ToolchainPrefixSelftest: AsyncParsableCommand {
                   && convert.contains(codersRel)
                   && convert.contains("MAGICK_CONFIGURE_PATH=")
                   && convert.contains("etc/ImageMagick-6"))
+            do {
+                // Rename plan §4.5.9: wrappers written by the previous identity
+                // (and rebased, not rewritten, by `briglia migrate`) keep the
+                // legacy marker and must stay OURS forever.
+                let legacy = root.appendingPathComponent("legacy-marker-wrapper").path
+                try "#!/bin/sh\n\(UserdataToolchain.legacyWrapperMarker)\nexec /x \"$@\"\n"
+                    .write(toFile: legacy, atomically: true, encoding: .utf8)
+                let foreign = root.appendingPathComponent("foreign-wrapper").path
+                try "#!/bin/sh\n# someone else's wrapper\nexec /x \"$@\"\n"
+                    .write(toFile: foreign, atomically: true, encoding: .utf8)
+                check("legacy-marker wrapper is recognized as ours",
+                      UserdataToolchain.isOurWrapper(legacy))
+                check("unmarked wrapper is not ours", !UserdataToolchain.isOurWrapper(foreign))
+                check("current marker differs from the legacy one and both are accepted",
+                      UserdataToolchain.wrapperMarker != UserdataToolchain.legacyWrapperMarker
+                      && UserdataToolchain.acceptedWrapperMarkers.count == 2)
+            }
             check("wrapper carries markers and the arch lib dir",
                   convert.contains(UserdataToolchain.wrapperMarker)
                   && convert.contains(UserdataToolchain.closureMarker)
@@ -1174,9 +1191,9 @@ struct ToolchainPrefixSelftest: AsyncParsableCommand {
             let v1Text = (try? String(
                 contentsOf: bin.appendingPathComponent("pdftotext"),
                 encoding: .utf8)) ?? ""
-            setenv("ADA_TOOLCHAIN_FAULT", "snapshot-flush", 1)
+            setenv("BRIGLIA_TOOLCHAIN_FAULT", "snapshot-flush", 1)
             let failed = UserdataToolchain.installSync(includePandoc: false) { _ in }
-            unsetenv("ADA_TOOLCHAIN_FAULT")
+            unsetenv("BRIGLIA_TOOLCHAIN_FAULT")
             let wrapperAfter = (try? String(
                 contentsOf: bin.appendingPathComponent("pdftotext"),
                 encoding: .utf8)) ?? ""
@@ -1212,9 +1229,9 @@ struct ToolchainPrefixSelftest: AsyncParsableCommand {
             """
             try writeScript(bin.appendingPathComponent("pdftotext"), v1Text)
             setenv("FAKE_REPO_VERSION", "2.0", 1)
-            setenv("ADA_TOOLCHAIN_FAULT", "commit-flush", 1)
+            setenv("BRIGLIA_TOOLCHAIN_FAULT", "commit-flush", 1)
             let failed = UserdataToolchain.installSync(includePandoc: false) { _ in }
-            unsetenv("ADA_TOOLCHAIN_FAULT")
+            unsetenv("BRIGLIA_TOOLCHAIN_FAULT")
             let wrapperAfter = (try? String(
                 contentsOf: bin.appendingPathComponent("pdftotext"),
                 encoding: .utf8)) ?? ""
@@ -1286,7 +1303,7 @@ struct ToolchainPrefixSelftest: AsyncParsableCommand {
             // kills the straggler; on Linux the orphan holds corelibs'
             // exit-detection descriptor so the ordinary timeout branch
             // fires — reference_corelibs_process_pipes_linux), the result
-            // must be NONZERO: Ada forcibly killed part of the process
+            // must be NONZERO: Briglia forcibly killed part of the process
             // tree, and callers must never mistake that for a clean
             // apt/dpkg run (Codex round 3 #2 — the old macOS shape returned
             // the leader's exit 0 with only an ignorable note).
@@ -1299,9 +1316,9 @@ struct ToolchainPrefixSelftest: AsyncParsableCommand {
         }
 
         // cleanup env so nothing leaks into other selftests
-        for key in ["ADA_TOOLCHAIN_ROOT", "ADA_TOOLCHAIN_BIN", "ADA_TOOLCHAIN_PATH",
-                    "ADA_TOOLCHAIN_APT", "ADA_TOOLCHAIN_DPKG",
-                    "ADA_TOOLCHAIN_DPKG_STATUS"] {
+        for key in ["BRIGLIA_TOOLCHAIN_ROOT", "BRIGLIA_TOOLCHAIN_BIN", "BRIGLIA_TOOLCHAIN_PATH",
+                    "BRIGLIA_TOOLCHAIN_APT", "BRIGLIA_TOOLCHAIN_DPKG",
+                    "BRIGLIA_TOOLCHAIN_DPKG_STATUS"] {
             unsetenv(key)
         }
 

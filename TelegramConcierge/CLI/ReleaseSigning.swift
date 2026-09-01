@@ -20,12 +20,12 @@ import Darwin
 /// workflow's authorize job checks that this constant, the tag, and the
 /// stamped version agree, and that the sequence is strictly greater than the
 /// last successfully released one. Bump it in the release-prep commit.
-let adaCLIReleaseSequence = 59
+let adaCLIReleaseSequence = 60
 
 /// The canonical release repository this binary trusts artifacts from. The
 /// staging pipeline stamps its own repo here (STAMP-RELEASE-REPO); production
 /// builds always carry the canonical value.
-let adaCLIReleaseRepository = "permaevidence/ada-cli" // STAMP-RELEASE-REPO
+let adaCLIReleaseRepository = "permaevidence/briglia-cli" // STAMP-RELEASE-REPO
 
 /// One pinned Ed25519 release-verification key.
 struct ReleaseKey {
@@ -54,7 +54,7 @@ struct ReleaseKey {
 enum ReleaseKeys {
     // STAMP-KEYS-BEGIN — edited only by the key ceremony (production key)
     static let pinnedKeyHex: [(keyId: String, publicKeyHex: String)] = [
-        (keyId: "ada-cli-release-v1-94d967bae0867c2e",
+        (keyId: "briglia-cli-release-v1-94d967bae0867c2e",
          publicKeyHex: "621031636aa2bb2edb64a58f2f72de7bc3559b08d717c79b4251f8b1e35b8a95"),
     ]
     // STAMP-KEYS-END
@@ -82,22 +82,22 @@ struct ReleasePolicy {
 
     static let production = ReleasePolicy(
         keys: ReleaseKeys.active,
-        channel: "ada-cli",
+        channel: "briglia-cli",
         artifactURLPrefix: "https://github.com/\(adaCLIReleaseRepository)/releases/download/v{version}/")
 
     /// The policy live checks use. Identical to `.production` in every
     /// stamped release build. ONLY a "-dev" source build (never stamped by
     /// the release pipeline — the authorize job verifies stamping) honors
     /// the smoke-test overrides, so the end-to-end upgrade tests can serve
-    /// a signed mock channel: ADA_RELEASE_TEST_KEY ("keyId:64hex", replaces
-    /// the pinned key set) and ADA_RELEASE_URL_PREFIX (replaces the artifact
+    /// a signed mock channel: BRIGLIA_RELEASE_TEST_KEY ("keyId:64hex", replaces
+    /// the pinned key set) and BRIGLIA_RELEASE_URL_PREFIX (replaces the artifact
     /// prefix template). This is deliberately NOT a runtime escape hatch in
     /// released binaries: the gate is the compiled version constant.
     static var effective: ReleasePolicy {
         guard adaCLIVersion.hasSuffix("-dev") else { return .production }
         let env = ProcessInfo.processInfo.environment
         var keys = ReleaseKeys.active
-        if let spec = env["ADA_RELEASE_TEST_KEY"] {
+        if let spec = env["BRIGLIA_RELEASE_TEST_KEY"] {
             let parts = spec.split(separator: ":", maxSplits: 1).map(String.init)
             if parts.count == 2, let key = ReleaseKey(keyId: parts[0], publicKeyHex: parts[1]) {
                 keys = [key]
@@ -105,8 +105,8 @@ struct ReleasePolicy {
         }
         return ReleasePolicy(
             keys: keys,
-            channel: "ada-cli",
-            artifactURLPrefix: env["ADA_RELEASE_URL_PREFIX"] ?? production.artifactURLPrefix)
+            channel: "briglia-cli",
+            artifactURLPrefix: env["BRIGLIA_RELEASE_URL_PREFIX"] ?? production.artifactURLPrefix)
     }
 }
 
@@ -376,7 +376,7 @@ enum ReleaseTrustStore {
     }
 
     static var fileURL: URL {
-        if let override = ProcessInfo.processInfo.environment["ADA_RELEASE_TRUST_FILE"] {
+        if let override = ProcessInfo.processInfo.environment["BRIGLIA_RELEASE_TRUST_FILE"] {
             return URL(fileURLWithPath: override)
         }
         return StoragePaths.dataRoot.appendingPathComponent("release_trust.json")
@@ -643,7 +643,7 @@ struct VerifyEnvelopeCommand: ParsableCommand {
 /// Hidden TEST-ONLY signer for the smoke suite's mock release channel:
 /// derives a deterministic Ed25519 key from --seed-hex, signs the manifest
 /// into a production-shaped envelope, and prints the keyId + public key so
-/// the harness can hand them to the client via ADA_RELEASE_TEST_KEY.
+/// the harness can hand them to the client via BRIGLIA_RELEASE_TEST_KEY.
 /// Refuses to run in stamped release builds — same gate as the policy
 /// overrides in ReleasePolicy.effective.
 struct TestSignEnvelopeCommand: ParsableCommand {
@@ -674,13 +674,13 @@ struct TestSignEnvelopeCommand: ParsableCommand {
         let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
         let publicKey = privateKey.publicKey.rawRepresentation
         let fingerprint = SHA256.hash(data: publicKey).map { String(format: "%02x", $0) }.joined()
-        let keyId = "ada-cli-release-v1-\(fingerprint.prefix(16))"
+        let keyId = "briglia-cli-release-v1-\(fingerprint.prefix(16))"
         let payload = try Data(contentsOf: URL(fileURLWithPath: manifestPath))
-        let message = ReleaseSigning.domainInput(channel: "ada-cli", keyId: keyId, payload: payload)
+        let message = ReleaseSigning.domainInput(channel: "briglia-cli", keyId: keyId, payload: payload)
         let signature = try privateKey.signature(for: message)
         let envelope: [String: String] = [
             "format": ReleaseSigning.formatName,
-            "channel": "ada-cli",
+            "channel": "briglia-cli",
             "keyId": keyId,
             "payload": payload.base64EncodedString(),
             "signature": signature.base64EncodedString(),

@@ -5,7 +5,7 @@ import Glibc
 
 // MARK: - Cross-platform shims
 //
-// Ada CLI builds on macOS and Linux. Everything genuinely platform-specific
+// Briglia CLI builds on macOS and Linux. Everything genuinely platform-specific
 // funnels through this file so the rest of the codebase stays identical to
 // Ada.app (which keeps upstream merges clean).
 

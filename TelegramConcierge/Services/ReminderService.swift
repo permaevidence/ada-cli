@@ -24,7 +24,7 @@ actor ReminderService {
     /// delivered as ONE batched fire once this window has passed (leading-edge
     /// fire + trailing batch). Env override is an internal test hook only.
     static let externalTriggerCooldownSeconds: TimeInterval = {
-        if let raw = ProcessInfo.processInfo.environment["ADA_TRIGGER_COOLDOWN_SECONDS"],
+        if let raw = ProcessInfo.processInfo.environment["BRIGLIA_TRIGGER_COOLDOWN_SECONDS"],
            let value = TimeInterval(raw), value > 0 {
             return value
         }
@@ -180,7 +180,7 @@ actor ReminderService {
     // MARK: - External-trigger watchers
 
     /// Create an external-trigger watcher: no schedule, no script — it fires
-    /// when an external process posts an event via `ada trigger <id>`.
+    /// when an external process posts an event via `briglia trigger <id>`.
     /// `triggerDate` is pinned to the distant future so the clock-based due
     /// check never selects the row.
     func createExternalTriggerReminder(
@@ -694,7 +694,7 @@ actor ReminderService {
             return .failure(ScriptValidationError(message: "No reminder found with that ID."))
         }
         guard reminders[index].isImportQuarantined else {
-            return .failure(ScriptValidationError(message: "That watcher is not import-quarantined — nothing to approve. (A watcher paused after script failures is resumed by asking Ada.)"))
+            return .failure(ScriptValidationError(message: "That watcher is not import-quarantined — nothing to approve. (A watcher paused after script failures is resumed by asking Briglia.)"))
         }
         let original = reminders[index]
         reminders[index].importQuarantined = nil
@@ -1065,7 +1065,7 @@ actor ReminderService {
         encoder.outputFormatting = .prettyPrinted
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(reminders)
-        // Atomic: `ada trigger` reads this file from a separate process
+        // Atomic: `briglia trigger` reads this file from a separate process
         // to validate watcher ids — a torn in-place write would make it
         // spuriously reject valid triggers (and a crash mid-write could
         // corrupt the whole store).

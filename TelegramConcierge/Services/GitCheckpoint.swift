@@ -8,7 +8,7 @@ import Foundation
 /// tracked files without touching the index, the stash list, or the user's
 /// history. The resulting SHA is appended to that edit's tool result with
 /// ready-to-run review/rollback commands, and recorded in a disk ledger at
-/// ~/.local/share/ada/git_checkpoints.json so it
+/// ~/.local/share/briglia/git_checkpoints.json so it
 /// survives context pruning and app restarts.
 ///
 /// Prunable by design, like project instructions and verification hints: when
@@ -70,7 +70,7 @@ final class GitCheckpointTracker: @unchecked Sendable {
                 + "- review everything you changed since: git -C \(rootPath) diff \(shortSha)\n"
                 + "- restore a single file: git -C \(rootPath) checkout \(shortSha) -- <path>\n"
                 + "- before reporting a multi-file change done, self-review with: git -C \(rootPath) diff --stat \(shortSha)\n"
-                + "Full SHA and earlier checkpoints: ~/.local/share/ada/git_checkpoints.json\n"
+                + "Full SHA and earlier checkpoints: ~/.local/share/briglia/git_checkpoints.json\n"
                 + Self.markerEnd
             )
         }
@@ -162,7 +162,7 @@ final class GitCheckpointTracker: @unchecked Sendable {
         // A repo with no commits can't be snapshotted (stash needs HEAD).
         guard runGit(["rev-parse", "--verify", "HEAD"], in: repoRoot) != nil else { return nil }
 
-        if let stashSha = runGit(["stash", "create", "Ada pre-edit checkpoint"], in: repoRoot),
+        if let stashSha = runGit(["stash", "create", "Briglia pre-edit checkpoint"], in: repoRoot),
            !stashSha.isEmpty {
             return Snapshot(sha: stashSha, clean: false)
         }
@@ -200,7 +200,7 @@ final class GitCheckpointTracker: @unchecked Sendable {
         // Drain stdout on a background queue so a full pipe buffer can't
         // deadlock the child while we wait.
         let outputBox = NSMutableData()
-        let readQueue = DispatchQueue(label: "ada.git-checkpoint.read")
+        let readQueue = DispatchQueue(label: "com.permaevidence.briglia.git-checkpoint.read")
         readQueue.async {
             outputBox.append(out.fileHandleForReading.readDataToEndOfFile())
         }

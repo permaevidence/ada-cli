@@ -6,7 +6,7 @@ import Foundation
 /// - `none`      — no email/calendar at all: no prompt sections, no polling,
 ///                 no calendar tool. The default for fresh installs.
 /// - `agentmail` — a dedicated agent inbox on AgentMail (api.agentmail.to,
-///                 key in secrets.json) plus Ada's local calendar store with
+///                 key in secrets.json) plus Briglia's local calendar store with
 ///                 the `manage_calendar` tool. The recommended easy path.
 /// - `gws`       — the user's own Gmail/Google Calendar via the `gws` CLI
 ///                 with a user-provided Google Cloud OAuth client. Calendar
@@ -72,7 +72,7 @@ enum EmailCalendarProvider: String, CaseIterable {
         case .agentmail:
             let inbox = Self.agentMailInboxAddress
             let inboxNote = inbox.isEmpty ? "" : " (\(inbox))"
-            return "- You have a dedicated email inbox\(inboxNote) on AgentMail. Use the `agentmail` CLI via `bash` for email actions — it authenticates itself automatically (e.g. `agentmail inboxes:messages list --inbox-id \(inbox.isEmpty ? "<inbox>" : inbox) --limit 10`, `… get --message-id '<id>'`, `… reply`, `… send`). For raw API calls, `ada __agentmail-key` prints the key. Use `manage_calendar` for the calendar."
+            return "- You have a dedicated email inbox\(inboxNote) on AgentMail. Use the `agentmail` CLI via `bash` for email actions — it authenticates itself automatically (e.g. `agentmail inboxes:messages list --inbox-id \(inbox.isEmpty ? "<inbox>" : inbox) --limit 10`, `… get --message-id '<id>'`, `… reply`, `… send`). For raw API calls, `briglia __agentmail-key` prints the key. Use `manage_calendar` for the calendar."
         case .gws:
             return "- Use `gws` for Google Workspace actions."
         }
@@ -104,7 +104,7 @@ enum EmailCalendarProvider: String, CaseIterable {
 /// resets the provider to an EXPLICIT "none" — leaving it unset would let
 /// the legacy "gws if installed" inference resurrect a token-less gws
 /// configuration and spam maintenance alerts. Server-side mailboxes are
-/// deliberately untouched: deleting the key severs Ada's access, and remote
+/// deliberately untouched: deleting the key severs Briglia's access, and remote
 /// mail belongs to the account owner (an AgentMail key is inbox-scoped, so a
 /// new owner's key cannot see the old inbox anyway).
 enum EmailCredentialWipe {

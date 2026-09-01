@@ -10,7 +10,7 @@ set -euo pipefail
 KEYID="${1:?usage: stamp-release-key.sh <keyId> <publicKeyHex>}"
 PUBHEX="${2:?missing public key hex}"
 [[ "$PUBHEX" =~ ^[0-9a-f]{64}$ ]] || { echo "✖ public key must be 64 lowercase hex chars"; exit 1; }
-[[ "$KEYID" =~ ^ada-(cli|ut)-release-v[0-9]+-[0-9a-f]{16}$ ]] || { echo "✖ keyId '$KEYID' has the wrong shape"; exit 1; }
+[[ "$KEYID" =~ ^briglia-(cli|ut)-release-v[0-9]+-[0-9a-f]{16}$ ]] || { echo "✖ keyId '$KEYID' has the wrong shape"; exit 1; }
 
 FILE="TelegramConcierge/CLI/ReleaseSigning.swift"
 python3 - "$FILE" "$KEYID" "$PUBHEX" <<'PYEOF'

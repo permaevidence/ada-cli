@@ -8,7 +8,7 @@ import CryptoKit
 import Crypto
 #endif
 
-/// Singleton actor: owns every connected MCP client, reads `~/.config/ada/mcp.json`,
+/// Singleton actor: owns every connected MCP client, reads `~/.config/briglia/mcp.json`,
 /// resolves Keychain-backed secrets into the spawn environment, bootstraps
 /// servers on first use, caches the merged tool list as native
 /// `ToolDefinition`s for the LLM tool block, and dispatches `tools/call`
@@ -521,7 +521,7 @@ actor MCPRegistry {
 
 /// Downloads the official Node.js LTS tarball from nodejs.org (verified
 /// against the release's SHASUMS256.txt), extracts it to ~/.local/node and
-/// links node/npm/npx into ~/.local/bin — a directory every Ada subprocess
+/// links node/npm/npx into ~/.local/bin — a directory every Briglia subprocess
 /// PATH already covers (MCPRegistry.baseEnvironment, BashTools.augmentedPath).
 /// No Homebrew, no admin password. Mirrors
 /// GoogleWorkspaceService.installGwsBinary().
@@ -700,7 +700,7 @@ enum BrowserAutomationBootstrap {
 
         // The "don't re-add after deliberate removal" flag lives in
         // UserDefaults (~/Library/Preferences), which survives a full wipe of
-        // ~/.config/ada. Distinguish the two cases by the config file itself:
+        // ~/.config/briglia. Distinguish the two cases by the config file itself:
         // a user who removed just the playwright entry leaves mcp.json on
         // disk, while a wiped/fresh machine has no file at all — treat that
         // as a fresh install and bootstrap again. (Observed live: a full

@@ -7,7 +7,7 @@ import Foundation
 /// keeps chat ids and typos from ever being probed as tokens, (c) the
 /// one-time code format, (d) the tolerant getUpdates parse the discovery
 /// poll relies on, and (e) the discovery filter: only a human in a PRIVATE
-/// chat can claim the code (a group would hand Ada to everyone in it).
+/// chat can claim the code (a group would hand Briglia to everyone in it).
 /// Pure static checks — no storage or network touched.
 struct BotSwitchSelftest: ParsableCommand {
     static let configuration = CommandConfiguration(

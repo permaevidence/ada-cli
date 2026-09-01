@@ -1,10 +1,10 @@
 import ArgumentParser
 import Foundation
 
-// MARK: - `ada service` — always-on Ada as a systemd user service (Linux)
+// MARK: - `briglia service` — always-on Briglia as a systemd user service (Linux)
 //
 // Replaces the hand-written unit files from the Raspberry Pi and Pixel 3a
-// (Ubuntu Touch) setups: `ada service install` writes the user unit, enables
+// (Ubuntu Touch) setups: `briglia service install` writes the user unit, enables
 // linger so it survives logout/boot, starts it, and — on Ubuntu Touch — also
 // offers the kernel-wakelock system unit that keeps the phone from suspending
 // when the screen turns off (repowerd's session inhibitor fails there with
@@ -15,25 +15,25 @@ import Foundation
 // Linux-only.
 
 enum AgentServiceSupport {
-    static let userUnitName = "ada.service"
-    static let wakelockUnitName = "ada-keepawake.service"
-    static let wakelockName = "ada-keepawake"
-    static let wakelockUnitPath = "/etc/systemd/system/ada-keepawake.service"
+    static let userUnitName = "briglia.service"
+    static let wakelockUnitName = "briglia-keepawake.service"
+    static let wakelockName = "briglia-keepawake"
+    static let wakelockUnitPath = "/etc/systemd/system/briglia-keepawake.service"
 
     static func userUnitDirectory(home: String) -> String {
         home + "/.config/systemd/user"
     }
 
-    /// The systemd user unit running `ada daemon`. Mirrors the field set
+    /// The systemd user unit running `briglia daemon`. Mirrors the field set
     /// proven on the Pixel 3a / Raspberry Pi manual installs: restart on
-    /// crash, SIGINT for Ada's own graceful shutdown path, and a PATH that
+    /// crash, SIGINT for Briglia's own graceful shutdown path, and a PATH that
     /// resolves the ada binary's own directory first (self-upgrade swaps the
     /// binary in place there).
     static func userUnitText(adaPath: String, home: String) -> String {
         let binDir = (adaPath as NSString).deletingLastPathComponent
         return """
         [Unit]
-        Description=Ada CLI Telegram daemon
+        Description=Briglia CLI Telegram daemon
 
         [Service]
         Type=simple
@@ -53,12 +53,12 @@ enum AgentServiceSupport {
     }
 
     /// The Ubuntu Touch keep-awake unit: holds a kernel wakelock so the
-    /// phone never fully suspends while Ada should stay reachable. Gated on
+    /// phone never fully suspends while Briglia should stay reachable. Gated on
     /// the Android wakelock sysfs interface actually existing.
     static func wakelockUnitText() -> String {
         """
         [Unit]
-        Description=Keep the phone awake for Ada CLI
+        Description=Keep the phone awake for Briglia CLI
         After=local-fs.target
         ConditionPathExists=/sys/power/wake_lock
         ConditionPathExists=/sys/power/wake_unlock
@@ -200,7 +200,7 @@ enum AgentServiceSupport {
         }
         print("  ✔ service enabled and started")
 
-        // Linger: without it, the user's systemd session — and Ada with it —
+        // Linger: without it, the user's systemd session — and Briglia with it —
         // only exists while logged in, and nothing starts at boot.
         if lingerEnabled() {
             print("  ✔ linger already enabled (starts at boot, survives logout)")
@@ -213,7 +213,7 @@ enum AgentServiceSupport {
                 if runInteractiveSudo(["loginctl", "enable-linger", NSUserName()]), lingerEnabled() {
                     print("  ✔ linger enabled (starts at boot, survives logout)")
                 } else {
-                    print("  ⚠ could not enable linger — Ada will stop at logout/reboot.")
+                    print("  ⚠ could not enable linger — Briglia will stop at logout/reboot.")
                     print("    Enable it manually: sudo loginctl enable-linger \(NSUserName())")
                 }
             } else {
@@ -226,11 +226,11 @@ enum AgentServiceSupport {
         Thread.sleep(forTimeInterval: 2.0)
         let active = run("systemctl", ["--user", "is-active", userUnitName]).output
         if active == "active" {
-            print("  ✔ ada daemon is running")
+            print("  ✔ briglia daemon is running")
         } else {
             print("  ⚠ service state: \(active) — inspect with:")
             print("    journalctl --user -u \(userUnitName) -n 50 --no-pager")
-            print("    (an `ada` chat session in another terminal blocks the daemon: same instance lock)")
+            print("    (an `briglia` chat session in another terminal blocks the daemon: same instance lock)")
         }
         return true
     }
@@ -249,7 +249,7 @@ enum AgentServiceSupport {
             }
         }
         let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ada-keepawake-\(UUID().uuidString).service")
+            .appendingPathComponent("briglia-keepawake-\(UUID().uuidString).service")
         do {
             try wakelockUnitText().write(to: temp, atomically: true, encoding: .utf8)
         } catch {
@@ -282,22 +282,22 @@ enum AgentServiceSupport {
         FileManager.default.fileExists(atPath: wakelockUnitPath)
     }
 
-    /// Shared Ubuntu Touch keep-awake offer (used by `ada service install`
+    /// Shared Ubuntu Touch keep-awake offer (used by `briglia service install`
     /// and the setup wizard's service step). No-op off Ubuntu Touch.
     static func offerUbuntuTouchKeepAwake() {
         guard isUbuntuTouch(), !wakelockUnitInstalled() else { return }
         print("""
 
         Ubuntu Touch detected. The phone suspends completely when the
-        screen turns off, which stops Ada — a kernel wakelock keeps it
+        screen turns off, which stops Briglia — a kernel wakelock keeps it
         reachable (higher idle battery use; check drain the first day).
         """)
         if WizardIO.askYesNo("Install the keep-awake unit now (asks for the phone's PIN)?",
                              default: true) {
             _ = installWakelockService()
         } else {
-            print("  Skipped — Ada will stop whenever the screen turns off.")
-            print("  Install later with: ada service install")
+            print("  Skipped — Briglia will stop whenever the screen turns off.")
+            print("  Install later with: briglia service install")
         }
     }
     #endif
@@ -308,7 +308,7 @@ enum AgentServiceSupport {
 struct AdaService: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "service",
-        abstract: "Run Ada as an always-on background service (Linux/systemd).",
+        abstract: "Run Briglia as an always-on background service (Linux/systemd).",
         subcommands: [ServiceInstall.self, ServiceStatus.self, ServiceUninstall.self],
         defaultSubcommand: ServiceStatus.self
     )
@@ -316,9 +316,9 @@ struct AdaService: AsyncParsableCommand {
 
 private func serviceUnsupportedOnThisPlatform() -> Never {
     print("""
-    `ada service` manages a systemd service — Linux only (Raspberry Pi,
-    servers, Ubuntu Touch phones). On macOS run `ada daemon` in a terminal,
-    or ask Ada to set up a LaunchAgent for you.
+    `briglia service` manages a systemd service — Linux only (Raspberry Pi,
+    servers, Ubuntu Touch phones). On macOS run `briglia daemon` in a terminal,
+    or ask Briglia to set up a LaunchAgent for you.
     """)
     Foundation.exit(1)
 }
@@ -334,15 +334,16 @@ struct ServiceInstall: AsyncParsableCommand {
 
     func run() async throws {
         AdaCLI.prepareIO()
+        try IdentityMigration.gateMutatingEntry()
         #if os(Linux)
         guard TelegramConfig.isConfigured else {
             print("""
-            ✖ The service runs `ada daemon`, which needs the Telegram channel.
-              Run `ada setup` and complete the Telegram step first.
+            ✖ The service runs `briglia daemon`, which needs the Telegram channel.
+              Run `briglia setup` and complete the Telegram step first.
             """)
             throw ExitCode(1)
         }
-        print("Installing the Ada background service…")
+        print("Installing the Briglia background service…")
         guard AgentServiceSupport.installUserService() else { throw ExitCode(1) }
 
         if !noKeepawake {
@@ -351,8 +352,8 @@ struct ServiceInstall: AsyncParsableCommand {
         print("""
 
         Done. Useful commands:
-          ada service status
-          journalctl --user -u ada.service -f
+          briglia service status
+          journalctl --user -u briglia.service -f
         """)
         #else
         serviceUnsupportedOnThisPlatform()
@@ -363,7 +364,7 @@ struct ServiceInstall: AsyncParsableCommand {
 struct ServiceStatus: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "status",
-        abstract: "Show whether the Ada service (and keep-awake unit) is installed and running."
+        abstract: "Show whether the Briglia service (and keep-awake unit) is installed and running."
     )
 
     func run() async throws {
@@ -373,10 +374,10 @@ struct ServiceStatus: AsyncParsableCommand {
         let unitPath = AgentServiceSupport.userUnitDirectory(home: home)
             + "/" + AgentServiceSupport.userUnitName
         guard FileManager.default.fileExists(atPath: unitPath) else {
-            print("Ada service: not installed (set it up with `ada service install`)")
+            print("Briglia service: not installed (set it up with `briglia service install`)")
             return
         }
-        print("Ada service: installed (\(unitPath))")
+        print("Briglia service: installed (\(unitPath))")
         guard AgentServiceSupport.systemdUserSessionAvailable() else {
             print("  ⚠ no systemd user session reachable from here — try from a normal login shell.")
             return
@@ -396,11 +397,11 @@ struct ServiceStatus: AsyncParsableCommand {
                 print("  \(wlActive == "active" ? "✔" : "⚠") keep-awake unit: \(wlActive)")
                 if wlActive != "active" {
                     print("    → sudo systemctl restart \(AgentServiceSupport.wakelockUnitName)")
-                    print("    (gone after an OTA update? Reinstall with: ada service install)")
+                    print("    (gone after an OTA update? Reinstall with: briglia service install)")
                 }
             } else {
                 print("  ⚠ keep-awake unit: not installed — the phone suspends on screen-off.")
-                print("    → ada service install")
+                print("    → briglia service install")
             }
         }
         if active != "active" {
@@ -419,7 +420,7 @@ struct ServiceStatus: AsyncParsableCommand {
 struct ServiceUninstall: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "uninstall",
-        abstract: "Stop and remove the Ada service (keeps Ada itself and its data)."
+        abstract: "Stop and remove the Briglia service (keeps Briglia itself and its data)."
     )
 
     func run() async throws {
@@ -433,9 +434,9 @@ struct ServiceUninstall: AsyncParsableCommand {
                 "systemctl", ["--user", "disable", "--now", AgentServiceSupport.userUnitName])
             try? FileManager.default.removeItem(atPath: unitPath)
             _ = AgentServiceSupport.run("systemctl", ["--user", "daemon-reload"])
-            print("✔ Ada service removed (linger left as-is; disable with: loginctl disable-linger \(NSUserName()))")
+            print("✔ Briglia service removed (linger left as-is; disable with: loginctl disable-linger \(NSUserName()))")
         } else {
-            print("Ada service: not installed — nothing to remove.")
+            print("Briglia service: not installed — nothing to remove.")
         }
         if AgentServiceSupport.wakelockUnitInstalled(),
            WizardIO.askYesNo("Also remove the keep-awake unit (asks for sudo, remounts / briefly)?",
@@ -498,8 +499,8 @@ struct ServiceSelftest: AsyncParsableCommand {
               wl.contains("ConditionPathExists=/sys/power/wake_lock")
               && wl.contains("ConditionPathExists=/sys/power/wake_unlock"))
         check("wakelock unit: acquires on start, releases on stop",
-              wl.contains("ExecStart=/bin/sh -c 'printf \"%s\\n\" ada-keepawake > /sys/power/wake_lock'")
-              && wl.contains("ExecStop=/bin/sh -c 'printf \"%s\\n\" ada-keepawake > /sys/power/wake_unlock'"))
+              wl.contains("ExecStart=/bin/sh -c 'printf \"%s\\n\" briglia-keepawake > /sys/power/wake_lock'")
+              && wl.contains("ExecStop=/bin/sh -c 'printf \"%s\\n\" briglia-keepawake > /sys/power/wake_unlock'"))
         check("wakelock unit: oneshot + RemainAfterExit + multi-user.target",
               wl.contains("Type=oneshot") && wl.contains("RemainAfterExit=yes")
               && wl.contains("WantedBy=multi-user.target"))

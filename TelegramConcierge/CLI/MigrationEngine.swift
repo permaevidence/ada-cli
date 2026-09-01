@@ -582,12 +582,12 @@ final class MigrationEngine {
     // ----------------------------------------------------- crash seams
 
     /// Fault-injection seam for durability tests (same pattern as
-    /// ADA_TOOLCHAIN_FAULT): "prefs-sync" | "fsync=<exact path>". The fsync
+    /// BRIGLIA_TOOLCHAIN_FAULT): "prefs-sync" | "fsync=<exact path>". The fsync
     /// fault fires INSIDE `fsyncPath`, before the real fsync(2) is issued —
     /// a fault injected after a real barrier already succeeded would prove
     /// nothing about the failure path (Codex Stage 3 round 3 #2).
     static var faultPoint: String? {
-        ProcessInfo.processInfo.environment["ADA_MIGRATE_FAULT"]
+        ProcessInfo.processInfo.environment["BRIGLIA_MIGRATE_FAULT"]
     }
 
     static var fsyncFaultPath: String? {
@@ -599,7 +599,7 @@ final class MigrationEngine {
     /// cleanup) at named points after every destructive sub-step, driven by
     /// the selftest through subprocess runs.
     static func crashPoint(_ name: String) {
-        if ProcessInfo.processInfo.environment["ADA_MIGRATE_CRASH_POINT"] == name {
+        if ProcessInfo.processInfo.environment["BRIGLIA_MIGRATE_CRASH_POINT"] == name {
             FileHandle.standardError.write(Data("injected crash at \(name)\n".utf8))
             _exit(137)
         }
@@ -2554,7 +2554,7 @@ final class MigrationEngine {
 // MARK: - Hidden runner (Stage 3 test harness)
 //
 // Runs the engine against a spec FILE in a separate process, which is what
-// makes the selftest's crash injection real: ADA_MIGRATE_CRASH_POINT kills
+// makes the selftest's crash injection real: BRIGLIA_MIGRATE_CRASH_POINT kills
 // this process with _exit — no defers, no cleanup — and recovery then runs
 // as a genuinely fresh process against whatever the journal says. Stage 4
 // wires the real user-facing `migrate` command; nothing user-facing changes

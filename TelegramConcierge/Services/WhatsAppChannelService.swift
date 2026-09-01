@@ -351,7 +351,7 @@ final class WhatsAppChannelService: ObservableObject {
         proc.standardError = out
         proc.standardInput = FileHandle.nullDevice
 
-        let outputQueue = DispatchQueue(label: "ada.whatsapp.npm-output")
+        let outputQueue = DispatchQueue(label: "com.permaevidence.briglia.whatsapp.npm-output")
         var outputTail = ""
         out.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData

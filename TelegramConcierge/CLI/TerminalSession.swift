@@ -51,10 +51,10 @@ final class TerminalSession {
         // missing pairing is a loud warning instead of a refusal.
         let telegramConfigured = TelegramConfig.isConfigured
         if !telegramConfigured {
-            print("⚠ Telegram is not configured — the daemon will listen only on the companion-app socket. Run `ada setup` to add Telegram.")
+            print("⚠ Telegram is not configured — the daemon will listen only on the companion-app socket. Run `briglia setup` to add Telegram.")
         }
         try await start(headless: true)
-        print("Ada daemon running — listening on \(telegramConfigured ? "Telegram and the app socket" : "the app socket"). Ctrl-C to stop.")
+        print("Briglia daemon running — listening on \(telegramConfigured ? "Telegram and the app socket" : "the app socket"). Ctrl-C to stop.")
         while true {
             try await Task.sleep(nanoseconds: 3_600_000_000_000)
         }
@@ -78,7 +78,7 @@ final class TerminalSession {
         await manager.startPolling()
         if let error = manager.error {
             print("✖ \(error)")
-            print("  Run `ada setup` to configure Ada, then try again.")
+            print("  Run `briglia setup` to configure Briglia, then try again.")
             throw ExitCode(1)
         }
 
@@ -96,10 +96,10 @@ final class TerminalSession {
         if let marker = UpgradeService.consumeRestartMarker() {
             switch marker.kind {
             case .upgrade:
-                print("✔ Update \(marker.version) installed — Ada restarted.")
+                print("✔ Update \(marker.version) installed — Briglia restarted.")
                 await manager.announceUpgradeCompletion(version: marker.version)
             case .restart:
-                print("✔ Ada restarted.")
+                print("✔ Briglia restarted.")
                 await manager.announceRestartCompletion()
             }
         }
@@ -108,7 +108,7 @@ final class TerminalSession {
     private func printWelcome() {
         let name = KeychainHelper.load(key: KeychainHelper.userNameKey)
         let greeting = name.flatMap { $0.isEmpty ? nil : "Hi \($0)! " } ?? ""
-        print("Ada CLI \(adaCLIVersion)")
+        print("Briglia CLI \(adaCLIVersion)")
         print("\(greeting)Type a message and press Enter. Commands: /stop /status /prune /attach <path> [text] /help /quit")
         prompt()
     }
@@ -225,7 +225,7 @@ final class TerminalSession {
         case .assistant:
             let text = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
-                print("\nAda ▸ \(text)")
+                print("\nBriglia ▸ \(text)")
             }
             renderAttachments(of: message)
         case .user:

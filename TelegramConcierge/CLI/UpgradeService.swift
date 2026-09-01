@@ -13,7 +13,7 @@ import Glibc
 import Darwin
 #endif
 
-/// Core of the self-update flow, shared by the `ada upgrade` terminal command
+/// Core of the self-update flow, shared by the `briglia upgrade` terminal command
 /// and the `/upgrade` chat command: manifest check against the release CDN,
 /// checksum-verified download, in-place binary + resource-bundle swap, and —
 /// for the chat path — self-restart via execv with a marker file so the
@@ -33,7 +33,7 @@ enum UpgradeService {
     /// any env-controlling attacker already can). Needed by the staging
     /// pipeline and the publisher tests.
     static var envelopeURL: String {
-        ProcessInfo.processInfo.environment["ADA_ENVELOPE_URL"] ?? defaultEnvelopeURL
+        ProcessInfo.processInfo.environment["BRIGLIA_ENVELOPE_URL"] ?? defaultEnvelopeURL
     }
 
 
@@ -206,10 +206,10 @@ enum UpgradeService {
     ) async throws {
         progress("Downloading…")
         let fm = FileManager.default
-        let tmp = fm.temporaryDirectory.appendingPathComponent("ada-upgrade-\(UUID().uuidString)")
+        let tmp = fm.temporaryDirectory.appendingPathComponent("briglia-upgrade-\(UUID().uuidString)")
         try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tmp) }
-        let tarball = tmp.appendingPathComponent("ada.tar.gz")
+        let tarball = tmp.appendingPathComponent("briglia.tar.gz")
 
         guard update.size > 0 else {
             throw UpgradeError(message: "release entry carries no authenticated size — refusing an unbounded download")
@@ -225,10 +225,10 @@ enum UpgradeService {
         try runOrThrow("/usr/bin/tar", ["-xzf", tarball.path, "-C", tmp.path])
 
         let bundleName = BundleCheck.bundleName
-        let newBinary = tmp.appendingPathComponent("ada")
+        let newBinary = tmp.appendingPathComponent("briglia")
         let newBundle = tmp.appendingPathComponent(bundleName)
         guard fm.fileExists(atPath: newBinary.path), fm.fileExists(atPath: newBundle.path) else {
-            throw UpgradeError(message: "unexpected tarball layout — expected ada + \(bundleName)")
+            throw UpgradeError(message: "unexpected tarball layout — expected briglia + \(bundleName)")
         }
 
         // Validate the unpacked build BEFORE touching the installation:
@@ -258,9 +258,9 @@ enum UpgradeService {
     }
 
     /// Deterministic fault injection for the smoke tests — throws at a named
-    /// point when ADA_UPGRADE_FAULT matches it. Inert in normal operation.
+    /// point when BRIGLIA_UPGRADE_FAULT matches it. Inert in normal operation.
     private static func injectedFault(_ point: String) throws {
-        if ProcessInfo.processInfo.environment["ADA_UPGRADE_FAULT"] == point {
+        if ProcessInfo.processInfo.environment["BRIGLIA_UPGRADE_FAULT"] == point {
             throw UpgradeError(message: "injected test fault: \(point)")
         }
     }
@@ -277,10 +277,10 @@ enum UpgradeService {
         let dir = executable.deletingLastPathComponent()
         // Stage inside the install dir so every move below is a same-volume
         // rename, not a cross-device copy.
-        let stagedBinary = dir.appendingPathComponent(".ada-upgrade-staged-bin")
-        let stagedBundle = dir.appendingPathComponent(".ada-upgrade-staged-bundle")
-        let oldBinary = dir.appendingPathComponent(".ada-upgrade-old-bin")
-        let oldBundle = dir.appendingPathComponent(".ada-upgrade-old-bundle")
+        let stagedBinary = dir.appendingPathComponent(".briglia-upgrade-staged-bin")
+        let stagedBundle = dir.appendingPathComponent(".briglia-upgrade-staged-bundle")
+        let oldBinary = dir.appendingPathComponent(".briglia-upgrade-old-bin")
+        let oldBundle = dir.appendingPathComponent(".briglia-upgrade-old-bundle")
         for leftover in [stagedBinary, stagedBundle, oldBinary, oldBundle] {
             try? fm.removeItem(at: leftover)
         }
@@ -353,10 +353,10 @@ enum UpgradeService {
         }
         let fm = FileManager.default
         let dir = executable.deletingLastPathComponent()
-        let stagedBinary = dir.appendingPathComponent(".ada-upgrade-staged-bin")
-        let stagedBundle = dir.appendingPathComponent(".ada-upgrade-staged-bundle")
-        let oldBinary = dir.appendingPathComponent(".ada-upgrade-old-bin")
-        let oldBundle = dir.appendingPathComponent(".ada-upgrade-old-bundle")
+        let stagedBinary = dir.appendingPathComponent(".briglia-upgrade-staged-bin")
+        let stagedBundle = dir.appendingPathComponent(".briglia-upgrade-staged-bundle")
+        let oldBinary = dir.appendingPathComponent(".briglia-upgrade-old-bin")
+        let oldBundle = dir.appendingPathComponent(".briglia-upgrade-old-bundle")
         try sudo(["rm", "-rf", stagedBinary.path, stagedBundle.path,
                                          oldBinary.path, oldBundle.path])
 
@@ -473,7 +473,7 @@ enum UpgradeService {
     /// (TerminalHandoff) so it can prompt — required for every sudo call:
     /// Foundation spawns children into a background process group, and a
     /// background sudo reading the tty for a password is SIGTTIN-stopped
-    /// forever. Only the standalone `ada upgrade` command reaches the sudo
+    /// forever. Only the standalone `briglia upgrade` command reaches the sudo
     /// path, so no REPL thread is reading stdin concurrently. Non-prompting
     /// children (tar, bundle-check) stay on the plain spawn: the in-chat
     /// upgrade path runs those while the REPL reader owns stdin.

@@ -8,7 +8,7 @@ import Foundation
 /// (in the tools array every turn) or **deferred** (discoverable on-demand
 /// via `tool_search` + `mcp_call`).
 ///
-/// The routing file lives at `~/.config/ada/mcp-routing.json`:
+/// The routing file lives at `~/.config/briglia/mcp-routing.json`:
 ///
 /// ```json
 /// {

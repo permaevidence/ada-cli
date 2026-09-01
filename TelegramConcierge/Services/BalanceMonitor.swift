@@ -17,7 +17,7 @@ import FoundationNetworking
 ///   • Serper.dev — search credits (`GET /account` → `balance`).
 ///   • Jina.ai    — reader token balance (undocumented dashboard endpoint).
 ///
-/// The other paid services Ada can use have NO pollable balance API and are
+/// The other paid services Briglia can use have NO pollable balance API and are
 /// deliberately not covered here:
 ///   • OpenCode / Zen (the main LLM) — no endpoint (open feature request);
 ///     protect it with the account's AUTO-RELOAD instead, which is strictly
@@ -246,7 +246,7 @@ actor BalanceMonitor {
         switch metric {
         case .openRouterAccount:
             return "⚠️ OpenRouter credit running low: \(usd(remaining)) left (threshold \(usd(threshold))). "
-                + "Ada uses OpenRouter for OCR only when it is the selected OCR backend. "
+                + "Briglia uses OpenRouter for OCR only when it is the selected OCR backend. "
                 + "Top up at openrouter.ai to avoid interruptions."
         case .openRouterKeyLimit:
             return "⚠️ OpenRouter key spend limit almost reached: \(usd(remaining)) left (threshold \(usd(threshold))). "

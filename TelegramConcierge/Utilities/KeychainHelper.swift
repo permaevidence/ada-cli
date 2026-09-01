@@ -61,7 +61,7 @@ enum VoiceTranscriptionProvider: String, CaseIterable, Identifiable {
         }
     }
 
-    // Ada CLI is cloud-only: the WhisperKit shim never reports a ready model,
+    // Briglia CLI is cloud-only: the WhisperKit shim never reports a ready model,
     // so .local would break every voice message. Default to OpenAI and
     // normalize any stored "local" (older/incomplete installs, imported
     // Ada.app state) at the single read choke point.
@@ -84,11 +84,11 @@ enum KeychainHelper {
         case unexpectedStatus(Int32)
     }
     
-    // File-backed secret store. Ada CLI deliberately does NOT use the macOS
+    // File-backed secret store. Briglia CLI deliberately does NOT use the macOS
     // Keychain: a from-source CLI gets a new ad-hoc code identity on every
     // rebuild, so the Keychain would pop an authorization dialog for every
     // stored item after every update — and block forever in headless runs.
-    // Secrets live in ~/.config/ada/secrets.json with 0600 permissions, the
+    // Secrets live in ~/.config/briglia/secrets.json with 0600 permissions, the
     // same mechanism Phase 2 uses on Linux. The KeychainHelper name and the
     // save/load/delete surface are kept so the ported Ada.app services are
     // untouched.
@@ -100,7 +100,7 @@ enum KeychainHelper {
 
     // The cache mirrors ONE specific on-disk state, identified by
     // inode + mtime(ns) + size. secrets.json has more than one writer — the
-    // daemon plus every short-lived `ada setup-api`/wizard process — and a
+    // daemon plus every short-lived `briglia setup-api`/wizard process — and a
     // per-process forever-cache silently reverted the other writer's keys on
     // the next save (field incident 2026-08-29: keys saved from the UT app
     // were at risk of dying with the daemon's next persona write, and the
@@ -129,6 +129,17 @@ enum KeychainHelper {
         try mutate { $0.removeValue(forKey: key) }
     }
 
+    /// Read-only health check used by the identity-migration probe: nil
+    /// when the store is absent or decodes; otherwise the strict reader's
+    /// diagnosis. Never writes, never caches.
+    static func storeReadProblem() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        do { _ = try readDiskStrict(); return nil } catch {
+            return (error as? StoreDamagedError)?.message ?? error.localizedDescription
+        }
+    }
+
     /// Apply several writes (nil value = delete) as ONE atomic file write.
     /// Multi-key state transitions (provider-profile activation) use this so
     /// a mid-sequence failure can't leave half the keys switched — the store
@@ -148,7 +159,12 @@ enum KeychainHelper {
     private static func mutate(_ change: (inout [String: String]) -> Void) throws {
         lock.lock()
         defer { lock.unlock() }
-        // Serialize against every OTHER Ada process before deciding what the
+        // Writes materialize the config root; reads never do (StoragePaths:
+        // diagnostics must not create empty new roots that mask the
+        // identity-migration detection).
+        try? FileManager.default.createDirectory(
+            at: StoragePaths.configRoot, withIntermediateDirectories: true)
+        // Serialize against every OTHER Briglia process before deciding what the
         // store contains. Held across read-modify-write so two concurrent
         // writers can't both start from the same base and last-writer-wins.
         let fd = open(lockURL.path, O_CREAT | O_WRONLY, 0o600)
@@ -173,7 +189,7 @@ enum KeychainHelper {
         let data = try encoder.encode(store)
         // Disk write FIRST, cache second: if the write throws (read-only
         // config dir, full disk), in-memory reads must not pretend the value
-        // was saved — that made `ada setup` look successful and break only
+        // was saved — that made `briglia setup` look successful and break only
         // after restart.
         try data.write(to: storeURL, options: .atomic)
         cache = store
@@ -281,7 +297,7 @@ extension KeychainHelper {
     // Google Workspace (Gmail / Calendar / Contacts / Drive) is reached through
     // the `gws` CLI — auth tokens live in gws's own keyring, not here. The
     // former imap/smtp/gmail-OAuth keys were removed as part of that migration.
-    // The user-provided OAuth client (Ada no longer ships one embedded) is
+    // The user-provided OAuth client (Briglia no longer ships one embedded) is
     // stored here so the wizard can rewrite ~/.config/gws/client_secret.json
     // if it's ever deleted.
     static let gwsOAuthClientIDKey = "gws_oauth_client_id"
@@ -384,7 +400,7 @@ extension KeychainHelper {
 /// - `label`: the user-friendly name they typed ("Vercel Token", "Supabase", …).
 /// - `name`:  normalized internal key derived from label at creation time
 ///            ("VERCEL_TOKEN", "SUPABASE"). Used for Keychain storage and fallback
-///            global env vars (`ADA_KEY_VERCEL_TOKEN`).
+///            global env vars (`BRIGLIA_KEY_VERCEL_TOKEN`).
 /// - `description`: optional extra context.
 struct ServiceKey: Identifiable, Equatable, Codable {
     var id: String { name }
@@ -419,7 +435,7 @@ struct ServiceKey: Identifiable, Equatable, Codable {
 }
 
 extension KeychainHelper {
-    static let serviceKeyEnvironmentPrefix = "ADA_KEY_"
+    static let serviceKeyEnvironmentPrefix = "BRIGLIA_KEY_"
 
     private static let serviceKeysMetadataDefaultsKey = "ada.service_keys_metadata"
     private static let serviceKeyPrefix = "servicekey_"
@@ -459,7 +475,7 @@ extension KeychainHelper {
     }
 
     /// Returns all service keys as a dictionary:
-    /// `["ADA_KEY_VERCEL_TOKEN": "sk-...", ...]`.
+    /// `["BRIGLIA_KEY_VERCEL_TOKEN": "sk-...", ...]`.
     /// NOT injected into subprocess environments (only per-command
     /// `service_key_env` mappings are) — this seeds the SecretRedactor so
     /// every stored secret gets scrubbed from tool output.

@@ -566,7 +566,7 @@ struct MidturnAnnotationSelftest: AsyncParsableCommand {
 
     private static func locateRepoRoot() -> URL? {
         var candidates: [URL] = []
-        if let env = ProcessInfo.processInfo.environment["ADA_REPO_ROOT"] {
+        if let env = ProcessInfo.processInfo.environment["BRIGLIA_REPO_ROOT"] {
             candidates.append(URL(fileURLWithPath: env))
         }
         candidates.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath))

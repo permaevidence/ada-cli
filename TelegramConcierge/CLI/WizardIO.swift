@@ -15,7 +15,7 @@ enum WizardIO {
     /// nil reads. Finished steps are already persisted, so stop cleanly.
     private static func readLineOrExit() -> String {
         guard let line = readLine(strippingNewline: true) else {
-            print("\nInput closed — stopping here. Finished steps stay saved; run `ada setup` to continue.")
+            print("\nInput closed — stopping here. Finished steps stay saved; run `briglia setup` to continue.")
             Foundation.exit(1)
         }
         return line
@@ -109,7 +109,7 @@ enum WizardIO {
         tcsetattr(fileno(stdin), TCSAFLUSH, &original)
         print("")  // the suppressed newline
         guard let line else {
-            print("\nInput closed — stopping here. Finished steps stay saved; run `ada setup` to continue.")
+            print("\nInput closed — stopping here. Finished steps stay saved; run `briglia setup` to continue.")
             Foundation.exit(1)
         }
         return line

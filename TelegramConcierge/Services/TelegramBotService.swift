@@ -10,7 +10,7 @@ import Crypto
 
 actor TelegramBotService {
     /// Overridable for hermetic poller tests (a mock Bot API server).
-    private let baseURL = ProcessInfo.processInfo.environment["ADA_TELEGRAM_API_BASE"]
+    private let baseURL = ProcessInfo.processInfo.environment["BRIGLIA_TELEGRAM_API_BASE"]
         ?? "https://api.telegram.org/bot"
     private var botToken: String = ""
 
@@ -67,7 +67,7 @@ actor TelegramBotService {
     }
 
     private static let resetWindowSeconds: TimeInterval = {
-        if let raw = ProcessInfo.processInfo.environment["ADA_TELEGRAM_RESET_WINDOW_SECONDS"],
+        if let raw = ProcessInfo.processInfo.environment["BRIGLIA_TELEGRAM_RESET_WINDOW_SECONDS"],
            let value = TimeInterval(raw), value > 0 {
             return value  // test hook — production uses the documented week
         }

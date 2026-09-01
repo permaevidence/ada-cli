@@ -9,7 +9,7 @@ import Foundation
 /// `/upgrade` chat command.
 struct Upgrade: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Update Ada CLI to the latest published release.",
+        abstract: "Update Briglia CLI to the latest published release.",
         aliases: ["update"]
     )
 
@@ -17,11 +17,12 @@ struct Upgrade: AsyncParsableCommand {
     var yes = false
 
     func run() async throws {
+        try IdentityMigration.gateMutatingEntry()
         print("Checking for updates…")
         let update: UpgradeService.Update
         switch await UpgradeService.check(warn: { print($0) }) {
         case .rollbackRefused(let live, let floor):
-            print("✖ The release channel serves signed metadata with sequence \(live), BELOW this install's trusted floor \(floor). This can be a stale mirror — or a rollback attack. Refusing; if it persists, check https://github.com/permaevidence/ada-cli/releases directly.")
+            print("✖ The release channel serves signed metadata with sequence \(live), BELOW this install's trusted floor \(floor). This can be a stale mirror — or a rollback attack. Refusing; if it persists, check https://github.com/permaevidence/briglia-cli/releases directly.")
             throw ExitCode(1)
         case .unsupportedPlatform:
             print("✖ No prebuilt releases exist for this platform.")
@@ -61,6 +62,6 @@ struct Upgrade: AsyncParsableCommand {
             print("✖ \(error.localizedDescription)")
             throw ExitCode(1)
         }
-        print("✔ Ada CLI updated to \(update.version).")
+        print("✔ Briglia CLI updated to \(update.version).")
     }
 }

@@ -22,7 +22,7 @@ actor MindExportService {
     }()
 
     /// User-editable configuration (skills, agents, MCP config): kept in
-    /// ~/.config/ada so it is easy for users to inspect and share.
+    /// ~/.config/briglia so it is easy for users to inspect and share.
     /// Root of the subagent-session store. Was StoragePaths.configRoot by
     /// mistake until 2026-08-20 (Codex round 3): SubagentSessionRegistry
     /// persists under DATA root, so exports silently included no sessions
@@ -435,7 +435,7 @@ enum MindExportError: LocalizedError {
         case .unzipFailed(let message):
             return "Failed to extract archive: \(message)"
         case .notAMindBackup:
-            return "The selected file is not an Ada memory backup (mind_config.json missing). No data was changed."
+            return "The selected file is not an Briglia memory backup (mind_config.json missing). No data was changed."
         case .toolMissing(let name):
             return "`\(name)` is not installed on this machine — install it (Linux: `sudo apt install zip unzip`) and retry. No data was changed."
         }

@@ -27,9 +27,9 @@ enum ChatCommandRegistry {
     static let commands: [ChatCommand] = [
         ChatCommand(name: "stop", description: "Stop the current work immediately",
                     usage: nil, inMenu: true, category: "Control"),
-        ChatCommand(name: "status", description: "Show what Ada is doing right now",
+        ChatCommand(name: "status", description: "Show what Briglia is doing right now",
                     usage: nil, inMenu: true, category: "Control"),
-        ChatCommand(name: "prune", description: "Free up Ada's working memory",
+        ChatCommand(name: "prune", description: "Free up Briglia's working memory",
                     usage: nil, inMenu: true, category: "Control"),
         ChatCommand(name: "continue", description: "Show the rest of a long reply",
                     usage: nil, inMenu: false, category: "Control"),
@@ -45,11 +45,11 @@ enum ChatCommandRegistry {
                     usage: nil, inMenu: false, category: "Models"),
         ChatCommand(name: "subagents", description: "Turn the Agent delegation tools on or off",
                     usage: "[on|off]", inMenu: false, category: "Models"),
-        ChatCommand(name: "upgrade", description: "Update Ada to the latest release",
+        ChatCommand(name: "upgrade", description: "Update Briglia to the latest release",
                     usage: nil, inMenu: true, category: "System"),
-        ChatCommand(name: "restart", description: "Restart Ada (reloads mcp.json and skills)",
+        ChatCommand(name: "restart", description: "Restart Briglia (reloads mcp.json and skills)",
                     usage: nil, inMenu: false, category: "System"),
-        ChatCommand(name: "commands", description: "List standard Ada commands",
+        ChatCommand(name: "commands", description: "List standard Briglia commands",
                     usage: nil, inMenu: true, category: "System"),
         ChatCommand(name: "setname", description: "Set or change your name (asks for confirmation)",
                     usage: "[name]", inMenu: false, category: "Account"),
@@ -61,7 +61,7 @@ enum ChatCommandRegistry {
                     usage: "[path]", inMenu: false, category: "Account"),
         ChatCommand(name: "resumewatcher", description: "Review and re-arm watchers quarantined by a memory import",
                     usage: "[id]", inMenu: false, category: "Account"),
-        ChatCommand(name: "switchbot", description: "Move Ada to a different Telegram bot (guided, asks for confirmation)",
+        ChatCommand(name: "switchbot", description: "Move Briglia to a different Telegram bot (guided, asks for confirmation)",
                     usage: "[token]", inMenu: false, category: "Account"),
     ]
 
@@ -73,7 +73,7 @@ enum ChatCommandRegistry {
 
     /// Body of the /commands reply: every public command, grouped.
     static func commandsListText() -> String {
-        var lines = ["Ada commands:"]
+        var lines = ["Briglia commands:"]
         for category in categories {
             let members = commands.filter { $0.category == category }
             guard !members.isEmpty else { continue }

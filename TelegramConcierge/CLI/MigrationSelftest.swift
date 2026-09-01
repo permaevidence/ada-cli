@@ -674,7 +674,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         do {
             // Produce a real mid-flight journal via an injected crash.
             let fixture = try makeFixture("corrupt", units: false)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "between-root-moves"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "between-root-moves"])
             check("corruption fixture: crash injected", crashed.code == 137, crashed.output)
             let journalPath = fixture.stateDir + "/journal.json"
             let original = readText(journalPath)
@@ -761,7 +761,7 @@ struct MigrationSelftest: AsyncParsableCommand {
 
         do {
             let fixture = try makeFixture("doctor", units: false)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-moved"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-moved"])
             check("doctor fixture: crash injected", crashed.code == 137)
             let before = snapshot([fixture.root])
             let doctor = runEngine(fixture, args: ["--doctor"])
@@ -788,7 +788,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         for point in forwardPoints {
             let fixture = try makeFixture("fwd-\(point)", wakelock: true)
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": point])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": point])
             check("crash@\(point): child died at the injected point",
                   crashed.code == 137, "exit \(crashed.code): \(crashed.output)")
             let recovered = runEngine(fixture)
@@ -819,7 +819,7 @@ struct MigrationSelftest: AsyncParsableCommand {
                 }
             }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": point])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": point])
             check("rollback@\(point): child died at the injected point", crashed.code == 137)
             let rolled = runEngine(fixture, args: ["--rollback"])
             check("rollback@\(point): rollback recovery succeeds", rolled.code == 0,
@@ -895,7 +895,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             UserDefaults.standard.setPersistentDomain(seededPrefs, forName: oldDomain)
             UserDefaults.standard.synchronize()
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-binary-park"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-binary-park"])
             check("park-restore: crash injected after binary parking", crashed.code == 137)
             // Make forward completion impossible: destroy the new binary.
             try fm.removeItem(atPath: fixture.newBinary)
@@ -925,7 +925,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         do {
             let fixture = try makeFixture("park-corrupt")
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-binary-park"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-binary-park"])
             check("park-corrupt: crash injected", crashed.code == 137)
             try fm.removeItem(atPath: fixture.newBinary)
             // Corrupt the parked binary: rollback must be refused, everything held.
@@ -946,7 +946,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         do {
             let fixture = try makeFixture("verify-hold")
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-committed"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-committed"])
             check("verify-hold: crash injected after the committed marker", crashed.code == 137)
             // Break verification: the moved data root disappears.
             try fm.moveItem(atPath: fixture.newData, toPath: fixture.root + "/hidden-data")
@@ -966,7 +966,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("rollback-past-commit")
             defer { killHolders(fixture) }
             let crashed = runEngine(fixture,
-                                    env: ["ADA_MIGRATE_CRASH_POINT": "after-committing-marker"])
+                                    env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-committing-marker"])
             check("past-commit: crash injected at the committing marker", crashed.code == 137)
             let refused = runEngine(fixture, args: ["--rollback"])
             check("past-commit: explicit rollback is refused at ≥ committing",
@@ -983,7 +983,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         do {
             let fixture = try makeFixture("symlink-binary", binaryIsSymlink: true)
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-binary-park"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-binary-park"])
             check("symlink binary: crash injected after parking", crashed.code == 137)
             try fm.removeItem(atPath: fixture.newBinary)
             let result = runEngine(fixture)
@@ -1000,7 +1000,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("foreign-binary")
             defer { killHolders(fixture) }
             let crashed = runEngine(fixture,
-                                    env: ["ADA_MIGRATE_CRASH_POINT": "after-committing-marker"])
+                                    env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-committing-marker"])
             check("foreign binary: crash injected before binary parking", crashed.code == 137)
             // Someone replaces the binary between the crash and recovery.
             try writeScript(fixture.oldBinary, "#!/bin/sh\necho impostor\n")
@@ -1043,7 +1043,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("rollback-honesty")
             defer { killHolders(fixture) }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-fixups"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-fixups"])
             check("rollback-honesty: crash injected", crashed.code == 137)
             let failed = runEngine(fixture, args: ["--rollback"],
                                    env: ["FAKE_SYSTEMCTL_FAIL_START": "1"])
@@ -1176,12 +1176,12 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("rollback-fsync-fault")
             defer { killHolders(fixture) }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-moved"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-moved"])
             check("rollback-fsync-fault: crash injected", crashed.code == 137)
             // The fault fires INSIDE fsyncPath for the roots' parent
             // directory — before any real barrier is issued (round 3 #2).
             let faulted = runEngine(fixture, args: ["--rollback"],
-                                    env: ["ADA_MIGRATE_FAULT": "fsync=" + fixture.root + "/xdg-config"])
+                                    env: ["BRIGLIA_MIGRATE_FAULT": "fsync=" + fixture.root + "/xdg-config"])
             check("rollback-fsync-fault: real fsync failure surfaces, journal kept",
                   faulted.code == 1 && faulted.output.contains("not durable")
                   && faulted.output.contains("injected fault")
@@ -1207,7 +1207,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             UserDefaults.standard.setPersistentDomain(seededPrefs, forName: oldDomain)
             UserDefaults.standard.synchronize()
             let before = snapshot(fixture.restoreRoots)
-            let result = runEngine(fixture, env: ["ADA_MIGRATE_FAULT": "prefs-sync"])
+            let result = runEngine(fixture, env: ["BRIGLIA_MIGRATE_FAULT": "prefs-sync"])
             check("prefs-sync fault: fixup failure rolls back automatically",
                   result.code == 1 && result.output.contains("persisted"), result.output)
             check("prefs-sync fault: byte-identical restore, old domain intact, new domain gone",
@@ -1221,7 +1221,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             // silently suppressed.
             let fixture = try makeFixture("cleanup-retry")
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-committed"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-committed"])
             check("cleanup-retry: crash injected after committed", crashed.code == 137,
                   crashed.output)
             let parkedPath = fixture.stateDir + "/parked"
@@ -1289,7 +1289,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("preimage-corrupt")
             defer { killHolders(fixture) }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-fixups"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-fixups"])
             check("preimage-corrupt: crash injected after fixups", crashed.code == 137,
                   crashed.output)
             guard let pre = firstFilePreimage(fixture) else {
@@ -1334,7 +1334,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             // before the parked assets move or any unit is touched.
             let fixture = try makeFixture("park-preimage-corrupt")
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-binary-park"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-binary-park"])
             check("park-preimage-corrupt: crash injected after binary parking",
                   crashed.code == 137, crashed.output)
             try fm.removeItem(atPath: fixture.newBinary)
@@ -1365,11 +1365,11 @@ struct MigrationSelftest: AsyncParsableCommand {
             // fsync failure there must surface (with the journal kept).
             let fixture = try makeFixture("reconcile-move-fsync")
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-root-rename"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-root-rename"])
             check("reconcile-move-fsync: crash injected between rename and barrier",
                   crashed.code == 137, crashed.output)
             let parent = firstMovedParent(fixture) ?? "?"
-            let faulted = runEngine(fixture, env: ["ADA_MIGRATE_FAULT": "fsync=" + parent])
+            let faulted = runEngine(fixture, env: ["BRIGLIA_MIGRATE_FAULT": "fsync=" + parent])
             check("reconcile-move-fsync: the repeated barrier's failure surfaces honestly",
                   faulted.code == 1 && faulted.output.contains("found already done")
                   && faulted.output.contains("not durable"), faulted.output)
@@ -1388,15 +1388,15 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("reconcile-rollback-fsync")
             defer { killHolders(fixture) }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-moved"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-moved"])
             check("reconcile-rollback-fsync: crash injected after moved", crashed.code == 137)
             let crashedBack = runEngine(fixture, args: ["--rollback"],
-                                        env: ["ADA_MIGRATE_CRASH_POINT": "after-rollback-rename"])
+                                        env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-rollback-rename"])
             check("reconcile-rollback-fsync: rollback crashed between rename-back and barrier",
                   crashedBack.code == 137, crashedBack.output)
             let parent = firstBackParent(fixture) ?? "?"
             let faulted = runEngine(fixture, args: ["--rollback"],
-                                    env: ["ADA_MIGRATE_FAULT": "fsync=" + parent])
+                                    env: ["BRIGLIA_MIGRATE_FAULT": "fsync=" + parent])
             check("reconcile-rollback-fsync: repeated barrier failure surfaces, journal kept",
                   faulted.code == 1 && faulted.output.contains("already back")
                   && faulted.output.contains("not durable")
@@ -1416,12 +1416,12 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("park-restore-fsync")
             defer { killHolders(fixture) }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-symlink"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-symlink"])
             check("park-restore-fsync: crash injected after the compat symlink",
                   crashed.code == 137, crashed.output)
             try fm.removeItem(atPath: fixture.newBinary)
             let faulted = runEngine(fixture,
-                                    env: ["ADA_MIGRATE_FAULT": "fsync=" + fixture.stateDir + "/parked"])
+                                    env: ["BRIGLIA_MIGRATE_FAULT": "fsync=" + fixture.stateDir + "/parked"])
             check("park-restore-fsync: parked/ barrier failure surfaces, journal kept",
                   faulted.code == 1 && faulted.output.contains("not durable")
                   && faulted.output.contains("/parked")
@@ -1488,14 +1488,14 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("restored-corrupt")
             defer { killHolders(fixture) }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-symlink"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-symlink"])
             check("restored-corrupt: crash injected after the compat symlink",
                   crashed.code == 137, crashed.output)
             try fm.removeItem(atPath: fixture.newBinary)
             // Interrupt the park-restoring rollback after its FIRST asset is
             // back at its original path (the parked/ barrier fault).
             let interrupted = runEngine(fixture,
-                                        env: ["ADA_MIGRATE_FAULT": "fsync=" + fixture.stateDir + "/parked"])
+                                        env: ["BRIGLIA_MIGRATE_FAULT": "fsync=" + fixture.stateDir + "/parked"])
             check("restored-corrupt: first restore attempt interrupted after one asset",
                   interrupted.code == 1 && interrupted.output.contains("not durable"),
                   interrupted.output)
@@ -1550,7 +1550,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("dual-copies")
             defer { killHolders(fixture) }
             let before = snapshot(fixture.restoreRoots)
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-binary-park"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-binary-park"])
             check("dual-copies: crash injected after binary parking", crashed.code == 137,
                   crashed.output)
             try fm.removeItem(atPath: fixture.newBinary)
@@ -1580,7 +1580,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             // binary path is refused like any other foreign object.
             let fixture = try makeFixture("dual-foreign-symlink")
             defer { killHolders(fixture) }
-            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-symlink"])
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-symlink"])
             check("dual-foreign-symlink: crash injected after the compat symlink",
                   crashed.code == 137, crashed.output)
             try fm.removeItem(atPath: fixture.newBinary)
@@ -1653,6 +1653,339 @@ struct MigrationSelftest: AsyncParsableCommand {
                 }
                 check("diagnostic `\(args.joined(separator: " "))`: no file writes, no deletions",
                       diffs.isEmpty, diffs.prefix(5).joined(separator: "; "))
+            }
+        }
+
+        // ============================================================
+        // Stage 4 (RENAME_PLAN §4.1/§4.2/§4.4/§4.5/§4.6): the PRODUCTION
+        // wiring — this very binary, its real StoragePaths/IdentityMigration
+        // spec, the user-facing `migrate` command and the setup-api verb —
+        // against a redirected fixture home. Everything above exercised the
+        // engine through a synthetic spec; this proves the spec the shipped
+        // command actually builds.
+        print("\n— Stage 4: production identity wiring (§4.1/§4.2/§4.4/§4.5/§4.6) —")
+        do {
+            let s4 = tempRoot.appendingPathComponent("stage4").path
+            let home = s4 + "/home"
+            let cfg = s4 + "/cfg", data = s4 + "/data", state = s4 + "/state"
+            let bin = home + "/.local/bin"
+            let unitDir = home + "/.config/systemd/user"
+            let sysd = s4 + "/sysd"
+            for dir in [bin, unitDir, sysd, home + "/Documents/AdaCLI/telegram"] {
+                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            }
+            // This build as both the retired `ada` and the new `briglia`,
+            // with the resource bundle beside them (bundle-check needs it).
+            let newBinary = bin + "/briglia", oldBinary = bin + "/ada"
+            try fm.copyItem(atPath: adaBinary, toPath: newBinary)
+            try fm.copyItem(atPath: adaBinary, toPath: oldBinary)
+            let bundleSrc = (adaBinary as NSString).deletingLastPathComponent + "/" + BundleCheck.bundleName
+            if fm.fileExists(atPath: bundleSrc) {
+                try fm.copyItem(atPath: bundleSrc, toPath: bin + "/" + BundleCheck.bundleName)
+            }
+            // The old install: secrets (default persona + a stored token),
+            // a watcher whose row embeds an absolute old-root path, the
+            // agentmail broker wrapper pinned to the old binary, a userdata
+            // toolchain wrapper with the LEGACY marker and old prefix path,
+            // an enabled+active old user unit.
+            try writeFile(cfg + "/ada/secrets.json",
+                          "{\"assistant_name\": \"Ada\", \"telegram_bot_token\": \"tok-keep\"}", mode: 0o600)
+            let watcherId = UUID().uuidString
+            try writeFile(data + "/ada/reminders.json",
+                          "[{\"id\": \"\(watcherId)\", \"scriptPath\": \"\(data)/ada/reminder-scripts/\(watcherId).sh\"}]")
+            try writeScript(data + "/ada/reminder-scripts/\(watcherId).sh", "#!/bin/sh\necho hi\n")
+            try writeFile(data + "/ada/conversation.json", "{\"messages\": []}")
+            try writeScript(bin + "/agentmail-bin", "#!/bin/sh\necho agentmail-bin\n")
+            try writeScript(bin + "/agentmail",
+                            AgentMailService.wrapperScript(adaPath: oldBinary, realBinaryPath: bin + "/agentmail-bin"))
+            try writeScript(bin + "/pdftotext",
+                            "#!/bin/sh\n\(UserdataToolchain.legacyWrapperMarker)\nexec \"\(data)/ada/toolchain/prefix/usr/bin/pdftotext\" \"$@\"\n")
+            try writeFile(unitDir + "/ada.service",
+                          AgentServiceSupport.userUnitText(adaPath: oldBinary, home: home))
+            try writeFile(sysd + "/ada.service.enabled", "")
+            try writeFile(sysd + "/ada.service.active", "")
+            try writeFile(sysd + "/lockholder.py", """
+            import fcntl, os, sys, time
+            f = open(sys.argv[1], "a+")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                sys.exit(1)
+            with open(sys.argv[2], "w") as p:
+                p.write(str(os.getpid()))
+            time.sleep(600)
+            """)
+            // Fake systemctl (state = marker files in sysd; `start` of the
+            // new unit holds the NEW instance.lock like a real daemon so the
+            // engine's post-start lock check is exercised for real).
+            let systemctl = sysd + "/systemctl"
+            try writeScript(systemctl, """
+            #!/bin/sh
+            SD="\(sysd)"
+            echo "$@" >> "$SD/log"
+            if [ "$1" = "--user" ]; then shift; fi
+            verb="$1"; unit="$2"
+            loaded=1
+            if [ -n "$unit" ] && [ ! -f "\(unitDir)/$unit" ]; then loaded=0; fi
+            case "$verb" in
+              daemon-reload) exit 0;;
+              is-enabled) if [ "$loaded" = 0 ]; then echo "Failed to get unit file state for $unit: No such file or directory"; exit 1; fi
+                          if [ -f "$SD/$unit.enabled" ]; then echo enabled; else echo disabled; fi; exit 0;;
+              is-active)  if [ -f "$SD/$unit.active" ]; then echo active; else echo inactive; fi; exit 0;;
+              enable)  if [ "$loaded" = 0 ]; then echo "Unit $unit not loaded."; exit 5; fi; touch "$SD/$unit.enabled"; exit 0;;
+              disable) rm -f "$SD/$unit.enabled"; exit 0;;
+              stop)    rm -f "$SD/$unit.active"
+                       if [ -f "$SD/$unit.pid" ]; then kill "$(cat "$SD/$unit.pid")" 2>/dev/null; rm -f "$SD/$unit.pid"; fi
+                       exit 0;;
+              start)   if [ "$loaded" = 0 ]; then echo "Unit $unit not loaded."; exit 5; fi
+                       touch "$SD/$unit.active"
+                       if [ "$unit" = "briglia.service" ]; then
+                         nohup python3 "$SD/lockholder.py" "\(data)/briglia/instance.lock" "$SD/$unit.pid" >/dev/null 2>&1 &
+                       fi
+                       exit 0;;
+            esac
+            exit 0
+            """)
+            // Throwaway preferences domains (never the machine's real ones).
+            let tag = UUID().uuidString.prefix(8)
+            let oldDomain = "briglia-s4-\(tag)-old", newDomain = "briglia-s4-\(tag)-new"
+            #if os(Linux)
+            // corelibs persists domains under the PROCESS's home
+            // ($HOME/.config/<domain>.plist — resolved concretely above), so
+            // the child running under the fixture home sees a different
+            // store than this process: seed the fixture's store as files,
+            // and read it back through a child (below) — never in-process.
+            let seedPlist = try PropertyListSerialization.data(
+                fromPropertyList: ["s4": "seeded"], format: .xml, options: 0)
+            for dir in [cfg, home + "/.config"] {
+                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                try seedPlist.write(to: URL(fileURLWithPath: dir + "/\(oldDomain).plist"))
+            }
+            #else
+            UserDefaults.standard.setPersistentDomain(["s4": "seeded"], forName: oldDomain)
+            UserDefaults.standard.synchronize()
+            #endif
+            defer {
+                UserDefaults.standard.removePersistentDomain(forName: oldDomain)
+                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                UserDefaults.standard.synchronize()
+                if let pid = Int32((try? String(contentsOfFile: sysd + "/briglia.service.pid", encoding: .utf8)) ?? "") {
+                    kill(pid, SIGTERM)
+                }
+            }
+            let env: [String: String] = [
+                "HOME": home, "XDG_CONFIG_HOME": cfg, "XDG_DATA_HOME": data, "XDG_STATE_HOME": state,
+                "BRIGLIA_TOOLCHAIN_BIN": bin,
+                "BRIGLIA_MIGRATE_SYSTEMCTL": systemctl,
+                "BRIGLIA_MIGRATE_PREFS_DOMAINS": "\(oldDomain):\(newDomain)",
+                "PATH": bin + ":" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"),
+            ]
+            func runNew(_ args: [String], extra: [String: String] = [:]) -> MigrationEngine.RunResult {
+                MigrationEngine.runBounded([newBinary] + args, timeout: 180,
+                                           extraEnv: env.merging(extra) { $1 })
+            }
+            let watched = [cfg, data, state, unitDir, sysd, home + "/Documents"]
+            let binHashBefore = sha(oldBinary) + sha(newBinary)
+
+            // §4.2: diagnostics never migrate, never create the new roots.
+            for args in [["--version"], ["bundle-check"], ["doctor"], ["setup-api", "status"],
+                         ["migrate", "--status"], ["service", "status"], ["toolchain", "status"]] {
+                let before = snapshot(watched)
+                let r = runNew(args)
+                let diffs = snapshotDiff(before, snapshot(watched))
+                check("real identity: diagnostic `\(args.joined(separator: " "))` writes nothing with an old install present",
+                      diffs.isEmpty, diffs.prefix(4).joined(separator: "; ") + " | rc=\(r.exitCode) " + r.tail)
+            }
+            check("real identity: diagnostics materialized no new roots",
+                  !fm.fileExists(atPath: cfg + "/briglia") && !fm.fileExists(atPath: data + "/briglia"))
+            do {
+                let r = runNew(["migrate", "--status"])
+                check("real identity: `migrate --status` reports PENDING",
+                      r.exitCode == 0 && r.output.contains("PENDING") && r.output.contains("briglia migrate"), r.tail)
+                let st = runNew(["setup-api", "status"])
+                if let obj = try? JSONSerialization.jsonObject(with: Data(st.output.utf8)) as? [String: Any],
+                   let migration = obj["migration"] as? [String: Any] {
+                    check("real identity: setup-api status schema 2 + migration.needed",
+                          obj["schema"] as? Int == 2 && migration["needed"] as? Bool == true
+                          && (migration["old_roots_present"] as? [String])?.count == 2
+                          && migration["recovery_command"] as? String == "briglia migrate")
+                } else {
+                    check("real identity: setup-api status is JSON with a migration block", false, st.tail)
+                }
+            }
+
+            // §4.2: every entry point that would write the new roots refuses
+            // with the exact instruction and touches nothing.
+            for args in [["chat"], ["daemon"], ["setup"], ["trigger", UUID().uuidString],
+                         ["upgrade"], ["toolchain", "install"], ["service", "install"]] {
+                let before = snapshot(watched)
+                let r = runNew(args)
+                let diffs = snapshotDiff(before, snapshot(watched))
+                check("real identity: `\(args.joined(separator: " "))` refuses (exit 2) with the migrate instruction, zero writes",
+                      r.exitCode == 2 && r.output.contains("Run `briglia migrate`") && diffs.isEmpty,
+                      "rc=\(r.exitCode) " + r.tail + (diffs.isEmpty ? "" : " diffs: " + diffs.prefix(3).joined(separator: "; ")))
+            }
+            do {
+                let r = MigrationEngine.runBounded(
+                    ["/bin/sh", "-c", "printf '{\"identity\":{\"user_name\":\"x\"}}' | '\(newBinary)' setup-api apply"],
+                    timeout: 60, extraEnv: env)
+                check("real identity: setup-api apply refuses with code migration_needed",
+                      r.output.contains("\"migration_needed\"") && r.output.contains("\"ok\":false"), r.tail)
+                let r2 = MigrationEngine.runBounded(
+                    ["/bin/sh", "-c", "printf '{\"action\":\"status\"}' | '\(newBinary)' setup-api service"],
+                    timeout: 60, extraEnv: env)
+                check("real identity: setup-api service refuses with code migration_needed",
+                      r2.output.contains("\"migration_needed\""), r2.tail)
+                check("real identity: refused API verbs created no new roots",
+                      !fm.fileExists(atPath: cfg + "/briglia") && !fm.fileExists(atPath: data + "/briglia"))
+            }
+
+            // §4.5.4: legacy variables are named, their values never echoed.
+            do {
+                let r = runNew(["doctor"], extra: ["ADA_RELEASE_BASE": "hunter2-never-printed"])
+                check("legacy env var: doctor names ADA_RELEASE_BASE and its replacement, value withheld",
+                      r.output.contains("ADA_RELEASE_BASE is set but no longer read; use BRIGLIA_RELEASE_BASE")
+                      && !r.output.contains("hunter2"), r.tail)
+            }
+
+            // `--rollback` without an in-flight journal is a refusal, not a
+            // forward migration in disguise.
+            do {
+                let before = snapshot(watched)
+                let r = runNew(["migrate", "--rollback"])
+                check("real identity: `migrate --rollback` with no journal refuses and writes nothing",
+                      r.exitCode == 2 && r.output.contains("nothing to roll back")
+                      && snapshotDiff(before, snapshot(watched)).isEmpty, r.tail)
+            }
+
+            // The migration itself.
+            let mig = runNew(["migrate"])
+            check("real identity: `briglia migrate` completes",
+                  mig.exitCode == 0 && mig.output.contains("migration committed and verified"), mig.tail)
+            check("real identity: roots moved (new present, old absent)",
+                  fm.fileExists(atPath: cfg + "/briglia/secrets.json")
+                  && fm.fileExists(atPath: data + "/briglia/conversation.json")
+                  && !fm.fileExists(atPath: cfg + "/ada") && !fm.fileExists(atPath: data + "/ada"))
+            check("real identity: landing zone moved",
+                  fm.fileExists(atPath: home + "/Documents/Briglia/telegram")
+                  && !fm.fileExists(atPath: home + "/Documents/AdaCLI"))
+            let secrets = readText(cfg + "/briglia/secrets.json")
+            check("§4.5.1: persona Ada → Bree, other secrets preserved verbatim",
+                  secrets.contains("\"assistant_name\" : \"Bree\"") && secrets.contains("tok-keep"), secrets)
+            check("§4.5.1: secrets.json keeps mode 0600 across the staged rewrite",
+                  MigrationEngine.fileMode(cfg + "/briglia/secrets.json") == 0o600)
+            let marker = readText(data + "/briglia/" + IdentityMigration.markerFileName)
+            check("§4.5.6: durable persona marker records the prior name",
+                  marker.contains("\"priorName\" : \"Ada\""), marker)
+            check("§4.4: the persona bridge reads the marker from the migrated data root",
+                  IdentityMigration.priorPersonaName(dataRoot: URL(fileURLWithPath: data + "/briglia")) == "Ada")
+            let reminders = readText(data + "/briglia/reminders.json")
+            check("§4.5.7: watcher path rebased onto the new data root, script untouched",
+                  reminders.contains("\(data)/briglia/reminder-scripts/\(watcherId).sh")
+                  && !reminders.contains("/ada/")
+                  && readText(data + "/briglia/reminder-scripts/\(watcherId).sh") == "#!/bin/sh\necho hi\n", reminders)
+            let wrapper = readText(bin + "/agentmail")
+            check("§4.5.2: agentmail broker wrapper re-pinned to the new binary",
+                  wrapper.contains("'\(newBinary)' __agentmail-key") && !wrapper.contains("'\(oldBinary)'"), wrapper)
+            let tool = readText(bin + "/pdftotext")
+            check("§4.5.9: toolchain wrapper rebased, legacy marker kept, still recognized as ours",
+                  tool.contains("\(data)/briglia/toolchain/prefix") && !tool.contains("/ada/")
+                  && tool.contains(UserdataToolchain.legacyWrapperMarker)
+                  && UserdataToolchain.isOurWrapper(bin + "/pdftotext"), tool)
+            check("§4.6: compatibility symlink ada → briglia over the verified old binary",
+                  (try? fm.destinationOfSymbolicLink(atPath: oldBinary)) == newBinary
+                  && sha(newBinary) == String(binHashBefore.suffix(64)))
+            let newUnit = readText(unitDir + "/briglia.service")
+            check("§4.3.5a: briglia.service installed from captured state (enabled + active), old unit retired",
+                  newUnit.contains("ExecStart=\"\(newBinary)\" daemon")
+                  && !fm.fileExists(atPath: unitDir + "/ada.service")
+                  && fm.fileExists(atPath: sysd + "/briglia.service.enabled")
+                  && fm.fileExists(atPath: sysd + "/briglia.service.active")
+                  && !fm.fileExists(atPath: sysd + "/ada.service.active"), newUnit)
+            let log = readText(sysd + "/log")
+            check("§4.3.5b: the new daemon was started and held the new instance lock before retirement",
+                  log.contains("start briglia.service") && fm.fileExists(atPath: sysd + "/briglia.service.pid")
+                  && MigrationEngine.lockHeld(data + "/briglia/instance.lock"), log)
+            // Read the domains the way the migrated binary does — in a
+            // child under the fixture environment (the only correct view
+            // on Linux; identical through cfprefsd on macOS).
+            func dumpDomain(_ domain: String) -> [String: String] {
+                let r = runNew(["__migrate-run", "--dump-prefs-domain", domain])
+                let line = r.output.split(separator: "\n").last.map(String.init) ?? ""
+                return ((try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: String]) ?? [:]
+            }
+            check("§4.5.8: preferences domain copied to the new domain, old domain retired",
+                  // (the dump prints String(describing:) — corelibs yields
+                  // Optional("seeded") where Darwin yields "seeded")
+                  dumpDomain(newDomain)["s4"]?.contains("seeded") == true && dumpDomain(oldDomain).isEmpty,
+                  "new=\(dumpDomain(newDomain)) old=\(dumpDomain(oldDomain))")
+            check("§4.3: journal, preimages and parked assets cleaned after verification",
+                  !fm.fileExists(atPath: state + "/briglia-migrate"))
+
+            // After: the shipped surfaces agree the install is Briglia's.
+            do {
+                let st = runNew(["setup-api", "status"])
+                if let obj = try? JSONSerialization.jsonObject(with: Data(st.output.utf8)) as? [String: Any],
+                   let migration = obj["migration"] as? [String: Any],
+                   let identity = obj["identity"] as? [String: Any] {
+                    check("after: setup-api status — migration not needed, assistant Bree, schema 2",
+                          migration["needed"] as? Bool == false && identity["assistant_name"] as? String == "Bree"
+                          && obj["schema"] as? Int == 2)
+                } else {
+                    check("after: setup-api status parses", false, st.tail)
+                }
+                let again = runNew(["migrate"])
+                check("after: `briglia migrate` again is a no-op",
+                      again.exitCode == 0 && again.output.contains("already on Briglia"), again.tail)
+                let doc = runNew(["doctor"])
+                check("after: doctor reports the compatibility symlink and the migration marker",
+                      doc.output.contains("compatibility symlink") && doc.output.contains("migrated from Ada-era"), doc.tail)
+                let probe = runNew([MigrateProbe.configuration.commandName ?? "__migrate-probe"])
+                check("after: the health probe passes against the migrated roots",
+                      probe.exitCode == 0 && probe.output.contains("PROBE-OK schema=2"), probe.tail)
+            }
+
+            // setup-api `migrate` verb (the companion app's path) on a second
+            // fixture with a CUSTOM persona and no service: the name is
+            // preserved verbatim; the verb reports the outcome; rerun is a
+            // documented no-op.
+            do {
+                let s4b = tempRoot.appendingPathComponent("stage4b").path
+                let homeB = s4b + "/home", cfgB = s4b + "/cfg", dataB = s4b + "/data", stateB = s4b + "/state"
+                let binB = homeB + "/.local/bin"
+                try fm.createDirectory(atPath: binB, withIntermediateDirectories: true)
+                let newB = binB + "/briglia"
+                try fm.copyItem(atPath: adaBinary, toPath: newB)
+                if fm.fileExists(atPath: bundleSrc) {
+                    try fm.copyItem(atPath: bundleSrc, toPath: binB + "/" + BundleCheck.bundleName)
+                }
+                try writeFile(cfgB + "/ada/secrets.json", "{\"assistant_name\": \"Nina\"}", mode: 0o600)
+                try writeFile(dataB + "/ada/conversation.json", "{\"messages\": []}")
+                let envB: [String: String] = [
+                    "HOME": homeB, "XDG_CONFIG_HOME": cfgB, "XDG_DATA_HOME": dataB, "XDG_STATE_HOME": stateB,
+                    "BRIGLIA_TOOLCHAIN_BIN": binB, "BRIGLIA_MIGRATE_PREFS_DOMAINS": "none",
+                ]
+                let r = MigrationEngine.runBounded(["/bin/sh", "-c", "'\(newB)' setup-api migrate </dev/null"],
+                                                   timeout: 180, extraEnv: envB)
+                let obj = (try? JSONSerialization.jsonObject(with: Data(r.output.utf8))) as? [String: Any]
+                check("setup-api migrate: ok, outcome migrated, migration block now not needed",
+                      obj?["ok"] as? Bool == true && obj?["outcome"] as? String == "migrated"
+                      && (obj?["migration"] as? [String: Any])?["needed"] as? Bool == false, r.tail)
+                // The persona fixup must not even rewrite the file when the
+                // stored name is not exactly the old default: the bytes are
+                // the fixture's own (compact JSON, no pretty-print).
+                let secretsB = readText(cfgB + "/briglia/secrets.json")
+                check("§4.5.1: a custom persona (Nina) is preserved verbatim (file untouched), marker still written",
+                      secretsB == "{\"assistant_name\": \"Nina\"}"
+                      && readText(dataB + "/briglia/" + IdentityMigration.markerFileName).contains("\"storedNameAtMigration\" : \"Nina\""),
+                      secretsB)
+                check("no old binary present: no compat symlink, migration still completes",
+                      !fm.fileExists(atPath: binB + "/ada"))
+                let r2 = MigrationEngine.runBounded(["/bin/sh", "-c", "'\(newB)' setup-api migrate </dev/null"],
+                                                    timeout: 60, extraEnv: envB)
+                let obj2 = (try? JSONSerialization.jsonObject(with: Data(r2.output.utf8))) as? [String: Any]
+                check("setup-api migrate: rerun reports nothing_to_do",
+                      obj2?["ok"] as? Bool == true && obj2?["outcome"] as? String == "nothing_to_do", r2.tail)
             }
         }
 

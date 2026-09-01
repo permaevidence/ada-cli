@@ -13,7 +13,7 @@ struct Todo: Codable, Sendable, Equatable {
 
 /// Persistent, singleton todo list. Replaced in-place by each todo_write
 /// call (same semantics as Claude Code's TodoWrite). Persisted to
-/// ~/.local/share/ada/todos.json so the list
+/// ~/.local/share/briglia/todos.json so the list
 /// survives /newsession and app restarts.
 actor TodoStore {
     static let shared = TodoStore()

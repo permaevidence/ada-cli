@@ -7,7 +7,7 @@ import Foundation
 /// Agent tool.
 ///
 /// Conversation state (messages, tool interactions, totals) is serialized
-/// to `~/.local/share/ada/subagent_sessions/<id>.json` on every mutation and
+/// to `~/.local/share/briglia/subagent_sessions/<id>.json` on every mutation and
 /// reloaded at app start. Subprocess-backed resources (e.g. Playwright
 /// browser) still have to relaunch after an app restart — only the message
 /// history is restored, not live OS state.
@@ -249,7 +249,7 @@ actor SubagentSessionRegistry {
     private static let persistenceDirName = "subagent_sessions"
     private static let persistenceExtension = "json"
 
-    /// Canonical on-disk location: `~/.local/share/ada/subagent_sessions/`.
+    /// Canonical on-disk location: `~/.local/share/briglia/subagent_sessions/`.
     /// Creates the directory if it does not yet exist.
     private static func persistenceDirectory() -> URL {
         let url = StoragePaths.dataRoot

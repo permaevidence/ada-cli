@@ -1,4 +1,4 @@
-// WhatsApp bridge for Ada.
+// WhatsApp bridge for Briglia.
 //
 // Speaks the WhatsApp Web multi-device protocol via Baileys and exposes a
 // JSON-lines protocol over stdio to the Swift host (WhatsAppChannelService):

@@ -6,7 +6,7 @@
 # scripts/publisher_selftest.py) exercise the exact production logic.
 #
 # Env (required): GH_TOKEN, REPO (owner/name), REF_NAME (tag), VERSION
-# Env (optional): DIST (default dist), INSTALLER (default scripts/get-ada.sh),
+# Env (optional): DIST (default dist), INSTALLER (default scripts/get-briglia.sh),
 #                 GH_API_URL (default https://api.github.com),
 #                 GH_UPLOADS_URL (default https://uploads.github.com)
 #
@@ -22,7 +22,7 @@ set -euo pipefail
 : "${REF_NAME:?REF_NAME is required}"
 : "${VERSION:?VERSION is required}"
 DIST="${DIST:-dist}"
-INSTALLER="${INSTALLER:-scripts/get-ada.sh}"
+INSTALLER="${INSTALLER:-scripts/get-briglia.sh}"
 API="${GH_API_URL:-https://api.github.com}"
 UPLOADS="${GH_UPLOADS_URL:-https://uploads.github.com}"
 
@@ -74,7 +74,7 @@ done
 # 3. Create the draft and address it by ID from here on (a draft cannot be
 #    resolved by tag).
 python3 -c 'import json,sys
-print(json.dumps({"tag_name": sys.argv[1], "draft": True, "name": "Ada CLI " + sys.argv[2],
+print(json.dumps({"tag_name": sys.argv[1], "draft": True, "name": "Briglia CLI " + sys.argv[2],
   "body": "Signed release " + sys.argv[2] + ". Clients authenticate manifest.sig.json with the pinned Ed25519 key before trusting any asset."}))' \
     "$REF_NAME" "$VERSION" > "$WORK/create.json"
 api POST "$API/repos/$REPO/releases" -H "Content-Type: application/json" --data-binary @"$WORK/create.json"
@@ -85,7 +85,7 @@ echo "draft release $RELEASE_ID created for $REF_NAME"
 
 # 4. Assets first, the signed envelope LAST — stable metadata cannot precede
 #    what it describes even inside the draft. The public installer ships as
-#    `install.sh` (byte-identical to the repo's get-ada.sh).
+#    `install.sh` (byte-identical to the repo's get-briglia.sh).
 upload() {
     local file="$1" name
     name="$(basename "$file")"
@@ -98,8 +98,8 @@ upload() {
 }
 mkdir -p "$WORK/installer"
 cp "$INSTALLER" "$WORK/installer/install.sh"
-for asset in "$DIST/ada-macos-arm64.tar.gz" "$DIST/ada-linux-x64.tar.gz" "$DIST/ada-linux-arm64.tar.gz" \
-             "$DIST/ada-macos-arm64.tar.gz.sha256" "$DIST/ada-linux-x64.tar.gz.sha256" "$DIST/ada-linux-arm64.tar.gz.sha256" \
+for asset in "$DIST/briglia-macos-arm64.tar.gz" "$DIST/briglia-linux-x64.tar.gz" "$DIST/briglia-linux-arm64.tar.gz" \
+             "$DIST/briglia-macos-arm64.tar.gz.sha256" "$DIST/briglia-linux-x64.tar.gz.sha256" "$DIST/briglia-linux-arm64.tar.gz.sha256" \
              "$DIST/manifest.json" "$WORK/installer/install.sh"; do
     upload "$asset"
 done

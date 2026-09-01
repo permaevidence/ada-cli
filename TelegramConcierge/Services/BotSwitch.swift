@@ -4,15 +4,15 @@ import Foundation
 /// separate from ConversationManager so the selftest can pin the whole matrix
 /// without a manager or a network.
 ///
-/// Contract (settled with the owner 2026-08-22, for handing a machine's Ada to a
+/// Contract (settled with the owner 2026-08-22, for handing a machine's Briglia to a
 /// new owner or replacing a broken bot): the user supplies ONLY the new bot's
-/// token — never a chat id, the error-prone half. Ada answers with a one-time
-/// code; whoever will own the new bot sends that code TO the new bot, and Ada
+/// token — never a chat id, the error-prone half. Briglia answers with a one-time
+/// code; whoever will own the new bot sends that code TO the new bot, and Briglia
 /// discovers the chat id from that message. This proves in one step that the
 /// token works, the chat id is real, and the person controlling the new chat
 /// is the person the current owner intends. Nothing is written until
 /// `/switchbot confirm`; the old bot keeps working up to that moment, so a
-/// crash mid-flow always leaves a reachable Ada.
+/// crash mid-flow always leaves a reachable Briglia.
 enum BotSwitchFlow {
     /// How long discovery waits for the code before auto-cancelling.
     static let discoveryTimeoutSeconds: TimeInterval = 600
@@ -198,7 +198,7 @@ enum BotSwitchFlow {
     }
 
     /// The chat that proved the code. Only a human in a PRIVATE chat counts:
-    /// a group would hand Ada's replies to everyone in it, and a bot sender
+    /// a group would hand Briglia's replies to everyone in it, and a bot sender
     /// can't be the new owner.
     struct DiscoveredChat: Equatable {
         let chatId: Int

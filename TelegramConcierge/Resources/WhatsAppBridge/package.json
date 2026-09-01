@@ -1,9 +1,9 @@
 {
-  "name": "ada-whatsapp-bridge",
+  "name": "briglia-whatsapp-bridge",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Baileys-based WhatsApp bridge for Ada (JSON-lines over stdio)",
+  "description": "Baileys-based WhatsApp bridge for Briglia (JSON-lines over stdio)",
   "main": "index.js",
   "engines": {
     "node": ">=18"

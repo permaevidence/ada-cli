@@ -9,7 +9,7 @@ import Darwin
 
 /// Hidden deterministic test of the secret store's multi-writer contract
 /// (field incident 2026-08-29: `secrets.json` has two writers — the daemon
-/// and every short-lived `ada setup-api` process — and the old per-process
+/// and every short-lived `briglia setup-api` process — and the old per-process
 /// forever-cache meant the daemon's next whole-file rewrite silently
 /// reverted keys another process had saved, and the daemon couldn't see
 /// externally saved keys until restart).
@@ -101,8 +101,8 @@ struct SecretStoreSelftest: ParsableCommand {
             try FileManager.default.createDirectory(at: configRoot, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: dataRoot, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: temp) }
-            let storePath = configRoot.appendingPathComponent("ada/secrets.json").path
-            let lockPath = configRoot.appendingPathComponent("ada/secrets.lock").path
+            let storePath = configRoot.appendingPathComponent("briglia/secrets.json").path
+            let lockPath = configRoot.appendingPathComponent("briglia/secrets.lock").path
 
             var failures = 0
             func check(_ label: String, _ ok: Bool, _ detail: String = "") {

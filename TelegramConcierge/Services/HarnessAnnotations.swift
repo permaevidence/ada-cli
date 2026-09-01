@@ -192,13 +192,13 @@ enum MidTurnDelivery {
     nonisolated(unsafe) static var overrideForTesting: Bool?
 
     /// Rollback flag for the typed-annotation delivery renderer (plan §15
-    /// Phase D). Enabled by default; `ADA_MIDTURN_TYPED_ANNOTATIONS=0` (env)
+    /// Phase D). Enabled by default; `BRIGLIA_MIDTURN_TYPED_ANNOTATIONS=0` (env)
     /// or `defaults write ... ada.midturnLegacyDelivery -bool true` restores
     /// the weaker legacy static-marker delivery. Neutralization of the
     /// reserved prefix stays active regardless of this flag.
     static var typedAnnotationsEnabled: Bool {
         if let override = overrideForTesting { return override }
-        if let env = ProcessInfo.processInfo.environment["ADA_MIDTURN_TYPED_ANNOTATIONS"],
+        if let env = ProcessInfo.processInfo.environment["BRIGLIA_MIDTURN_TYPED_ANNOTATIONS"],
            env == "0" || env.lowercased() == "false" {
             return false
         }

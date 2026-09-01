@@ -5,15 +5,15 @@ import Glibc
 import Darwin
 #endif
 
-/// Exclusive per-user lock for conversation-owning modes (`ada` chat and
-/// `ada daemon`). Two such processes would long-poll the same Telegram bot
+/// Exclusive per-user lock for conversation-owning modes (`briglia` chat and
+/// `briglia daemon`). Two such processes would long-poll the same Telegram bot
 /// (Telegram splits updates randomly between competing pollers) and race on
 /// the same conversation, archive and reminder files — so the second one
 /// must refuse to start instead of silently corrupting shared state.
 ///
 /// Uses flock(2): advisory, and released automatically when the process dies
 /// for any reason, so a crash can never leave a stale lock behind. `ada
-/// setup` / `ada doctor` deliberately do NOT take the lock — they must work
+/// setup` / `briglia doctor` deliberately do NOT take the lock — they must work
 /// while a daemon is running.
 enum InstanceLock {
     private static var lockFd: Int32 = -1
@@ -36,8 +36,8 @@ enum InstanceLock {
                 if !pid.isEmpty { holder = " (pid \(pid))" }
             }
             close(fd)
-            return "another Ada instance\(holder) is already running — `ada` chat and "
-                + "`ada daemon` share one conversation and one Telegram poller, so only "
+            return "another Briglia instance\(holder) is already running — `briglia` chat and "
+                + "`briglia daemon` share one conversation and one Telegram poller, so only "
                 + "one can be active. Quit the other instance first."
         }
         let pid = "\(getpid())\n"
@@ -45,7 +45,7 @@ enum InstanceLock {
         _ = pid.withCString { write(fd, $0, strlen($0)) }
         // Close-on-exec, for two reasons: child processes (background bash,
         // language servers) must not inherit the fd — a lingering child would
-        // keep the lock held after we exit and block the next `ada` — and the
+        // keep the lock held after we exit and block the next `briglia` — and the
         // /upgrade self-restart re-execs in place, where the inherited lock
         // would deadlock the new image against its own predecessor.
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)

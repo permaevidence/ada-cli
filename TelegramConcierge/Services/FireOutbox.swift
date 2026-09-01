@@ -184,7 +184,7 @@ struct FireRecord: Codable {
     }
 }
 
-/// File-backed outbox under `~/.local/share/ada/fire-outbox/`, one JSON file
+/// File-backed outbox under `~/.local/share/briglia/fire-outbox/`, one JSON file
 /// per pending fire batch (`<uuid>.json`, atomic temp+rename writes). Pending
 /// records are few and short-lived, so listing decodes the whole directory.
 /// A record file may be the only remaining copy of a fire, so nothing here

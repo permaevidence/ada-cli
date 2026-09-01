@@ -577,7 +577,7 @@ actor WebOrchestrator {
     private func extractSourceURLs(from text: String) -> [String] {
         // The prompts ask for <https://…>, but models routinely emit markdown
         // links or bare URLs instead — accept all three so `sources` doesn't
-        // depend on prompt compliance. (Field-found by Ada: web_search answers
+        // depend on prompt compliance. (Field-found by Briglia: web_search answers
         // used [title](url) and the angle-only regex returned zero sources on
         // every search.)
         let patterns = [
@@ -2284,7 +2284,7 @@ actor WebOrchestrator {
 
     private func apiKey(for backend: WebSearchBackend) -> String {
         // The instance's OpenRouter key wins for that backend (it can carry
-        // the ADA_TEST_OPENROUTER_KEY env override); everything else comes
+        // the BRIGLIA_TEST_OPENROUTER_KEY env override); everything else comes
         // from stored settings via the shared resolver.
         if backend == .openrouter { return openRouterApiKey }
         return WebSearchBackend.storedKey(for: backend)
@@ -2296,7 +2296,7 @@ actor WebOrchestrator {
             // OpenCode Go sits behind Cloudflare, which 403s (error 1010)
             // requests whose User-Agent looks like a script.
             let version = adaCLIVersion
-            headers["User-Agent"] = "Ada/\(version) (\(PlatformOS.userAgentToken))"
+            headers["User-Agent"] = "Briglia/\(version) (\(PlatformOS.userAgentToken))"
         }
         return headers
     }

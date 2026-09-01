@@ -132,7 +132,7 @@ final class DebugTelemetry: ObservableObject {
 /// (apply_patch vs edit_file). Unlike DebugTelemetry's in-memory event stream,
 /// these survive restarts — they exist to answer "does apply_patch earn its
 /// keep" with real numbers over days of use.
-/// Stored at ~/.local/share/ada/edit_tool_stats.json
+/// Stored at ~/.local/share/briglia/edit_tool_stats.json
 /// as a flat {"apply_patch.success": N, "apply_patch.failure": N, ...} map.
 actor EditToolStats {
     static let shared = EditToolStats()

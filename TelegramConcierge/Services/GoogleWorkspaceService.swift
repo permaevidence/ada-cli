@@ -80,7 +80,7 @@ actor GoogleWorkspaceService {
     /// fetch would fail, burning ~3s retry ladders per prompt build and
     /// eventually raising "run gws auth login" maintenance alerts for a tool
     /// the user never finished setting up. Authorizing (or installing) later
-    /// takes effect on the next Ada start.
+    /// takes effect on the next Briglia start.
     private var cachedGwsUsable: Bool?
     /// Number of top-level gws operations currently between entry and exit —
     /// including their retry ladders' sleeps and the blocking subprocesses
@@ -119,7 +119,7 @@ actor GoogleWorkspaceService {
         }
         cachedGwsUsable = usable
         if !usable {
-            print("[GoogleWorkspaceService] gws \(Self.gwsInstalled() ? "installed but not authorized" : "not installed") — email/calendar disabled (optional; `ada setup` toolchain step, then restart Ada)")
+            print("[GoogleWorkspaceService] gws \(Self.gwsInstalled() ? "installed but not authorized" : "not installed") — email/calendar disabled (optional; `briglia setup` toolchain step, then restart Briglia)")
         }
         return usable
     }
@@ -312,7 +312,7 @@ actor GoogleWorkspaceService {
     /// most one re-download per day.
     private var lastGwsSelfUpdateAttempt: Date?
 
-    /// If the active gws binary is the one Ada installed (~/.local/bin/gws),
+    /// If the active gws binary is the one Briglia installed (~/.local/bin/gws),
     /// re-run the installer: a persistent failure can be a stale binary that
     /// Google's APIs no longer accept, and unlike Homebrew installs nobody
     /// ever runs `brew upgrade` on ours. Cheap (~6 MB), idempotent, and a
@@ -839,12 +839,12 @@ actor GoogleWorkspaceService {
 // MARK: - User-provided OAuth client (gws login)
 
 /// The Google OAuth Desktop client `gws auth login` authenticates against.
-/// Ada no longer ships an embedded client — each user creates their own in
+/// Briglia no longer ships an embedded client — each user creates their own in
 /// their Google Cloud project (the wizard's gws path collects the id/secret
 /// and stores them in secrets.json so ~/.config/gws/client_secret.json can be
 /// rewritten if it's ever deleted). `isConfigured == false` means the user
 /// hasn't provided one yet; a pre-existing client_secret.json written by an
-/// older Ada or by hand keeps working regardless.
+/// older Briglia or by hand keeps working regardless.
 enum AdaOAuthClient {
     static var clientID: String {
         KeychainHelper.load(key: KeychainHelper.gwsOAuthClientIDKey) ?? ""
@@ -907,7 +907,7 @@ extension GoogleWorkspaceService {
     /// disk — `gws auth login` cannot work until the user supplies one.
     struct MissingOAuthClient: LocalizedError {
         var errorDescription: String? {
-            "no Google OAuth client configured — rerun `ada setup` (email step) and provide your own client ID + secret"
+            "no Google OAuth client configured — rerun `briglia setup` (email step) and provide your own client ID + secret"
         }
     }
 
@@ -999,7 +999,7 @@ extension GoogleWorkspaceService {
     static func installGwsBinary(progress: (@Sendable (String) -> Void)? = nil) async -> String? {
         // Release asset targets, verified against the published asset list:
         // {x86_64,aarch64}-apple-darwin and {x86_64,aarch64}-unknown-linux-gnu
-        // (musl variants exist too, but Ada CLI only supports glibc distros).
+        // (musl variants exist too, but Briglia CLI only supports glibc distros).
         #if os(Linux)
         #if arch(arm64)
         let target = "aarch64-unknown-linux-gnu"

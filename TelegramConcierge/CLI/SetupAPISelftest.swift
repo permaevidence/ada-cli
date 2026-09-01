@@ -4,12 +4,12 @@ import Foundation
 import Glibc
 #endif
 
-/// Hidden deterministic test of the `ada setup-api` surface
+/// Hidden deterministic test of the `briglia setup-api` surface
 /// (JSON over stdio for the companion app). Fully offline — network probe KINDS are
 /// validated for request shape only, never executed. Isolation: XDG roots
 /// and TMPDIR point at a temp directory BEFORE anything touches
 /// KeychainHelper/StoragePaths (locations freeze at first access), the
-/// legacy setup flag is suppressed via ADA_IGNORE_LEGACY_SETUP_FLAG, and
+/// legacy setup flag is suppressed via BRIGLIA_IGNORE_LEGACY_SETUP_FLAG, and
 /// UserDefaults writes go to a throwaway suite through the SetupAPICore
 /// seam — the machine's real preferences are never read or written, and a
 /// crash mid-run leaves only a uniquely-named orphan suite that nothing
@@ -29,7 +29,7 @@ struct SetupAPISelftest: AsyncParsableCommand {
         setenv("XDG_CONFIG_HOME", tempRoot.path, 1)
         setenv("XDG_DATA_HOME", tempRoot.path, 1)
         setenv("TMPDIR", tempRoot.path + "/", 1)
-        setenv("ADA_IGNORE_LEGACY_SETUP_FLAG", "1", 1)
+        setenv("BRIGLIA_IGNORE_LEGACY_SETUP_FLAG", "1", 1)
 
         let suiteName = "ada-setup-api-selftest-\(UUID().uuidString)"
         guard let suite = UserDefaults(suiteName: suiteName) else {
@@ -63,8 +63,8 @@ struct SetupAPISelftest: AsyncParsableCommand {
         // 1. Response plumbing.
         do {
             let transport = SetupAPICore.transportError("nope")
-            check("transport error: schema 1, ok false, code transport",
-                  transport["schema"] as? Int == 1 && transport["ok"] as? Bool == false
+            check("transport error: schema 2, ok false, code transport",
+                  transport["schema"] as? Int == 2 && transport["ok"] as? Bool == false
                   && errorCode(transport) == "transport")
             check("argv refusal message names stdin",
                   SetupAPICore.argvRefusalMessage.contains("stdin"))
@@ -73,8 +73,8 @@ struct SetupAPISelftest: AsyncParsableCommand {
         // 2. Virgin status.
         do {
             let status = await SetupAPICore.status()
-            check("virgin status: ok, schema 1",
-                  isOK(status) && status["schema"] as? Int == 1)
+            check("virgin status: ok, schema 2",
+                  isOK(status) && status["schema"] as? Int == 2)
             check("virgin status: version + platform present",
                   status["version"] as? String == adaCLIVersion
                   && !((status["platform"] as? String) ?? "").isEmpty)
@@ -167,16 +167,16 @@ struct SetupAPISelftest: AsyncParsableCommand {
             }
             let statusFile = fakeRoot.appendingPathComponent("dpkg-status")
             try "".write(to: statusFile, atomically: true, encoding: .utf8)
-            setenv("ADA_TOOLCHAIN_ROOT", fakeRoot.appendingPathComponent("root").path, 1)
-            setenv("ADA_TOOLCHAIN_BIN", binDir.path, 1)
-            setenv("ADA_TOOLCHAIN_PATH", "\(binDir.path):\(sysDir.path)", 1)
-            setenv("ADA_TOOLCHAIN_APT", fakeApt.path, 1)
-            setenv("ADA_TOOLCHAIN_DPKG", fakeDpkg.path, 1)
-            setenv("ADA_TOOLCHAIN_DPKG_STATUS", statusFile.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_ROOT", fakeRoot.appendingPathComponent("root").path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_BIN", binDir.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_PATH", "\(binDir.path):\(sysDir.path)", 1)
+            setenv("BRIGLIA_TOOLCHAIN_APT", fakeApt.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_DPKG", fakeDpkg.path, 1)
+            setenv("BRIGLIA_TOOLCHAIN_DPKG_STATUS", statusFile.path, 1)
             defer {
-                for key in ["ADA_TOOLCHAIN_ROOT", "ADA_TOOLCHAIN_BIN",
-                            "ADA_TOOLCHAIN_PATH", "ADA_TOOLCHAIN_APT",
-                            "ADA_TOOLCHAIN_DPKG", "ADA_TOOLCHAIN_DPKG_STATUS"] {
+                for key in ["BRIGLIA_TOOLCHAIN_ROOT", "BRIGLIA_TOOLCHAIN_BIN",
+                            "BRIGLIA_TOOLCHAIN_PATH", "BRIGLIA_TOOLCHAIN_APT",
+                            "BRIGLIA_TOOLCHAIN_DPKG", "BRIGLIA_TOOLCHAIN_DPKG_STATUS"] {
                     unsetenv(key)
                 }
             }
@@ -359,7 +359,7 @@ struct SetupAPISelftest: AsyncParsableCommand {
             check("apply multi-section: values persisted",
                   KeychainHelper.load(key: KeychainHelper.serperApiKeyKey) == "serper-test-key-123"
                   && KeychainHelper.load(key: KeychainHelper.userNameKey) == "Sofia"
-                  && KeychainHelper.load(key: KeychainHelper.assistantNameKey) == "Ada"
+                  && KeychainHelper.load(key: KeychainHelper.assistantNameKey) == "Bree"
                   && KeychainHelper.load(key: KeychainHelper.emailCalendarProviderKey) == "none"
                   && TelegramConfig.isConfigured)
             let status = await SetupAPICore.status()
@@ -423,9 +423,9 @@ struct SetupAPISelftest: AsyncParsableCommand {
             }
             let install = SetupAPICore.wakelockInstallScript()
             check("wakelock install script: remount rw, unit heredoc, enable",
-                  install.contains("cat > \(AgentServiceSupport.wakelockUnitPath) <<'ADA_UNIT'")
+                  install.contains("cat > \(AgentServiceSupport.wakelockUnitPath) <<'BRIGLIA_UNIT'")
                   && install.contains("ConditionPathExists=/sys/power/wake_lock")
-                  && install.contains("\nADA_UNIT\n")
+                  && install.contains("\nBRIGLIA_UNIT\n")
                   && install.contains("chmod 644 \(AgentServiceSupport.wakelockUnitPath)")
                   && install.contains("systemctl daemon-reload")
                   && install.contains("systemctl enable --now \(AgentServiceSupport.wakelockUnitName)"))
@@ -488,10 +488,10 @@ struct SetupAPISelftest: AsyncParsableCommand {
                   && KeychainHelper.load(key: KeychainHelper.openAIImageApiKeyKey) == nil)
 
             let nameGone = await SetupAPICore.apply(["identity": ["remove": true]])
-            check("remove identity: user_name deleted, assistant stays Ada",
+            check("remove identity: user_name deleted, assistant stays Briglia",
                   isOK(nameGone)
                   && KeychainHelper.load(key: KeychainHelper.userNameKey) == nil
-                  && KeychainHelper.load(key: KeychainHelper.assistantNameKey) == "Ada")
+                  && KeychainHelper.load(key: KeychainHelper.assistantNameKey) == "Bree")
 
             let telegramGone = await SetupAPICore.apply(["telegram": ["remove": true]])
             check("remove telegram: token + chat id deleted",

@@ -37,7 +37,7 @@ enum ProcessTree {
     }
 
     /// Process groups covering the tree: the root's own group plus every
-    /// descendant's, minus Ada's. Group signalling is what catches processes
+    /// descendant's, minus Briglia's. Group signalling is what catches processes
     /// the BFS structurally cannot see: a `(daemon &)` double fork reparents
     /// to init before we walk parent pids, but it KEEPS the shell's process
     /// group. Conversely the BFS catches a descendant that moved itself into
@@ -53,7 +53,7 @@ enum ProcessTree {
         for pid in [rootPid] + descendants {
             let pgid = getpgid(pid)
             // Guard against ever group-signalling ourselves (or init): no
-            // legitimate child group can be Ada's, but pid reuse races are
+            // legitimate child group can be Briglia's, but pid reuse races are
             // cheap to exclude.
             if pgid > 1 && pgid != ownGroup { groups.insert(pgid) }
         }
@@ -66,7 +66,7 @@ enum ProcessTree {
         let rootPid = process.processIdentifier
         let kids = descendants(of: rootPid)
         let groups = processGroups(rootPid: rootPid, descendants: kids)
-        if ProcessInfo.processInfo.environment["ADA_DEBUG_PROCTREE"] != nil {
+        if ProcessInfo.processInfo.environment["BRIGLIA_DEBUG_PROCTREE"] != nil {
             FileHandle.standardError.write(Data("[proctree] root=\(rootPid) rootPgid=\(getpgid(rootPid)) kids=\(kids.map { "\($0)/pg\(getpgid($0))" }) groups=\(groups)\n".utf8))
         }
         if process.isRunning { process.terminate() }
@@ -76,7 +76,7 @@ enum ProcessTree {
         if process.isRunning { _ = Darwin.kill(rootPid, SIGKILL) }
         for g in groups {
             let probe = Darwin.kill(-g, 0)
-            if ProcessInfo.processInfo.environment["ADA_DEBUG_PROCTREE"] != nil {
+            if ProcessInfo.processInfo.environment["BRIGLIA_DEBUG_PROCTREE"] != nil {
                 FileHandle.standardError.write(Data("[proctree] probe -\(g) => \(probe) errno=\(errno)\n".utf8))
             }
             if probe == 0 { _ = Darwin.kill(-g, SIGKILL) }
@@ -131,10 +131,10 @@ enum BashTools {
 
     /// PATH for agent-spawned shells. The GUI app inherits launchd's minimal
     /// PATH, and `zsh -l` only restores Homebrew/user dirs if the user's
-    /// dotfiles do — so prepend the places Ada actually installs and expects
+    /// dotfiles do — so prepend the places Briglia actually installs and expects
     /// tools (notably ~/.local/bin, where the onboarding installs `gws` and
     /// the `agentmail` key-broker wrapper). ~/.local/bin comes FIRST —
-    /// standard XDG/systemd user-session order — so Ada-installed wrappers
+    /// standard XDG/systemd user-session order — so Briglia-installed wrappers
     /// win over a same-named Homebrew/system binary (a foreign `agentmail`
     /// has no key broker and can only fail auth). path_helper in
     /// /etc/zprofile reorders but preserves these entries.
@@ -146,7 +146,7 @@ enum BashTools {
         var parts = current.split(separator: ":").map(String.init)
         // ~/.local/bin is unconditionally MOVED to the front (not just
         // prepended when missing): an inherited PATH with Homebrew ahead of
-        // it would let a foreign same-named binary shadow Ada's wrappers —
+        // it would let a foreign same-named binary shadow Briglia's wrappers —
         // the exact agentmail-broker bypass Codex flagged (round 5).
         parts.removeAll { $0 == localBin }
         let missing = prepend.filter { !parts.contains($0) }
@@ -215,11 +215,11 @@ enum BashTools {
         return FileManager.default.isExecutableFile(atPath: path) ? path : nil
     }()
 
-    /// Wrap an absolute-path invocation in `ada __setsid-exec` so the child
+    /// Wrap an absolute-path invocation in `briglia __setsid-exec` so the child
     /// runs detached from any controlling terminal (the trampoline execs the
     /// target in place, so the PID the parent tracks IS the target).
     /// Detachment makes tty-prompting tools (sudo, ssh) fail fast instead of
-    /// writing `Password:` into Ada's own terminal and hanging the turn.
+    /// writing `Password:` into Briglia's own terminal and hanging the turn.
     /// Passes through unchanged for relative paths or if the ada binary
     /// can't be resolved (never expected in a real install).
     static func detachedInvocation(executable: String, arguments: [String]) -> (executable: String, arguments: [String]) {
@@ -1318,7 +1318,7 @@ actor BackgroundProcessRegistry {
     }
 
     /// Serial queue coordinating writes to Entry buffers from pipe readability handlers.
-    private let ioQueue = DispatchQueue(label: "Ada.background-process-io")
+    private let ioQueue = DispatchQueue(label: "com.permaevidence.briglia.background-process-io")
 
     private init() {}
 
@@ -1345,7 +1345,7 @@ actor BackgroundProcessRegistry {
         // Only per-command secrets are injected into this process. The
         // AgentMail key deliberately does NOT ride in these environments at
         // all: the installed `agentmail` command is a broker wrapper that
-        // fetches the key itself (via `ada __agentmail-key`) and execs the
+        // fetches the key itself (via `briglia __agentmail-key`) and execs the
         // real binary, so the key exists only in the actual AgentMail
         // process — no shell-string heuristic decides credential scope
         // (Codex, 2026-08-22: substring matching is not a boundary). The

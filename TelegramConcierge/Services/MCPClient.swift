@@ -75,7 +75,7 @@ actor MCPClient {
         // lookup via /usr/bin/env. Either way the server runs detached from
         // the controlling terminal (setsid trampoline): a startup command
         // that hits a /dev/tty prompt (sudo) fails fast instead of writing
-        // `Password:` into Ada's terminal.
+        // `Password:` into Briglia's terminal.
         let resolved: (executable: String, arguments: [String]) =
             executable.hasPrefix("/")
                 ? (executable, arguments)

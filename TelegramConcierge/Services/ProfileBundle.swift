@@ -1,14 +1,14 @@
 import Foundation
 
-/// Shareable Ada profile bundle.
+/// Shareable Briglia profile bundle.
 ///
 /// Captures the three pieces of user-editable MCP/agent state into a single
 /// JSON file that can be dropped on another machine (or another user's
 /// setup) to reproduce the configuration:
 ///
-///   - `mcpServers`   — contents of ~/.config/ada/mcp.json (server configs)
-///   - `mcpRouting`   — contents of ~/.config/ada/mcp-routing.json
-///   - `agents`       — every ~/.config/ada/agents/*.md file verbatim
+///   - `mcpServers`   — contents of ~/.config/briglia/mcp.json (server configs)
+///   - `mcpRouting`   — contents of ~/.config/briglia/mcp-routing.json
+///   - `agents`       — every ~/.config/briglia/agents/*.md file verbatim
 ///
 /// Explicitly NOT included: Keychain-backed secret values. The bundle
 /// carries `secretRefs` (the variable names) so the importer knows what
@@ -18,7 +18,15 @@ import Foundation
 enum ProfileBundle {
 
     static let currentVersion = 1
-    static let fileExtension = "ada-profile.json"
+    static let fileExtension = "briglia-profile.json"
+    /// Export names of the previous product identity — imported forever
+    /// with unchanged content handling (rename plan §4.5.3).
+    static let legacyFileExtensions = ["ada-profile.json"]
+    static var acceptedFileExtensions: [String] { [fileExtension] + legacyFileExtensions }
+    static func isProfileFileName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        return acceptedFileExtensions.contains { lower.hasSuffix("." + $0) || lower == $0 }
+    }
 
     // MARK: - Export
 
@@ -28,7 +36,7 @@ enum ProfileBundle {
         var root: [String: Any] = [
             "version": currentVersion,
             "exportedAt": isoNow(),
-            "exportedBy": "Ada \(appVersion())"
+            "exportedBy": "Briglia \(appVersion())"
         ]
 
         // mcp.json — re-encode from the struct list so we strip any extraneous
@@ -227,6 +235,6 @@ enum ProfileBundle {
     static func defaultExportFilename() -> String {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyyMMdd-HHmmss"
-        return "ada-profile-\(fmt.string(from: Date())).\(fileExtension)"
+        return "briglia-profile-\(fmt.string(from: Date())).\(fileExtension)"
     }
 }

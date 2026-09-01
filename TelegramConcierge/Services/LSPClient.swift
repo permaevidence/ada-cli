@@ -56,7 +56,7 @@ actor LSPClient {
         guard process == nil else { return }
         let proc = Process()
         // Detach from the controlling terminal (setsid trampoline) so an
-        // unusual server startup can never prompt into Ada's own terminal.
+        // unusual server startup can never prompt into Briglia's own terminal.
         let invocation = BashTools.detachedInvocation(
             executable: executable, arguments: arguments)
         proc.executableURL = URL(fileURLWithPath: invocation.executable)

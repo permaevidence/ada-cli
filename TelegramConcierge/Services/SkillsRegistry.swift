@@ -11,14 +11,14 @@ import Foundation
 ///
 /// Canonical layout:
 /// ```
-/// ~/.config/ada/skills/pdf/
+/// ~/.config/briglia/skills/pdf/
 ///   SKILL.md          ← frontmatter + body
 ///   render.py         ← asset, invoked by the body via the bash tool
 ///   template.html     ← another asset
 /// ```
 ///
 /// A backward-compatibility shim also accepts the legacy single-file format
-/// (`~/.config/ada/skills/pdf.md`) so user skills written before the migration
+/// (`~/.config/briglia/skills/pdf.md`) so user skills written before the migration
 /// keep working. Flat files have no assets.
 ///
 /// Skills are NOT loaded into the system prompt — only an index (name +
@@ -47,7 +47,7 @@ enum SkillsRegistry {
     enum Origin: Equatable {
         /// Ships inside the app bundle at `Contents/Resources/BundledSkills/`.
         case bundled
-        /// Lives in `~/.config/ada/skills/`. User-authored. Overrides a
+        /// Lives in `~/.config/briglia/skills/`. User-authored. Overrides a
         /// bundled skill with the same name.
         case user
     }
@@ -309,7 +309,7 @@ enum SkillsRegistry {
         )
     }
 
-    /// Canonical skills directory: `~/.config/ada/skills/`.
+    /// Canonical skills directory: `~/.config/briglia/skills/`.
     static func skillsDirectoryURL() -> URL {
         StoragePaths.configRoot
             .appendingPathComponent("skills", isDirectory: true)

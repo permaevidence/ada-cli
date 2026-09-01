@@ -25,14 +25,14 @@ on:
 # run is stopped by the sequence re-check inside the group, not by a cancel
 # that could interrupt a half-published draft.
 concurrency:
-  group: ada-cli-release-signed
+  group: briglia-cli-release-signed
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
-  EXPECTED_PUBKEY: .github/release-keys/ada-cli-release.pub.pem
+  EXPECTED_PUBKEY: .github/release-keys/briglia-cli-release.pub.pem
 
 jobs:
   authorize:
@@ -98,11 +98,11 @@ jobs:
         run: |
           mkdir -p dist
           cp LICENSE THIRD_PARTY_NOTICES.md .build/release/
-          tar -czf dist/ada-macos-arm64.tar.gz -C .build/release ada ada-cli_ada.bundle LICENSE THIRD_PARTY_NOTICES.md
+          tar -czf dist/briglia-macos-arm64.tar.gz -C .build/release briglia briglia-cli_briglia.bundle LICENSE THIRD_PARTY_NOTICES.md
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ada-macos-arm64
-          path: dist/ada-macos-arm64.tar.gz
+          name: briglia-macos-arm64
+          path: dist/briglia-macos-arm64.tar.gz
 
   build-linux-x64:
     name: Build Linux x64
@@ -122,11 +122,11 @@ jobs:
         run: |
           mkdir -p dist
           cp LICENSE THIRD_PARTY_NOTICES.md .build/release/
-          tar -czf dist/ada-linux-x64.tar.gz -C .build/release ada ada-cli_ada.resources LICENSE THIRD_PARTY_NOTICES.md
+          tar -czf dist/briglia-linux-x64.tar.gz -C .build/release briglia briglia-cli_briglia.resources LICENSE THIRD_PARTY_NOTICES.md
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ada-linux-x64
-          path: dist/ada-linux-x64.tar.gz
+          name: briglia-linux-x64
+          path: dist/briglia-linux-x64.tar.gz
 
   build-linux-arm64:
     name: Build Linux arm64 (native)
@@ -148,11 +148,11 @@ jobs:
         run: |
           mkdir -p dist
           cp LICENSE THIRD_PARTY_NOTICES.md .build/release/
-          tar -czf dist/ada-linux-arm64.tar.gz -C .build/release ada ada-cli_ada.resources LICENSE THIRD_PARTY_NOTICES.md
+          tar -czf dist/briglia-linux-arm64.tar.gz -C .build/release briglia briglia-cli_briglia.resources LICENSE THIRD_PARTY_NOTICES.md
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ada-linux-arm64
-          path: dist/ada-linux-arm64.tar.gz
+          name: briglia-linux-arm64
+          path: dist/briglia-linux-arm64.tar.gz
 
   assemble:
     name: Assemble manifest
@@ -172,14 +172,14 @@ jobs:
         run: |
           set -euo pipefail
           for platform in macos-arm64 linux-x64 linux-arm64; do
-            [ -f "dist/ada-$platform.tar.gz" ] || { echo "✖ missing dist/ada-$platform.tar.gz"; exit 1; }
+            [ -f "dist/briglia-$platform.tar.gz" ] || { echo "✖ missing dist/briglia-$platform.tar.gz"; exit 1; }
           done
           ./.github/scripts/build-manifest.sh "$VERSION" "$SEQUENCE" dist/manifest.json
           cat dist/manifest.json
           # Checksum sidecars for the installer's disclosed TLS-bootstrap
           # fallback (systems without python3/openssl); signed-path clients
           # never read them.
-          for tarball in dist/ada-*.tar.gz; do
+          for tarball in dist/briglia-*.tar.gz; do
             (cd dist && sha256sum "$(basename "$tarball")" > "$(basename "$tarball").sha256")
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -202,16 +202,16 @@ jobs:
           path: dist
       - name: Sign the manifest
         env:
-          SIGNING_KEY_B64: ${{ secrets.ADA_CLI_SIGNING_KEY }}
+          SIGNING_KEY_B64: ${{ secrets.BRIGLIA_CLI_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          [ -n "$SIGNING_KEY_B64" ] || { echo "✖ ADA_CLI_SIGNING_KEY is not configured"; exit 1; }
+          [ -n "$SIGNING_KEY_B64" ] || { echo "✖ BRIGLIA_CLI_SIGNING_KEY is not configured"; exit 1; }
           KEYFILE="$(mktemp)"
           chmod 600 "$KEYFILE"
           trap 'rm -f "$KEYFILE"' EXIT
           printf '%s' "$SIGNING_KEY_B64" | base64 -d > "$KEYFILE"
           EXPECTED_PUBKEY_PEM="$EXPECTED_PUBKEY" \
-            ./.github/scripts/sign-envelope.sh "$KEYFILE" ada-cli dist/manifest.json dist/manifest.sig.json
+            ./.github/scripts/sign-envelope.sh "$KEYFILE" briglia-cli dist/manifest.json dist/manifest.sig.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: envelope
@@ -247,15 +247,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir extracted
-          tar -xzf "dist/ada-$PLATFORM.tar.gz" -C extracted
-          ./extracted/ada __verify-envelope dist/manifest.sig.json \
+          tar -xzf "dist/briglia-$PLATFORM.tar.gz" -C extracted
+          ./extracted/briglia __verify-envelope dist/manifest.sig.json \
             --expect-version "$VERSION" --expect-sequence "$SEQUENCE"
           # The authenticated hashes must match the actual artifacts.
           python3 - <<'PYEOF'
           import base64, hashlib, json
           payload = json.loads(base64.b64decode(json.load(open("dist/manifest.sig.json"))["payload"]))
           for platform, entry in payload["platforms"].items():
-              path = f"dist/ada-{platform}.tar.gz"
+              path = f"dist/briglia-{platform}.tar.gz"
               digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
               assert digest == entry["sha256"], f"hash mismatch for {platform}"
               import os
@@ -323,6 +323,6 @@ jobs:
           SEQUENCE: ${{ needs.authorize.outputs.sequence }}
           PLATFORM: ${{ matrix.platform }}
           REPO: ${{ github.repository }}
-          CANDIDATE_TARBALL: dist/ada-${{ matrix.platform }}.tar.gz
+          CANDIDATE_TARBALL: dist/briglia-${{ matrix.platform }}.tar.gz
           CANDIDATE_ENVELOPE: dist/manifest.sig.json
         run: ./.github/scripts/verify-public-release.sh

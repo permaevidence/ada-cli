@@ -303,7 +303,7 @@ struct MindSelftest: AsyncParsableCommand {
                 check("description store is hermetic before the test mutates it",
                       FileDescriptionsStore.isHermetic)
                 guard FileDescriptionsStore.isHermetic else { break hermeticGuard }
-                // Build the "fresh Ada" source backup: no descriptions, no
+                // Build the "fresh Briglia" source backup: no descriptions, no
                 // persona.
                 try FileDescriptionsStore.storeData(
                     try JSONEncoder().encode([String: String]()))
@@ -368,7 +368,7 @@ struct MindSelftest: AsyncParsableCommand {
                 atomically: true, encoding: .utf8)
             let scriptSHA = SHA256.hash(data: Data(scriptSource.utf8))
                 .map { String(format: "%02x", $0) }.joined()
-            let foreignPath = "/home/other-user/.local/share/ada/reminder-scripts/\(watcherId.uuidString).sh"
+            let foreignPath = "/home/other-user/.local/share/briglia/reminder-scripts/\(watcherId.uuidString).sh"
             let scripted = Reminder(
                 id: watcherId,
                 triggerDate: Date().addingTimeInterval(3600),

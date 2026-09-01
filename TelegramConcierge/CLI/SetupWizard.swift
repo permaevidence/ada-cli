@@ -1,7 +1,7 @@
 import ArgumentParser
 import Foundation
 
-// MARK: - `ada setup`
+// MARK: - `briglia setup`
 
 struct Setup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -9,6 +9,9 @@ struct Setup: AsyncParsableCommand {
     )
 
     func run() async throws {
+        AdaCLI.prepareIO()
+        try IdentityMigration.gateMutatingEntry()
+        IdentityMigration.warnLegacyEnvironment()
         try await SetupWizard().run()
     }
 }
@@ -17,7 +20,7 @@ struct Setup: AsyncParsableCommand {
 /// CLI-specific changes agreed on 2026-08-03: OpenCode
 /// Go or any OpenAI-compatible endpoint for the main agent; ONE OpenAI key
 /// covering web research, transcription, image generation and OCR; Serper;
-/// Jina; the user's name (assistant is always Ada); keep-awake + Full Disk
+/// Jina; the user's name (assistant is always Briglia); keep-awake + Full Disk
 /// Access; optional toolchain; optional Telegram. English throughout.
 ///
 /// UX borrows from the proven claude-plugins wizard: numbered steps, inline
@@ -33,7 +36,7 @@ struct SetupWizard {
     // a HOME override, so file storage is what keeps scripted test runs from
     // touching a real installation. Installs configured before this existed
     // only have the legacy UserDefaults flag, which is still honored.
-    // Shared with `ada setup-api` (SetupAPICommand.swift) — the GUI setup
+    // Shared with `briglia setup-api` (SetupAPICommand.swift) — the GUI setup
     // surface reads and writes the same completion state. nonisolated: the
     // wizard type is @MainActor, but these touch only KeychainHelper (its
     // own lock) and UserDefaults.
@@ -45,7 +48,7 @@ struct SetupWizard {
     /// callers use the machine's real defaults for the legacy flag.
     nonisolated static func setupComplete(legacyDefaults: UserDefaults = .standard) -> Bool {
         if KeychainHelper.load(key: completeKey) == "true" { return true }
-        if ProcessInfo.processInfo.environment["ADA_IGNORE_LEGACY_SETUP_FLAG"] != nil { return false }
+        if ProcessInfo.processInfo.environment["BRIGLIA_IGNORE_LEGACY_SETUP_FLAG"] != nil { return false }
         return legacyDefaults.bool(forKey: legacyCompleteFlag)
     }
 
@@ -63,11 +66,11 @@ struct SetupWizard {
             ("Jina key (page reading)", { await $0.stepJina() }),
             ("Your name", { await $0.stepName() }),
             (SetupWizard.permissionsStepTitle, { await $0.stepPermissions() }),
-            ("Ada's toolchain (optional)", { await $0.stepToolchain() }),
+            ("Briglia's toolchain (optional)", { await $0.stepToolchain() }),
             ("Telegram (optional)", { await $0.stepTelegram() }),
         ]
         #if os(Linux)
-        // Last on purpose: the service runs `ada daemon`, which needs the
+        // Last on purpose: the service runs `briglia daemon`, which needs the
         // Telegram step already done.
         list.append(("Always-on background service (optional)", { await $0.stepService() }))
         #endif
@@ -96,16 +99,16 @@ struct SetupWizard {
         if startIndex == 0 {
             print("""
 
-            ── Ada CLI setup ─────────────────────────────────────────
+            ── Briglia CLI setup ─────────────────────────────────────────
             \(steps.count) steps, about 5 minutes. Keys are validated as you paste
-            them and stored in ~/.config/ada/secrets.json (owner-only
+            them and stored in ~/.config/briglia/secrets.json (owner-only
             permissions). Press Ctrl-C to abort at any time; finished
             steps stay saved.
             """)
         }
         for index in startIndex..<steps.count {
             // Marked before the step runs, so dying mid-step re-offers
-            // exactly this step on the next `ada setup`.
+            // exactly this step on the next `briglia setup`.
             save(Self.progressKey, String(index))
             printHeader(index: index + 1, total: steps.count, title: steps[index].title)
             await steps[index].run(self)
@@ -113,11 +116,11 @@ struct SetupWizard {
         try? KeychainHelper.delete(key: Self.progressKey)
         save(Self.completeKey, "true")
         printSummary()
-        print("\nSetup complete. Start chatting with `ada`, or run `ada daemon` for Telegram-only mode.")
+        print("\nSetup complete. Start chatting with `briglia`, or run `briglia daemon` for Telegram-only mode.")
     }
 
     private func rerunMenu() async {
-        print("\nAda is already configured. Pick a section to change (Enter to exit):\n")
+        print("\nBriglia is already configured. Pick a section to change (Enter to exit):\n")
         for (index, step) in steps.enumerated() {
             print("  \(index + 1). \(step.title)")
         }
@@ -153,13 +156,13 @@ struct SetupWizard {
             print("  ✔ keeping the current main agent")
             return
         }
-        // Loop until a main agent is actually persisted: Ada cannot run
+        // Loop until a main agent is actually persisted: Briglia cannot run
         // without one, and a declined "Save anyway?" on the custom-endpoint
         // path must not let setup fall through to "Setup complete."
         while true {
             await runProviderMenu()
             if Self.mainAgentConfigured() { return }
-            print("\n  Ada cannot run without a main model — let's try again (Ctrl-C aborts setup).")
+            print("\n  Briglia cannot run without a main model — let's try again (Ctrl-C aborts setup).")
         }
     }
 
@@ -191,7 +194,7 @@ struct SetupWizard {
         while true {
             print("""
 
-            Ada's main brain. You can configure SEVERAL providers and hop
+            Briglia's main brain. You can configure SEVERAL providers and hop
             between them anytime with the /provider command. Recommended:
             OpenCode Go — one subscription key, generous limits.
             """)
@@ -418,7 +421,7 @@ struct SetupWizard {
     // MARK: Steps 3–4 — Serper & Jina
 
     private func stepSerper() async {
-        print("Serper gives Ada Google search. Free tier: 2,500 queries — https://serper.dev")
+        print("Serper gives Briglia Google search. Free tier: 2,500 queries — https://serper.dev")
         let key = await WizardIO.askSecretValidated(
             "Serper API key",
             current: KeychainHelper.load(key: KeychainHelper.serperApiKeyKey),
@@ -429,7 +432,7 @@ struct SetupWizard {
     }
 
     private func stepJina() async {
-        print("Jina Reader lets Ada read web pages. Free tier available — https://jina.ai/reader")
+        print("Jina Reader lets Briglia read web pages. Free tier available — https://jina.ai/reader")
         let key = await WizardIO.askSecretValidated(
             "Jina API key",
             current: KeychainHelper.load(key: KeychainHelper.jinaApiKeyKey),
@@ -443,30 +446,30 @@ struct SetupWizard {
 
     private func stepName() async {
         let current = KeychainHelper.load(key: KeychainHelper.userNameKey) ?? ""
-        let prompt = current.isEmpty ? "What should Ada call you?" : "What should Ada call you? [\(current)]"
+        let prompt = current.isEmpty ? "What should Bree call you?" : "What should Bree call you? [\(current)]"
         var name = WizardIO.ask(prompt)
         if name.isEmpty { name = current }
         if !name.isEmpty {
             save(KeychainHelper.userNameKey, name)
         }
-        save(KeychainHelper.assistantNameKey, "Ada")
-        print("  ✔ Nice to meet you\(name.isEmpty ? "" : ", \(name)")! I'm Ada.")
+        save(KeychainHelper.assistantNameKey, "Bree")
+        print("  ✔ Nice to meet you\(name.isEmpty ? "" : ", \(name)")! I'm Bree.")
     }
 
     // MARK: Step 6 — permissions
 
     #if os(macOS)
     private func stepPermissions() async {
-        // Keep-awake: Ada works autonomously (reminders, Telegram, background
+        // Keep-awake: Briglia works autonomously (reminders, Telegram, background
         // tasks) — a sleeping Mac silently stops all of it.
         let sleep = PermissionsService.displaySleepMinutes()
         if let ac = sleep.ac, ac != 0 {
             print("""
             ⚠ Your display sleeps after \(ac) minutes on power. The DISPLAY may
-              sleep, but the SYSTEM must stay awake or Ada stops working when
+              sleep, but the SYSTEM must stay awake or Briglia stops working when
               unattended. Recommended: System Settings → Energy → enable
               "Prevent automatic sleeping on power adapter when the display is
-              off" (or run Ada under `caffeinate -is ada daemon`).
+              off" (or run Briglia under `caffeinate -is briglia daemon`).
             """)
             _ = WizardIO.ask("Press Enter when done (or to continue anyway)")
         } else {
@@ -478,12 +481,12 @@ struct SetupWizard {
             print("  ✔ Full Disk Access granted")
         } else {
             print("""
-            Ada needs Full Disk Access to work on your files. Grant it to the
-            TERMINAL app you run `ada` from (Terminal, iTerm, …):
+            Briglia needs Full Disk Access to work on your files. Grant it to the
+            TERMINAL app you run `briglia` from (Terminal, iTerm, …):
               1. Opening System Settings → Privacy & Security → Full Disk Access…
               2. Add your terminal app and enable it.
               3. macOS asks to relaunch the terminal — do it, then run
-                 `ada setup` again; it offers to resume from this step,
+                 `briglia setup` again; it offers to resume from this step,
                  keeping everything you already entered.
             """)
             _ = await GoogleWorkspaceService.runProcessAsync(
@@ -497,7 +500,7 @@ struct SetupWizard {
             }
             print(PermissionsService.fullDiskAccessGranted()
                   ? "  ✔ Full Disk Access granted"
-                  : "  ⚠ Skipped — Ada will fail on protected folders until granted")
+                  : "  ⚠ Skipped — Briglia will fail on protected folders until granted")
         }
     }
     #else
@@ -537,7 +540,7 @@ struct SetupWizard {
         let timers = [acText, batteryText].compactMap { $0 }.joined(separator: ", ")
         print("""
         ⚠ This machine auto-suspends (\(timers.isEmpty ? "desktop power settings" : timers)).
-          A suspended machine stops Ada completely — reminders, Telegram and
+          A suspended machine stops Briglia completely — reminders, Telegram and
           background tasks all go silent.
         """)
 
@@ -557,7 +560,7 @@ struct SetupWizard {
           Options:
           • Desktop: disable automatic suspend in your power settings.
           • Dedicated/headless box: mask the systemd sleep targets so the
-            machine can never suspend (recommended for an always-on Ada):
+            machine can never suspend (recommended for an always-on Briglia):
               sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
         """)
         if WizardIO.askYesNo("Mask the systemd sleep targets now (asks for sudo)?", default: false) {
@@ -567,7 +570,7 @@ struct SetupWizard {
                 print("  ✖ Masking failed (sudo declined?) — run the command above manually.")
             }
         } else {
-            print("  ⚠ Left as-is — Ada will stop whenever the machine suspends.")
+            print("  ⚠ Left as-is — Briglia will stop whenever the machine suspends.")
         }
     }
     #endif
@@ -578,9 +581,9 @@ struct SetupWizard {
     private func stepService() async {
         guard TelegramConfig.isConfigured else {
             print("""
-              Skipped — the service runs `ada daemon`, which needs the Telegram
+              Skipped — the service runs `briglia daemon`, which needs the Telegram
               channel (previous step). Set it up any time later with:
-                ada service install
+                briglia service install
             """)
             return
         }
@@ -588,18 +591,18 @@ struct SetupWizard {
         if isUT {
             print("""
               Recommended on Ubuntu Touch: the Terminal app's processes are
-              frozen when the screen turns off, so Ada must run as a systemd
+              frozen when the screen turns off, so Briglia must run as a systemd
               service to stay reachable over Telegram.
             """)
         } else {
             print("""
-              Runs `ada daemon` as a systemd user service: starts at boot,
+              Runs `briglia daemon` as a systemd user service: starts at boot,
               restarts after crashes, keeps working after you log out.
               Ideal for a Raspberry Pi or an always-on box.
             """)
         }
         guard WizardIO.askYesNo("Install and start the service now?", default: isUT) else {
-            print("  Skipped — set it up any time with: ada service install")
+            print("  Skipped — set it up any time with: briglia service install")
             return
         }
         _ = AgentServiceSupport.installUserService()
@@ -631,7 +634,7 @@ struct SetupWizard {
                 print("  ✔ Media pipeline ready (poppler-utils + ImageMagick + ffmpeg)")
             } else {
                 print("""
-                  Installing Ada's media tools (PDF reading, images, audio/video for
+                  Installing Briglia's media tools (PDF reading, images, audio/video for
                   transcription) to the USERDATA partition: no sudo, the tiny
                   read-only rootfs is never touched, and they survive OS updates.
                 """)
@@ -646,7 +649,7 @@ struct SetupWizard {
                              : " (\(report.wrappers.count) tools on userdata)"))
                 } else {
                     for failure in report.failures { print("  ✖ \(failure)") }
-                    print("  Retry any time with: ada toolchain install")
+                    print("  Retry any time with: briglia toolchain install")
                 }
             }
         } else if popplerOK && magickOK {
@@ -656,7 +659,7 @@ struct SetupWizard {
             if !popplerOK { needed.append("poppler-utils") }
             if !magickOK { needed.append("imagemagick") }
             print("""
-            ⚠ Ada needs \(needed.joined(separator: " and ")) on Linux — without them
+            ⚠ Briglia needs \(needed.joined(separator: " and ")) on Linux — without them
               it cannot read PDFs or handle images.
             """)
             if let manager = ToolchainService.linuxPackageManager(),
@@ -677,7 +680,7 @@ struct SetupWizard {
         await configureEmailCalendar()
         print("""
         Optional helpers for documents and media (PDF/DOCX/XLSX generation,
-        video editing). Ada works without them; install now or any time later.
+        video editing). Briglia works without them; install now or any time later.
         """)
         guard WizardIO.askYesNo("Check the toolchain now?", default: false) else {
             print("  Skipped.")
@@ -717,18 +720,18 @@ struct SetupWizard {
     }
 
     /// Optional email + calendar. Three providers: AgentMail (dedicated agent
-    /// inbox + Ada's local calendar, recommended), Google Workspace via the
+    /// inbox + Briglia's local calendar, recommended), Google Workspace via the
     /// `gws` CLI (user's own Gmail/Calendar, user-provided OAuth client), or
     /// none (the default — no email/calendar context, polling, or tool).
     private func configureEmailCalendar() async {
         let current = EmailCalendarProvider.current
         print("""
 
-        Email & calendar (optional). Ada can watch an inbox (new-mail alerts,
+        Email & calendar (optional). Briglia can watch an inbox (new-mail alerts,
         unread snapshot in its context) and keep a calendar (daily agenda).
-          1) AgentMail — a dedicated inbox for Ada (recommended, easy):
+          1) AgentMail — a dedicated inbox for Briglia (recommended, easy):
              sign up at https://agentmail.to, create an inbox + API key,
-             paste the key here. Includes Ada's own calendar tool.
+             paste the key here. Includes Briglia's own calendar tool.
           2) Google Workspace — YOUR Gmail/Calendar via Google's `gws` CLI
              (advanced: requires your own Google Cloud OAuth client).
           3) None — no email or calendar context.
@@ -754,16 +757,16 @@ struct SetupWizard {
         default:
             save(KeychainHelper.emailCalendarProviderKey, EmailCalendarProvider.none.rawValue)
             if current != .none {
-                print("  ✔ email/calendar disabled — takes effect the next time Ada starts")
+                print("  ✔ email/calendar disabled — takes effect the next time Briglia starts")
             } else {
-                print("  ✔ no email/calendar — enable any time by rerunning `ada setup`")
+                print("  ✔ no email/calendar — enable any time by rerunning `briglia setup`")
             }
         }
     }
 
     private func configureAgentMail() async {
         print("""
-          AgentMail gives Ada its own inbox. If you don't have a key yet:
+          AgentMail gives Briglia its own inbox. If you don't have a key yet:
           https://agentmail.to → create an inbox → API keys → create one.
         """)
         let key = await WizardIO.askSecretValidated(
@@ -775,12 +778,12 @@ struct SetupWizard {
         // Enter-keeps-saved-key path, which skips the probe).
         let (failure, inboxes) = await AgentMailService.probeKey(key)
         if let failure {
-            print("  ⚠ could not list inboxes right now (\(failure)) — continuing; Ada retries at runtime")
+            print("  ⚠ could not list inboxes right now (\(failure)) — continuing; Briglia retries at runtime")
         }
         save(KeychainHelper.agentMailApiKeyKey, key)
         if let inbox = inboxes.first {
             save(KeychainHelper.agentMailInboxAddressKey, inbox)
-            print("  ✔ Ada's inbox: \(inbox)")
+            print("  ✔ Briglia's inbox: \(inbox)")
         }
         save(KeychainHelper.emailCalendarProviderKey, EmailCalendarProvider.agentmail.rawValue)
 
@@ -788,40 +791,40 @@ struct SetupWizard {
             print("  ✔ agentmail CLI (key broker) already installed")
         } else {
             // A bare `agentmail` binary here (pre-broker install, npm, brew)
-            // cannot authenticate — Ada never puts the key in bash envs. The
+            // cannot authenticate — Briglia never puts the key in bash envs. The
             // installer overwrites ~/.local/bin/agentmail with the broker
-            // wrapper, migrating any legacy Ada install in place.
-            if WizardIO.askYesNo("Install the agentmail CLI (~5 MB, lets Ada read/send email)?", default: true) {
+            // wrapper, migrating any legacy Briglia install in place.
+            if WizardIO.askYesNo("Install the agentmail CLI (~5 MB, lets Briglia read/send email)?", default: true) {
                 if let installFailure = await AgentMailService.installAgentMailBinary(progress: { print("  \($0)") }) {
                     print("  ✖ agentmail CLI install failed: \(installFailure)")
-                    print("    Inbox alerts and context still work (Ada polls the API directly);")
-                    print("    rerun `ada setup` later to retry the CLI install.")
+                    print("    Inbox alerts and context still work (Briglia polls the API directly);")
+                    print("    rerun `briglia setup` later to retry the CLI install.")
                 } else {
                     print("  ✔ agentmail CLI installed to ~/.local/bin/agentmail (key broker + binary)")
                 }
             } else {
-                print("  Skipped the CLI — inbox alerts and context still work; Ada can use the REST API via curl for actions.")
+                print("  Skipped the CLI — inbox alerts and context still work; Briglia can use the REST API via curl for actions.")
             }
         }
         let foreign = AgentMailService.foreignAgentMailInstalls()
         if !foreign.isEmpty {
             print("""
               ⚠ another agentmail install exists at \(foreign.joined(separator: ", ")) —
-                it has no access to Ada's key and may shadow Ada's wrapper
+                it has no access to Briglia's key and may shadow Briglia's wrapper
                 depending on PATH order. Consider removing it.
             """)
         }
-        print("  ✔ AgentMail + calendar configured — activates the next time Ada starts")
+        print("  ✔ AgentMail + calendar configured — activates the next time Briglia starts")
     }
 
     private func configureGoogleWorkspace() async {
-        // 1. OAuth client: Ada no longer ships one — the user provides their own.
+        // 1. OAuth client: Briglia no longer ships one — the user provides their own.
         let secretFileExists = FileManager.default.fileExists(atPath: GoogleWorkspaceService.clientSecretFileURL.path)
         if secretFileExists {
             print("  ✔ found existing ~/.config/gws/client_secret.json — keeping it")
         } else {
             print("""
-              gws needs YOUR OWN Google OAuth client (Ada does not ship one):
+              gws needs YOUR OWN Google OAuth client (Briglia does not ship one):
                 1. console.cloud.google.com → create or select a project
                 2. Enable the Gmail API and the Google Calendar API
                 3. OAuth consent screen → External → add yourself as a test user
@@ -862,16 +865,16 @@ struct SetupWizard {
         } else if WizardIO.askYesNo("Install gws now (~6 MB)?", default: true) {
             if let failure = await GoogleWorkspaceService.installGwsBinary() {
                 print("  ✖ gws install failed: \(failure)")
-                print("    Ada will run without email/calendar context until it's installed.")
+                print("    Briglia will run without email/calendar context until it's installed.")
             } else {
                 print("""
                   ✔ gws installed. To authorize it, run `gws auth login` in
                     another terminal (opens a browser). Email/calendar context
-                    activates the next time Ada starts.
+                    activates the next time Briglia starts.
                 """)
             }
         } else {
-            print("  Skipped the gws install — rerun `ada setup` any time.")
+            print("  Skipped the gws install — rerun `briglia setup` any time.")
         }
         save(KeychainHelper.emailCalendarProviderKey, EmailCalendarProvider.gws.rawValue)
     }
@@ -899,13 +902,13 @@ struct SetupWizard {
             }
         }
         print("""
-        Optional: talk to Ada from your phone via a Telegram bot, and run
-        `ada daemon` for a headless always-on Ada.
+        Optional: talk to Briglia from your phone via a Telegram bot, and run
+        `briglia daemon` for a headless always-on Briglia.
           1. In Telegram, message @BotFather → /newbot → copy the token.
           2. Message @userinfobot to get your numeric chat ID.
         """)
         guard WizardIO.askYesNo("Set up Telegram now?", default: false) else {
-            print("  Skipped — rerun `ada setup` any time to add it.")
+            print("  Skipped — rerun `briglia setup` any time to add it.")
             return
         }
         let token = await WizardIO.askSecretValidated(
@@ -929,7 +932,7 @@ struct SetupWizard {
         }
         save(KeychainHelper.telegramBotTokenKey, token)
         save(KeychainHelper.telegramChatIdKey, chatId)
-        print("  ✔ Telegram connected — messages to your bot reach Ada while `ada` or `ada daemon` is running")
+        print("  ✔ Telegram connected — messages to your bot reach Briglia while `briglia` or `briglia daemon` is running")
     }
 
     // MARK: Summary + helpers
@@ -975,7 +978,7 @@ struct SetupWizard {
 
         ✖ Could not write configuration to \(StoragePaths.configRootDisplay)/secrets.json:
           \(error.localizedDescription)
-          Fix the directory permissions (or free disk space) and run `ada setup` again.
+          Fix the directory permissions (or free disk space) and run `briglia setup` again.
           Nothing from this run was saved.
         """)
         Foundation.exit(1)
@@ -998,14 +1001,14 @@ enum OpenCodeGo {
         // Multimodal sibling of GLM 5.3 with the same reasoning contract:
         // reasoning_content on plain + tool-call turns, replay accepted,
         // implicit prefix caching, reasoning_tokens/cached_tokens in usage,
-        // effort restricted to low/high/max. Ada's 5.3 effort remap and
+        // effort restricted to low/high/max. Briglia's 5.3 effort remap and
         // thinking-flag omission match on the "glm-5.3" substring, so both
         // apply automatically. Full vision through the Go gateway (data-URL
         // image parts, layout-describe verified) — verified 2026-08-26.
         ("glm-5.3-flash", "GLM 5.3 Flash", false),
         ("kimi-k2.6", "Kimi K2.6", false),
         // reasoning_content on plain + tool-call turns, replay accepted,
-        // implicit prefix caching; effort restricted to low/high/max (Ada
+        // implicit prefix caching; effort restricted to low/high/max (Briglia
         // remaps minimal/medium/xhigh), thinking flag must stay omitted,
         // images rejected — verified 2026-08-14, replacing glm-5.2.
         ("glm-5.3", "GLM 5.3", true),
