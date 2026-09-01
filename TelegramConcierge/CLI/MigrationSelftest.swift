@@ -1614,6 +1614,16 @@ struct MigrationSelftest: AsyncParsableCommand {
             ]
             #if os(Linux)
             candidates.append(home + "/.config/\(domain).plist")
+            // corelibs resolves `homeDirectoryForCurrentUser` through the
+            // passwd entry but persists UserDefaults under $HOME; the two
+            // differ on hosted CI containers (HOME=/github/home, passwd
+            // /root). Every real install has them equal — the probe must
+            // still find the file wherever corelibs actually put it.
+            if let envHome = env["HOME"], !envHome.isEmpty, envHome != home {
+                candidates += [envHome + "/.config/\(domain).plist",
+                               envHome + "/.local/share/\(domain).plist",
+                               envHome + "/Library/Preferences/\(domain).plist"]
+            }
             #endif
             let found = candidates.first { fm.fileExists(atPath: $0) }
             check("preferences persist to a discoverable per-user plist", found != nil,
