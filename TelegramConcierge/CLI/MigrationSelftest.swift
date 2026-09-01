@@ -229,17 +229,47 @@ struct MigrationSelftest: AsyncParsableCommand {
             echo "$@" >> "$SD/log"
             if [ "$1" = "--user" ]; then shift; fi
             verb="$1"; unit="$2"
+            # Broken-query seam: systemd/dbus itself failing must never read
+            # as "inactive" (Codex round 2 #4).
+            if [ "${FAKE_SYSTEMCTL_BREAK_QUERY:-0}" = "1" ]; then
+                case "$verb" in is-enabled|is-active) echo "Failed to connect to bus: garbage"; exit 127;; esac
+            fi
+            # Real systemd rejects lifecycle operations on a unit with no
+            # unit file ("not loaded", exit 5) and answers is-enabled with a
+            # unit-file-state error — retried rollbacks must survive both.
+            loaded=1
+            if [ -n "$unit" ] && [ ! -f "\(unitDir)/$unit" ] && [ ! -f "\(systemUnits)/$unit" ]; then loaded=0; fi
             case "$verb" in
               daemon-reload) exit 0;;
-              is-enabled) if [ -f "$SD/$unit.enabled" ]; then echo enabled; else echo disabled; fi; exit 0;;
+              is-enabled) if [ "$loaded" = 0 ]; then echo "Failed to get unit file state for $unit: No such file or directory"; exit 1; fi
+                          if [ -f "$SD/$unit.enabled" ]; then echo enabled; else echo disabled; fi; exit 0;;
               is-active)  if [ -f "$SD/$unit.active" ]; then echo active; else echo inactive; fi; exit 0;;
+              enable|disable|start|stop)
+                          if [ "$loaded" = 0 ]; then echo "Unit $unit not loaded."; exit 5; fi;;
+            esac
+            case "$verb" in
               enable) if [ "${FAKE_SYSTEMCTL_FAIL_ENABLE:-0}" = "1" ]; then echo "enable refused"; exit 1; fi
                       touch "$SD/$unit.enabled"; exit 0;;
               disable) rm -f "$SD/$unit.enabled"; exit 0;;
               stop) rm -f "$SD/$unit.active"
-                    if [ -f "$SD/$unit.pid" ]; then kill "$(cat "$SD/$unit.pid")" 2>/dev/null; rm -f "$SD/$unit.pid"; fi
+                    # The daemon fake writes its pidfile asynchronously after
+                    # start returns — wait for it briefly, or a fast
+                    # stop-after-start would leak a lock holder whose flock
+                    # then travels back with the rolled-back data root.
+                    i=0
+                    while [ $i -lt 40 ]; do
+                        if [ -f "$SD/$unit.pid" ]; then
+                            echo "STOPKILL $unit pid=$(cat "$SD/$unit.pid")" >> "$SD/log"
+                            kill "$(cat "$SD/$unit.pid")" 2>/dev/null
+                            rm -f "$SD/$unit.pid"; break
+                        fi
+                        if [ "$unit" != "briglia-test.service" ]; then break; fi
+                        sleep 0.05; i=$((i+1))
+                    done
+                    if [ "$unit" = "briglia-test.service" ] && [ $i -ge 40 ]; then echo "STOPKILL $unit TIMEOUT no pidfile" >> "$SD/log"; fi
                     exit 0;;
               start) if [ "${FAKE_SYSTEMCTL_FAIL_START:-0}" = "1" ]; then echo "start refused"; exit 1; fi
+                     if [ -n "${FAKE_SYSTEMCTL_FAIL_START_UNIT:-}" ] && [ "$unit" = "$FAKE_SYSTEMCTL_FAIL_START_UNIT" ]; then echo "start refused for $unit"; exit 1; fi
                      touch "$SD/$unit.active"
                      if [ "$unit" = "briglia-test.service" ]; then
                        nohup python3 "$SD/lockholder.py" "\(newData)/instance.lock" "$SD/$unit.pid" >/dev/null 2>&1 &
@@ -687,6 +717,21 @@ struct MigrationSelftest: AsyncParsableCommand {
                 $0["preimages"] = [["id": "pre-0000", "type": "file",
                                     "path": fixture.oldConfig + "/secrets.json"]]
             }
+            try expectCorrupt("preimage id with path traversal", needle: "invalid preimage id") {
+                $0["preimages"] = [["id": "../evil", "type": "file",
+                                    "path": fixture.oldConfig + "/secrets.json",
+                                    "sha256": "00"]]
+            }
+            try expectCorrupt("duplicate preimage ids", needle: "duplicate preimage id") {
+                $0["preimages"] = [
+                    ["id": "pre-0000", "type": "absent", "path": fixture.oldConfig + "/a"],
+                    ["id": "pre-0000", "type": "absent", "path": fixture.oldConfig + "/b"]]
+            }
+            try expectCorrupt("truncated roots array", needle: "roots where the spec defines") {
+                var roots = $0["roots"] as! [[String: Any]]
+                roots.removeLast()
+                $0["roots"] = roots
+            }
             // Spec mismatch: same journal, different invoking spec.
             try original.write(toFile: journalPath, atomically: true, encoding: .utf8)
             var mismatched = fixture.spec
@@ -1050,6 +1095,145 @@ struct MigrationSelftest: AsyncParsableCommand {
                   sha(fixture.oldWakelockUnit) == wakelockBytes
                   && !fm.fileExists(atPath: fixture.newWakelockUnit)
                   && fm.fileExists(atPath: fixture.sysd + "/ada-keepawake-test.service.active"))
+        }
+
+        // ============================================================
+        print("\n— round 2: honest refusals, broken systemctl, retry idempotency, durability faults —")
+
+        do {
+            // Pre-move restart failure must be REPORTED, not hidden behind
+            // "the installation is untouched".
+            let fixture = try makeFixture("restart-honesty")
+            let fd = open(fixture.oldData + "/instance.lock", O_RDWR)
+            _ = flock(fd, LOCK_EX | LOCK_NB)
+            let result = runEngine(fixture, env: ["FAKE_SYSTEMCTL_FAIL_START": "1"])
+            flock(fd, LOCK_UN); close(fd)
+            check("pre-move restart failure: refusal names the failed restart",
+                  result.code == 2 && result.output.contains("could NOT be restarted"),
+                  result.output)
+        }
+
+        do {
+            // Broken systemctl queries refuse at capture — never recorded
+            // as "inactive/disabled".
+            let fixture = try makeFixture("broken-query")
+            let before = snapshot(fixture.restoreRoots)
+            let result = runEngine(fixture, env: ["FAKE_SYSTEMCTL_BREAK_QUERY": "1"])
+            check("broken is-active/is-enabled: refused at capture",
+                  result.code == 2 && result.output.contains("cannot capture the service state"),
+                  result.output)
+            check("broken query: nothing changed, no journal left",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty
+                  && !fm.fileExists(atPath: fixture.stateDir))
+        }
+
+        do {
+            // Retry idempotency against real systemd semantics: the first
+            // rollback (triggered by a failed probe) deletes the new unit
+            // file, then fails restarting the old service; the retry must
+            // NOT trip over stop/disable of the now-unloaded new unit
+            // (which the fake, like real systemctl, rejects with exit 5).
+            let fixture = try makeFixture("retry-unloaded-unit", probeFails: true)
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let failed = runEngine(fixture,
+                                   env: ["FAKE_SYSTEMCTL_FAIL_START_UNIT": "ada-test.service"])
+            check("retry-unloaded: first rollback fails at the old-service restart, journal kept",
+                  failed.code == 1
+                  && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), failed.output)
+            let retried = runEngine(fixture, args: ["--rollback"])
+            if retried.code != 0 {
+                note("sysd log: " + readText(fixture.sysd + "/log")
+                    .replacingOccurrences(of: "\n", with: " | "))
+                let lsof = MigrationEngine.runBounded(
+                    ["/usr/sbin/lsof", fixture.oldData + "/instance.lock"], timeout: 20)
+                note("lsof: " + lsof.output.replacingOccurrences(of: "\n", with: " | "))
+                let ps = MigrationEngine.runBounded(["/bin/ps", "ax"], timeout: 20)
+                for line in ps.output.split(separator: "\n")
+                    where line.contains("lockholder") && line.contains("retry-unloaded") {
+                    note("ps: \(line)")
+                }
+            }
+            check("retry-unloaded: retry skips the unloaded new unit and completes",
+                  retried.code == 0, retried.output)
+            check("retry-unloaded: byte-identical restore, old service active",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty
+                  && fm.fileExists(atPath: fixture.sysd + "/ada-test.service.active"))
+        }
+
+        do {
+            // A rollback whose root move-back cannot be made durable fails
+            // honestly and keeps the journal; the retry completes.
+            let fixture = try makeFixture("rollback-fsync-fault")
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-moved"])
+            check("rollback-fsync-fault: crash injected", crashed.code == 137)
+            let faulted = runEngine(fixture, args: ["--rollback"],
+                                    env: ["ADA_MIGRATE_FAULT": "rollback-move-fsync"])
+            check("rollback-fsync-fault: durability failure surfaces, journal kept",
+                  faulted.code == 1 && faulted.output.contains("not durable")
+                  && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), faulted.output)
+            let retried = runEngine(fixture, args: ["--rollback"])
+            check("rollback-fsync-fault: clean retry restores byte-identically",
+                  retried.code == 0
+                  && snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty,
+                  retried.output)
+        }
+
+        do {
+            // A preferences write that cannot be persisted fails the fixup
+            // and the automatic rollback restores everything.
+            let fixture = try makeFixture("prefs-sync-fault", units: false, prefs: true)
+            let oldDomain = fixture.spec.oldPrefsDomain!
+            let newDomain = fixture.spec.newPrefsDomain!
+            defer {
+                UserDefaults.standard.removePersistentDomain(forName: oldDomain)
+                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                UserDefaults.standard.synchronize()
+            }
+            UserDefaults.standard.setPersistentDomain(seededPrefs, forName: oldDomain)
+            UserDefaults.standard.synchronize()
+            let before = snapshot(fixture.restoreRoots)
+            let result = runEngine(fixture, env: ["ADA_MIGRATE_FAULT": "prefs-sync"])
+            check("prefs-sync fault: fixup failure rolls back automatically",
+                  result.code == 1 && result.output.contains("persisted"), result.output)
+            check("prefs-sync fault: byte-identical restore, old domain intact, new domain gone",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty
+                  && dumpPrefs(oldDomain).contains("strict")
+                  && dumpPrefs(newDomain) == "{}")
+        }
+
+        do {
+            // Cleanup deletion failures are reported and retried — never
+            // silently suppressed.
+            let fixture = try makeFixture("cleanup-retry")
+            defer { killHolders(fixture) }
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-committed"])
+            check("cleanup-retry: crash injected after committed", crashed.code == 137,
+                  crashed.output)
+            let parkedPath = fixture.stateDir + "/parked"
+            if getuid() == 0 {
+                // Root ignores directory permissions, so the undeletable-dir
+                // simulation is impossible here (Linux CI containers run as
+                // root); the failure branch is covered by non-root runs.
+                note("running as root — skipping the undeletable-parked-dir simulation")
+                let finished = runEngine(fixture)
+                check("cleanup-retry (root): committed journal re-verifies and cleans up",
+                      finished.code == 0 && !fm.fileExists(atPath: fixture.stateDir),
+                      finished.output)
+            } else {
+                try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parkedPath)
+                let held = runEngine(fixture)
+                check("cleanup-retry: undeletable parked dir reported, journal retained",
+                      held.code == 0 && held.output.contains("could not remove")
+                      && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), held.output)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parkedPath)
+                let finished = runEngine(fixture)
+                check("cleanup-retry: after repair, cleanup completes and the journal is gone",
+                      finished.code == 0 && !fm.fileExists(atPath: fixture.stateDir),
+                      finished.output)
+            }
         }
 
         // ============================================================

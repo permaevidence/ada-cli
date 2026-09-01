@@ -427,7 +427,19 @@ final class MigrationEngine {
                 canonical.hasPrefix(root.hasSuffix("/") ? root : root + "/")
             }
         }
+        // Preimage ids become filesystem paths under preimages/ — constrain
+        // the alphabet (no separators, no traversal) and require uniqueness
+        // so a corrupted journal cannot alias two records onto one stored
+        // preimage (Codex Stage 3 round 2 #2).
+        var seenPreimageIDs = Set<String>()
         for pre in journal.preimages {
+            guard !pre.id.isEmpty,
+                  pre.id.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) else {
+                return .failure(LoadFailure(message: "the migration journal has an invalid preimage id \"\(pre.id)\" — refusing to act on it"))
+            }
+            guard seenPreimageIDs.insert(pre.id).inserted else {
+                return .failure(LoadFailure(message: "the migration journal has a duplicate preimage id \"\(pre.id)\" — refusing to act on it"))
+            }
             switch pre.type {
             case "file":
                 guard pre.sha256 != nil, !pre.id.isEmpty else {
@@ -463,7 +475,11 @@ final class MigrationEngine {
             "binary": spec.oldBinary,
             "bundle": spec.oldBundle,
         ]
+        var seenParkedIDs = Set<String>()
         for parked in journal.parked {
+            guard seenParkedIDs.insert(parked.id).inserted else {
+                return .failure(LoadFailure(message: "the migration journal has a duplicate parked id \"\(parked.id)\" — refusing to act on it"))
+            }
             guard let expected = parkedTargets[parked.id] ?? nil,
                   parked.originalPath == expected else {
                 return .failure(LoadFailure(message: "the migration journal records an unexpected parked asset (\(parked.id) → \(parked.originalPath)) — refusing to act on it"))
@@ -481,10 +497,11 @@ final class MigrationEngine {
                 return .failure(LoadFailure(message: "the migration journal has a parked asset of unknown kind \"\(parked.kind)\" — refusing to act on it"))
             }
         }
-        // Roots must be exactly the spec's pairs, in order.
+        // Roots must be exactly the spec's pairs, in order and in FULL — a
+        // truncated array would silently skip a root during recovery.
         let specPairs = spec.rootPairs
-        guard journal.roots.count <= specPairs.count else {
-            return .failure(LoadFailure(message: "the migration journal records more roots than the spec defines — refusing to act on it"))
+        guard journal.roots.count == specPairs.count else {
+            return .failure(LoadFailure(message: "the migration journal records \(journal.roots.count) roots where the spec defines \(specPairs.count) — refusing to act on it"))
         }
         for (index, root) in journal.roots.enumerated() {
             guard root.old == specPairs[index].old, root.new == specPairs[index].new else {
@@ -551,6 +568,12 @@ final class MigrationEngine {
     }
 
     // ----------------------------------------------------- crash seams
+
+    /// Fault-injection seam for durability tests (same pattern as
+    /// ADA_TOOLCHAIN_FAULT): "rollback-move-fsync" | "prefs-sync".
+    static var faultPoint: String? {
+        ProcessInfo.processInfo.environment["ADA_MIGRATE_FAULT"]
+    }
 
     /// Test-only crash injection: a REAL process death (no defers, no
     /// cleanup) at named points after every destructive sub-step, driven by
@@ -728,8 +751,30 @@ final class MigrationEngine {
                                          O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         posix_spawn_file_actions_adddup2(&fileActions, 1, 2)
 
+        // SETSIGDEF + empty SETSIGMASK: give the child clean signal state,
+        // exactly as Foundation Process does when it spawns. Raw posix_spawn
+        // otherwise propagates inherited ignored dispositions AND the signal
+        // mask — observed live in the selftest, where a daemon started
+        // through this path (fake systemctl → lock holder) inherited an
+        // unkillable SIGTERM from the harness ancestry and outlived every
+        // stop (the SetsidExec lesson, second sighting).
+        #if os(Linux)
+        var attr = posix_spawnattr_t()
+        #else
+        var attr: posix_spawnattr_t? = nil
+        #endif
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        var defaultSigs = sigset_t()
+        sigfillset(&defaultSigs)
+        posix_spawnattr_setsigdefault(&attr, &defaultSigs)
+        var emptyMask = sigset_t()
+        sigemptyset(&emptyMask)
+        posix_spawnattr_setsigmask(&attr, &emptyMask)
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSIGDEF) | Int16(POSIX_SPAWN_SETSIGMASK))
+
         var pid: pid_t = 0
-        let rc = posix_spawn(&pid, exe, &fileActions, nil, cargs, cenv)
+        let rc = posix_spawn(&pid, exe, &fileActions, &attr, cargs, cenv)
         guard rc == 0 else {
             return RunResult(exitCode: 127, output: "\(exe): \(String(cString: strerror(rc)))")
         }
@@ -786,13 +831,38 @@ final class MigrationEngine {
         }
     }
 
-    func unitActive(_ name: String, system: Bool = false) -> Bool {
-        (system ? systemctlSystem(["is-active", name]) : systemctl(["is-active", name]))
-            .output.trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+    /// Unit-state probes that DISTINGUISH "definitely not active/enabled"
+    /// from "the query itself failed" (command missing, timeout, permission
+    /// error, garbage output). Interpreting a broken systemctl as "inactive"
+    /// would let capture record — and rollback verify — fiction (Codex
+    /// Stage 3 round 2 #4).
+    struct UnitQueryFailure: Error { let message: String }
+
+    func queryActive(_ name: String, system: Bool) throws -> Bool {
+        let result = system ? systemctlSystem(["is-active", name])
+                            : systemctl(["is-active", name])
+        let out = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if out == "active" || out == "activating" { return out == "active" }
+        let negative = ["inactive", "failed", "unknown", "deactivating", "not-found"]
+        if negative.contains(out) { return false }
+        throw UnitQueryFailure(message: "could not determine whether \(name) is active "
+            + "(systemctl is-active exit \(result.exitCode): "
+            + "\(out.isEmpty ? "no output" : out))")
     }
-    func unitEnabled(_ name: String, system: Bool = false) -> Bool {
-        (system ? systemctlSystem(["is-enabled", name]) : systemctl(["is-enabled", name]))
-            .output.trimmingCharacters(in: .whitespacesAndNewlines) == "enabled"
+
+    func queryEnabled(_ name: String, system: Bool) throws -> Bool {
+        let result = system ? systemctlSystem(["is-enabled", name])
+                            : systemctl(["is-enabled", name])
+        let out = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if out == "enabled" { return true }
+        let negative = ["disabled", "static", "masked", "indirect", "not-found",
+                        "linked", "alias"]
+        if negative.contains(out) { return false }
+        // systemd's answer for a unit with no unit file:
+        if out.hasPrefix("Failed to get unit file state") { return false }
+        throw UnitQueryFailure(message: "could not determine whether \(name) is enabled "
+            + "(systemctl is-enabled exit \(result.exitCode): "
+            + "\(out.isEmpty ? "no output" : out))")
     }
 
     var wakelockConfigured: Bool {
@@ -870,8 +940,11 @@ final class MigrationEngine {
 
             // 2. Stop what we manage; refuse an unmanaged holder.
             if let refusal = try stopManagedAndCheckLock() {
-                try restoreServiceAfterRefusal()
+                let restartProblem = restoreServiceAfterRefusal()
                 cleanupJournalArea()
+                if let restartProblem {
+                    return .refused(refusal + ". ALSO: " + restartProblem)
+                }
                 return .refused(refusal)
             }
 
@@ -891,34 +964,39 @@ final class MigrationEngine {
     }
 
     func capture(existingRoots: [(old: String, new: String)]) throws {
-        if unitManaged, let unitPath = oldUnitPath, let unitName = spec.oldUnitName {
-            let installed = fm.fileExists(atPath: unitPath)
-            var enabled = false
-            var active = false
-            if installed {
-                enabled = systemctl(["is-enabled", unitName]).output
-                    .trimmingCharacters(in: .whitespacesAndNewlines) == "enabled"
-                active = systemctl(["is-active", unitName]).output
-                    .trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+        // Capture flags come from throwing queries: if systemctl itself is
+        // broken, the migration must refuse now — not record fiction that
+        // commit and rollback would later "restore".
+        do {
+            if unitManaged, let unitPath = oldUnitPath, let unitName = spec.oldUnitName {
+                let installed = fm.fileExists(atPath: unitPath)
+                journal.oldService = MigrationJournal.UnitCapture(
+                    name: unitName, unitPath: unitPath,
+                    installed: installed,
+                    enabled: installed ? try queryEnabled(unitName, system: false) : false,
+                    active: installed ? try queryActive(unitName, system: false) : false)
             }
-            journal.oldService = MigrationJournal.UnitCapture(
-                name: unitName, unitPath: unitPath,
-                installed: installed, enabled: enabled, active: active)
+            if wakelockConfigured, let unitPath = spec.oldWakelockUnitPath,
+               let unitName = spec.oldWakelockUnitName {
+                let installed = fm.fileExists(atPath: unitPath)
+                journal.wakelockService = MigrationJournal.UnitCapture(
+                    name: unitName, unitPath: unitPath,
+                    installed: installed,
+                    enabled: installed ? try queryEnabled(unitName, system: true) : false,
+                    active: installed ? try queryActive(unitName, system: true) : false)
+            }
+        } catch let failure as UnitQueryFailure {
+            cleanupJournalArea()
+            throw EngineError(outcome: .refused(
+                "cannot capture the service state: \(failure.message) — fix systemctl "
+                + "access first; nothing was changed"))
         }
-        if wakelockConfigured, let unitPath = spec.oldWakelockUnitPath,
-           let unitName = spec.oldWakelockUnitName {
-            let installed = fm.fileExists(atPath: unitPath)
-            journal.wakelockService = MigrationJournal.UnitCapture(
-                name: unitName, unitPath: unitPath,
-                installed: installed,
-                enabled: installed && unitEnabled(unitName, system: true),
-                active: installed && unitActive(unitName, system: true))
-            if installed && !spec.wakelockPrivileged {
-                journal.warnings.append(
-                    "the keep-awake unit \(unitName) is installed but this process has no "
-                    + "privileges to migrate system units — its captured state is recorded; "
-                    + "swap it via the companion app (or manually) after migration")
-            }
+        if let wakelock = journal.wakelockService,
+           wakelock.installed, !spec.wakelockPrivileged {
+            journal.warnings.append(
+                "the keep-awake unit \(wakelock.name) is installed but this process has no "
+                + "privileges to migrate system units — its captured state is recorded; "
+                + "swap it via the companion app (or manually) after migration")
         }
         var st = stat()
         if lstat(spec.oldBinary, &st) == 0 {
@@ -961,11 +1039,22 @@ final class MigrationEngine {
         return nil
     }
 
-    func restoreServiceAfterRefusal() throws {
-        if journal.stoppedOldService, let service = journal.oldService, service.active {
-            _ = systemctl(["start", service.name])
-            log("restarted \(service.name) after refusal")
+    /// Restart the managed service we stopped, VERIFIED. Returns nil on
+    /// success (or nothing to do); otherwise a one-line detail the caller
+    /// must surface — a refusal that silently leaves the daemon down would
+    /// be a lie (Codex Stage 3 round 2 #1).
+    func restoreServiceAfterRefusal() -> String? {
+        guard journal.stoppedOldService, let service = journal.oldService,
+              service.active else { return nil }
+        let start = systemctl(["start", service.name])
+        let activeNow = (try? queryActive(service.name, system: false)) ?? false
+        guard start.exitCode == 0, activeNow else {
+            return "the managed service \(service.name) was stopped for the migration and "
+                + "could NOT be restarted (exit \(start.exitCode): \(start.tail)) — start it "
+                + "manually: systemctl --user start \(service.name)"
         }
+        log("restarted \(service.name) after refusal")
+        return nil
     }
 
     /// Refusal before anything moved: the journal area must not linger — a
@@ -1290,7 +1379,11 @@ final class MigrationEngine {
             sha256: nil, mode: nil, uid: nil, gid: nil, target: nil))
         try persistJournal()
         defaults.setPersistentDomain(contents, forName: newDomain)
-        defaults.synchronize()
+        guard defaults.synchronize(), Self.faultPoint != "prefs-sync" else {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "the copied \(newDomain) preferences domain could not be persisted "
+                + "(synchronize failed)"))
+        }
         notes.append("preferences domain \(oldDomain) copied to \(newDomain)")
     }
 
@@ -1539,7 +1632,12 @@ final class MigrationEngine {
            journal.preimages.contains(where: { $0.type == "prefs-old-domain" }) {
             let defaults = UserDefaults.standard
             defaults.removePersistentDomain(forName: oldDomain)
-            defaults.synchronize()
+            guard defaults.synchronize() else {
+                throw EngineError(outcome: .failed(
+                    "removal of the old \(oldDomain) preferences domain could not be "
+                    + "persisted (synchronize failed) — the journal is preserved; re-run "
+                    + "`\(spec.recoveryHint)` to resume"))
+            }
         }
 
         // Compat symlink (plan §4.6): only over the just-parked verified
@@ -1549,6 +1647,12 @@ final class MigrationEngine {
             try? fm.removeItem(atPath: spec.oldBinary)
             try fm.createSymbolicLink(atPath: spec.oldBinary,
                                       withDestinationPath: spec.newBinary)
+            if let why = Self.fsyncPath(URL(fileURLWithPath:
+                (spec.oldBinary as NSString).deletingLastPathComponent)) {
+                throw EngineError(outcome: .failed(
+                    "the compatibility symlink is not durable: \(why) — the journal is "
+                    + "preserved; re-run `\(spec.recoveryHint)` to resume"))
+            }
             journal.symlinkCreated = true
             try persistJournal()
             log("compatibility symlink \(spec.oldBinary) → \(spec.newBinary)")
@@ -1580,16 +1684,23 @@ final class MigrationEngine {
                 problems.append("compat symlink does not resolve to \(spec.newBinary)")
             }
         }
+        func probedActive(_ name: String, system: Bool) -> Bool? {
+            do { return try queryActive(name, system: system) } catch {
+                problems.append((error as? UnitQueryFailure)?.message
+                    ?? "unit query failed for \(name)")
+                return nil
+            }
+        }
         if let service = journal.oldService, service.installed {
             if fm.fileExists(atPath: service.unitPath) {
                 problems.append("old unit file still present: \(service.unitPath)")
             }
-            if unitManaged, unitActive(service.name) {
+            if unitManaged, probedActive(service.name, system: false) == true {
                 problems.append("the old unit \(service.name) is still active")
             }
         }
         if journal.startedNewWakelock, let name = spec.newWakelockUnitName,
-           !unitActive(name, system: true) {
+           probedActive(name, system: true) == false {
             problems.append("the new keep-awake unit \(name) is not active")
         }
         if let wakelock = journal.wakelockService, wakelock.installed,
@@ -1597,7 +1708,7 @@ final class MigrationEngine {
             if fm.fileExists(atPath: wakelock.unitPath) {
                 problems.append("old keep-awake unit file still present: \(wakelock.unitPath)")
             }
-            if unitActive(wakelock.name, system: true) {
+            if probedActive(wakelock.name, system: true) == true {
                 problems.append("the old keep-awake unit \(wakelock.name) is still active")
             }
         }
@@ -1609,16 +1720,29 @@ final class MigrationEngine {
         }
         try setState("done")
         // Cleanup: parked assets and preimages first, the journal last —
-        // its deletion is what marks the migration finished.
-        try? fm.removeItem(at: parkedDir)
-        try? fm.removeItem(at: preimagesDir)
-        if fm.fileExists(atPath: journalURL.path) {
-            guard unlink(journalURL.path) == 0 else {
-                notes.append("migration complete, but the journal could not be deleted "
-                    + "(\(String(cString: strerror(errno)))) — the next run re-verifies and retries")
+        // its deletion is what marks the migration finished. A failed
+        // deletion is REPORTED and leaves the journal so the next run
+        // re-verifies and retries; suppressing it would strand parked
+        // assets invisibly (Codex Stage 3 round 2 #4).
+        for dir in [parkedDir, preimagesDir] where fm.fileExists(atPath: dir.path) {
+            do { try fm.removeItem(at: dir) } catch {
+                notes.append("migration committed and verified, but cleanup could not remove "
+                    + "\(dir.lastPathComponent) (\(error.localizedDescription)) — the journal "
+                    + "stays; the next run re-verifies and retries the cleanup")
                 return
             }
-            _ = Self.fsyncPath(stateDirURL)
+        }
+        if fm.fileExists(atPath: journalURL.path) {
+            guard unlink(journalURL.path) == 0 else {
+                notes.append("migration committed and verified, but the journal could not be "
+                    + "deleted (\(String(cString: strerror(errno)))) — the next run re-verifies and retries")
+                return
+            }
+            if let why = Self.fsyncPath(stateDirURL) {
+                notes.append("migration committed and verified, but the journal deletion may "
+                    + "not be durable yet: \(why)")
+                return
+            }
         }
         try? fm.removeItem(at: stateDirURL)
         notes.append("migration committed and verified")
@@ -1634,10 +1758,15 @@ final class MigrationEngine {
             // touching anything, whatever direction recovery takes; the
             // captured flags still decide what gets restored or recreated.
             if let service = journal.oldService, service.installed {
-                let active = systemctl(["is-active", service.name]).output
-                    .trimmingCharacters(in: .whitespacesAndNewlines) == "active"
+                let active: Bool
+                do { active = try queryActive(service.name, system: false) } catch {
+                    return .failed("cannot determine the old service's state during recovery: "
+                        + "\((error as? UnitQueryFailure)?.message ?? "\(error)") — the journal "
+                        + "at \(journalURL.path) is preserved; fix systemctl access and re-run "
+                        + "`\(spec.recoveryHint)`")
+                }
                 if active {
-                    _ = systemctl(["stop", service.name])
+                    try systemctlChecked(["stop", service.name], context: "recovery")
                     journal.stoppedOldService = true
                     try persistJournal()
                 }
@@ -1762,6 +1891,35 @@ final class MigrationEngine {
         return nil
     }
 
+    /// Stop and disable the new-identity units this migration started or
+    /// enabled, exactly as far as they still exist: query current state
+    /// first (throwing on broken queries), operate checked only on what is
+    /// actually active/enabled.
+    func stopNewIdentityUnits(context: String) throws {
+        do {
+            if journal.startedNewUnit, let name = spec.newUnitName,
+               try queryActive(name, system: false) {
+                try systemctlChecked(["stop", name], context: context)
+            }
+            if journal.newUnitEnabled, let name = spec.newUnitName,
+               try queryEnabled(name, system: false) {
+                try systemctlChecked(["disable", name], context: context)
+            }
+            if journal.startedNewWakelock, let name = spec.newWakelockUnitName,
+               try queryActive(name, system: true) {
+                try systemctlChecked(["stop", name], system: true, context: context)
+            }
+            if journal.newWakelockEnabled, let name = spec.newWakelockUnitName,
+               try queryEnabled(name, system: true) {
+                try systemctlChecked(["disable", name], system: true, context: context)
+            }
+        } catch let failure as UnitQueryFailure {
+            throw EngineError(outcome: .failed(
+                "\(context): \(failure.message) — the journal at \(journalURL.path) is "
+                + "preserved; fix systemctl access and re-run `\(spec.recoveryHint)`"))
+        }
+    }
+
     /// Where a recorded path lives RIGHT NOW: a retried rollback runs after
     /// a partial one already moved some roots back, and restoring to the
     /// recorded new-root path would then recreate the new root from
@@ -1789,21 +1947,14 @@ final class MigrationEngine {
     /// hash), service topology; deletes everything the migration created.
     func rollback(reason: String?) throws {
         if let reason { log("rolling back: \(reason)") }
-        // Stop/disable anything we started on the new identity — CHECKED: a
+        // Stop/disable anything we started on the new identity — CHECKED (a
         // rollback that leaves the new service running while reporting
-        // success would be a lie (Codex Stage 3 round 1 #2).
-        if journal.startedNewUnit, let newUnitName = spec.newUnitName {
-            try systemctlChecked(["stop", newUnitName], context: "rollback")
-        }
-        if journal.newUnitEnabled, let newUnitName = spec.newUnitName {
-            try systemctlChecked(["disable", newUnitName], context: "rollback")
-        }
-        if journal.startedNewWakelock, let name = spec.newWakelockUnitName {
-            try systemctlChecked(["stop", name], system: true, context: "rollback")
-        }
-        if journal.newWakelockEnabled, let name = spec.newWakelockUnitName {
-            try systemctlChecked(["disable", name], system: true, context: "rollback")
-        }
+        // success would be a lie), but guarded by CURRENT state, not the
+        // historical flags: a retried rollback runs after the unit file is
+        // already gone, and real systemctl rejects operations on an
+        // unloaded unit — the retry must still reach the old-service
+        // restore (Codex Stage 3 round 2 #3).
+        try stopNewIdentityUnits(context: "rollback")
 
         // Preimages in reverse order, each at its CURRENT location.
         for pre in journal.preimages.reversed() {
@@ -1858,16 +2009,29 @@ final class MigrationEngine {
                             "rollback could not restore the ownership of \(location): "
                             + "\(String(cString: strerror(errno))) — the journal is preserved"))
                     }
+                    if let why = Self.fsyncPath(URL(fileURLWithPath: location)) {
+                        throw EngineError(outcome: .failed(
+                            "restored ownership of \(location) is not durable: \(why) — the journal is preserved"))
+                    }
                 }
             case "symlink":
                 try? fm.removeItem(atPath: location)
                 if let target = pre.target {
                     try fm.createSymbolicLink(atPath: location, withDestinationPath: target)
+                    if let why = Self.fsyncPath(URL(fileURLWithPath:
+                        (location as NSString).deletingLastPathComponent)) {
+                        throw EngineError(outcome: .failed(
+                            "restored symlink \(location) is not durable: \(why) — the journal is preserved"))
+                    }
                 }
             case "prefs-new-domain":
                 let defaults = UserDefaults.standard
                 defaults.removePersistentDomain(forName: pre.path)
-                defaults.synchronize()
+                guard defaults.synchronize() else {
+                    throw EngineError(outcome: .failed(
+                        "rollback could not persist the removal of the \(pre.path) "
+                        + "preferences domain (synchronize failed) — the journal is preserved"))
+                }
             case "prefs-old-domain":
                 // Before committing the old domain was never removed;
                 // re-import only if it is somehow missing.
@@ -1907,7 +2071,18 @@ final class MigrationEngine {
                         + "\(String(cString: strerror(errno))) — the journal is preserved; "
                         + "re-run `\(spec.recoveryHint)` to retry"))
                 }
-                _ = Self.fsyncPath(URL(fileURLWithPath: (root.old as NSString).deletingLastPathComponent))
+                for dir in [(root.old as NSString).deletingLastPathComponent,
+                            (root.new as NSString).deletingLastPathComponent] {
+                    var why = Self.fsyncPath(URL(fileURLWithPath: dir))
+                    if Self.faultPoint == "rollback-move-fsync" {
+                        why = "injected rollback-move-fsync fault"
+                    }
+                    if let why {
+                        throw EngineError(outcome: .failed(
+                            "rollback moved \(root.new) back but the move is not durable: \(why) "
+                            + "— the journal is preserved; re-run `\(spec.recoveryHint)` to retry"))
+                    }
+                }
                 journal.roots[index].moved = false
                 try persistJournal()
                 continue
@@ -1938,39 +2113,62 @@ final class MigrationEngine {
         // VERIFY the restored topology before declaring success — the
         // journal is deleted below, so this is the last honest moment
         // (Codex Stage 3 round 1 #2).
-        if unitManaged {
-            if let service = journal.oldService, service.installed,
-               unitActive(service.name) != service.active {
-                throw EngineError(outcome: .failed(
-                    "rollback finished but \(service.name) is \(service.active ? "not active" : "still active") "
-                    + "— captured topology not restored; the journal is preserved"))
+        do {
+            if unitManaged {
+                if let service = journal.oldService, service.installed,
+                   try queryActive(service.name, system: false) != service.active {
+                    throw EngineError(outcome: .failed(
+                        "rollback finished but \(service.name) is \(service.active ? "not active" : "still active") "
+                        + "— captured topology not restored; the journal is preserved"))
+                }
+                if let newUnitName = spec.newUnitName, journal.startedNewUnit,
+                   try queryActive(newUnitName, system: false) {
+                    throw EngineError(outcome: .failed(
+                        "rollback finished but \(newUnitName) is still active — the journal is preserved"))
+                }
             }
-            if let newUnitName = spec.newUnitName, journal.startedNewUnit,
-               unitActive(newUnitName) {
-                throw EngineError(outcome: .failed(
-                    "rollback finished but \(newUnitName) is still active — the journal is preserved"))
+            if spec.wakelockPrivileged {
+                if let wakelock = journal.wakelockService, wakelock.installed,
+                   try queryActive(wakelock.name, system: true) != wakelock.active {
+                    throw EngineError(outcome: .failed(
+                        "rollback finished but the keep-awake unit \(wakelock.name) does not match "
+                        + "its captured state — the journal is preserved"))
+                }
+                if let name = spec.newWakelockUnitName, journal.startedNewWakelock,
+                   try queryActive(name, system: true) {
+                    throw EngineError(outcome: .failed(
+                        "rollback finished but \(name) is still active — the journal is preserved"))
+                }
             }
-        }
-        if spec.wakelockPrivileged {
-            if let wakelock = journal.wakelockService, wakelock.installed,
-               unitActive(wakelock.name, system: true) != wakelock.active {
-                throw EngineError(outcome: .failed(
-                    "rollback finished but the keep-awake unit \(wakelock.name) does not match "
-                    + "its captured state — the journal is preserved"))
-            }
-            if let name = spec.newWakelockUnitName, journal.startedNewWakelock,
-               unitActive(name, system: true) {
-                throw EngineError(outcome: .failed(
-                    "rollback finished but \(name) is still active — the journal is preserved"))
-            }
+        } catch let failure as UnitQueryFailure {
+            throw EngineError(outcome: .failed(
+                "rollback finished but its verification could not query systemctl: "
+                + "\(failure.message) — the journal is preserved"))
         }
 
-        // Rollback complete — clear the journal area.
-        try? fm.removeItem(at: preimagesDir)
-        try? fm.removeItem(at: parkedDir)
+        // Rollback complete — clear the journal area, CHECKED: an orphaned
+        // journal on a rolled-back tree would send the next run into
+        // forward recovery the user never asked for.
+        for dir in [preimagesDir, parkedDir] where fm.fileExists(atPath: dir.path) {
+            do { try fm.removeItem(at: dir) } catch {
+                throw EngineError(outcome: .failed(
+                    "the rollback itself SUCCEEDED — every file was restored and verified — "
+                    + "but the journal area could not be cleared (\(error.localizedDescription)); "
+                    + "delete \(spec.stateDir) manually before the next migration attempt"))
+            }
+        }
         if fm.fileExists(atPath: journalURL.path) {
-            _ = unlink(journalURL.path)
-            _ = Self.fsyncPath(stateDirURL)
+            guard unlink(journalURL.path) == 0 else {
+                throw EngineError(outcome: .failed(
+                    "the rollback itself SUCCEEDED, but the journal could not be deleted "
+                    + "(\(String(cString: strerror(errno)))); delete \(spec.stateDir) manually "
+                    + "before the next migration attempt"))
+            }
+            if let why = Self.fsyncPath(stateDirURL) {
+                throw EngineError(outcome: .failed(
+                    "the rollback itself SUCCEEDED, but the journal deletion is not durable: "
+                    + "\(why); ensure \(spec.stateDir) is gone before the next attempt"))
+            }
         }
         try? fm.removeItem(at: stateDirURL)
         notes.append("every touched file was restored and verified against its preimage")
@@ -1984,13 +2182,7 @@ final class MigrationEngine {
         log("park-restoring rollback")
         // Anything started on the new identity goes down first, so old and
         // new never run side by side during the restore.
-        if journal.startedNewUnit, let newUnitName = spec.newUnitName {
-            try systemctlChecked(["stop", newUnitName], context: "park-restoring rollback")
-        }
-        if journal.startedNewWakelock, let name = spec.newWakelockUnitName {
-            try systemctlChecked(["stop", name], system: true,
-                                 context: "park-restoring rollback")
-        }
+        try stopNewIdentityUnits(context: "park-restoring rollback")
         // The compat symlink occupies the binary's path — remove it first
         // (it is also an `absent` record, so this is just ordering).
         if journal.symlinkCreated,
@@ -2023,10 +2215,13 @@ final class MigrationEngine {
                     }
                 }
             }
-            if let why = Self.fsyncPath(URL(fileURLWithPath:
-                (parked.originalPath as NSString).deletingLastPathComponent)) {
-                throw EngineError(outcome: .failed(
-                    "restore of \(parked.originalPath) is not durable: \(why) — the journal is preserved"))
+            for target in [parked.originalPath,
+                           (parked.originalPath as NSString).deletingLastPathComponent]
+                where parked.kind != "symlink" || target != parked.originalPath {
+                if let why = Self.fsyncPath(URL(fileURLWithPath: target)) {
+                    throw EngineError(outcome: .failed(
+                        "restore of \(parked.originalPath) is not durable: \(why) — the journal is preserved"))
+                }
             }
             restoredPaths.insert(parked.originalPath)
         }
@@ -2079,7 +2274,11 @@ final class MigrationEngine {
         }
         let defaults = UserDefaults.standard
         defaults.setPersistentDomain(plist, forName: pre.path)
-        defaults.synchronize()
+        guard defaults.synchronize() else {
+            throw EngineError(outcome: .failed(
+                "re-import of the \(pre.path) preferences domain could not be persisted "
+                + "(synchronize failed) — the journal is preserved"))
+        }
     }
 
     /// A failure while the transaction is still before `committing`: roll
@@ -2095,10 +2294,14 @@ final class MigrationEngine {
                 + "`\(spec.recoveryHint)` to complete the migration")
         }
         // Pre-move failures (state prepared, nothing moved): restore the
-        // service, drop the journal, report as a plain failure.
+        // service, drop the journal, report honestly — including a restart
+        // that did not work.
         if journal.state == "prepared", !journal.roots.contains(where: { $0.moved }) {
-            try? restoreServiceAfterRefusal()
+            let restartProblem = restoreServiceAfterRefusal()
             cleanupJournalArea()
+            if let restartProblem {
+                return .failed(why + " — nothing had been moved, but " + restartProblem)
+            }
             return .failed(why + " — nothing had been moved; the installation is untouched")
         }
         do {
