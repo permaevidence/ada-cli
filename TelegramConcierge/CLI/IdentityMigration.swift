@@ -260,18 +260,29 @@ enum IdentityMigration {
         var journalState: String?
         var roots: Roots
 
-        /// The gate: an old install exists and nothing of the new identity
-        /// does yet — or an interrupted migration left a journal.
-        var pending: Bool {
-            journalState != nil
-                || ((oldConfigPresent || oldDataPresent) && !newConfigPresent && !newDataPresent)
+        var oldPresent: Bool { oldConfigPresent || oldDataPresent }
+        var newPresent: Bool { newConfigPresent || newDataPresent }
+        /// Old AND new roots coexist with no journal explaining it: a
+        /// CONFLICT the user must resolve by hand — never "harmless
+        /// residue" (Codex Stage 4 round 1). The engine refuses to migrate
+        /// onto a pre-existing destination, so the outward gate must not
+        /// let anything write the new roots either.
+        var conflict: Bool { journalState == nil && oldPresent && newPresent }
+        /// The gate: ANY old root present (clean pending migration or
+        /// conflict), or an interrupted migration's journal.
+        var pending: Bool { journalState != nil || oldPresent }
+        var oldRootsPresent: [String] {
+            [(oldConfigPresent, roots.oldConfig), (oldDataPresent, roots.oldData)]
+                .compactMap { $0.0 ? $0.1 : nil }
         }
-        /// Old roots still present next to new ones: not a gate (the new
-        /// identity is usable), but worth a doctor line.
-        var oldResidue: Bool {
-            (oldConfigPresent || oldDataPresent) && (newConfigPresent || newDataPresent)
-                && journalState == nil
+        var newRootsPresent: [String] {
+            [(newConfigPresent, roots.newConfig), (newDataPresent, roots.newData)]
+                .compactMap { $0.0 ? $0.1 : nil }
         }
+        /// Exit status of `briglia migrate --status`, consumed by the
+        /// installers: 0 nothing to do, 3 migration pending (run it),
+        /// 4 conflict (resolve by hand first).
+        var statusExitCode: Int32 { conflict ? 4 : (pending ? 3 : 0) }
     }
 
     /// Zero writes (the engine's detect is read-only; plan §4.2).
@@ -308,9 +319,18 @@ enum IdentityMigration {
                 + "  Run `\(recoveryCommand)` to recover — nothing is changed until you do.\n"
                 + "  Diagnostics (`briglia doctor`, `briglia setup-api status`) work meanwhile."
         }
-        var found: [String] = []
-        if status.oldConfigPresent { found.append(status.roots.oldConfig) }
-        if status.oldDataPresent { found.append(status.roots.oldData) }
+        if status.conflict {
+            return "✖ An Ada CLI installation (\(status.oldRootsPresent.joined(separator: ", "))) AND "
+                + "Briglia directories (\(status.newRootsPresent.joined(separator: ", "))) both exist.\n"
+                + "  Briglia will not silently ignore the Ada data, and `\(recoveryCommand)` refuses to "
+                + "migrate onto pre-existing Briglia directories. Resolve by hand, then run "
+                + "`\(recoveryCommand)`:\n"
+                + "    · move the Briglia directories aside (e.g. `mv <dir> <dir>.bak`) if they are stray "
+                + "or from a fresh setup you don't need — the Ada data then migrates; or\n"
+                + "    · remove the old Ada directories if you no longer need that data.\n"
+                + "  Diagnostics (`briglia doctor`, `briglia setup-api status`, `\(recoveryCommand) --status`) work meanwhile."
+        }
+        let found = status.oldRootsPresent
         return "✖ An existing Ada CLI installation was found (\(found.joined(separator: ", "))) "
             + "and has not been migrated to Briglia yet.\n"
             + "  Run `\(recoveryCommand)` to move your configuration, memory, watchers and "
@@ -354,13 +374,14 @@ enum IdentityMigration {
         if let state = current.journalState {
             out.append((true, "interrupted identity migration (journal state: \(state))",
                         "run `\(recoveryCommand)` to recover — nothing is changed until you do"))
+        } else if current.conflict {
+            out.append((true, "CONFLICT: Ada CLI roots (\(current.oldRootsPresent.joined(separator: ", "))) "
+                + "and Briglia roots (\(current.newRootsPresent.joined(separator: ", "))) coexist — "
+                + "Briglia refuses to run and `\(recoveryCommand)` refuses to migrate onto them",
+                "move the Briglia directories aside (or remove the old Ada ones), then run `\(recoveryCommand)`"))
         } else if current.pending {
             out.append((true, "an Ada CLI installation is present and not migrated",
                         "run `\(recoveryCommand)`"))
-        } else if current.oldResidue {
-            out.append((false, "old Ada CLI roots still present next to Briglia's "
-                + "(\(current.roots.oldConfig), \(current.roots.oldData)) — not used; "
-                + "remove them by hand once you are sure", nil))
         }
         let compat = home().appendingPathComponent(".local/bin/" + oldBinaryName).path
         if let target = try? FileManager.default.destinationOfSymbolicLink(atPath: compat) {
@@ -396,7 +417,7 @@ struct Migrate: ParsableCommand {
     @Flag(name: .long, help: "Roll back an interrupted migration instead of completing it (honored only before its commit point).")
     var rollback = false
 
-    @Flag(name: .long, help: "Print what would be migrated and exit without changing anything.")
+    @Flag(name: .long, help: "Report the migration state and exit without changing anything (exit 0 = nothing to do, 3 = migration pending, 4 = conflict to resolve by hand).")
     var status = false
 
     func run() throws {
@@ -409,16 +430,21 @@ struct Migrate: ParsableCommand {
             print("new config: \(r.newConfig) — \(current.newConfigPresent ? "present" : "absent")")
             print("new data:   \(r.newData) — \(current.newDataPresent ? "present" : "absent")")
             print("journal:    \(current.journalState ?? "none")")
-            print("migration:  \(current.pending ? "PENDING — run `\(IdentityMigration.recoveryCommand)`" : "not needed")")
+            let verdict: String
+            if current.conflict {
+                verdict = "CONFLICT — old and new roots coexist; resolve by hand, then run `\(IdentityMigration.recoveryCommand)`"
+            } else if current.pending {
+                verdict = "PENDING — run `\(IdentityMigration.recoveryCommand)`"
+            } else {
+                verdict = "not needed"
+            }
+            print("migration:  \(verdict)")
+            if current.statusExitCode != 0 { throw ExitCode(current.statusExitCode) }
             return
         }
         if !current.pending {
-            if current.oldResidue {
-                print("Briglia is already set up; old Ada CLI roots remain at "
-                    + "\(current.roots.oldConfig) and \(current.roots.oldData) and are not used. "
-                    + "Nothing to migrate.")
-            } else if !current.oldConfigPresent && !current.oldDataPresent
-                        && !current.newConfigPresent && !current.newDataPresent {
+            if !current.oldConfigPresent && !current.oldDataPresent
+                && !current.newConfigPresent && !current.newDataPresent {
                 print("Nothing to migrate — no Ada CLI installation found. Run `briglia setup`.")
             } else {
                 print("Nothing to migrate — this install is already on Briglia.")
@@ -431,7 +457,12 @@ struct Migrate: ParsableCommand {
             throw ExitCode(2)
         }
         let spec = IdentityMigration.productionSpec()
-        if current.journalState == nil {
+        if current.conflict {
+            // Straight to the engine: its pre-existing-destination refusal
+            // is the fail-closed answer (nothing is changed, no journal).
+            print("Old and new roots coexist — asking the migration engine, which refuses "
+                + "to migrate onto pre-existing Briglia directories:")
+        } else if current.journalState == nil {
             print("Migrating the Ada CLI installation to Briglia:")
             print("  \(spec.oldConfigRoot) → \(spec.newConfigRoot)")
             print("  \(spec.oldDataRoot) → \(spec.newDataRoot)")
@@ -462,6 +493,11 @@ struct Migrate: ParsableCommand {
             }
         case .refused(let why):
             print("✖ refused: \(why)")
+            if current.conflict {
+                print("  Resolve by hand: move the Briglia directories aside (e.g. `mv <dir> <dir>.bak`) "
+                    + "so the Ada data can migrate, or remove the old Ada directories if you no longer "
+                    + "need that data — then rerun `\(IdentityMigration.recoveryCommand)`.")
+            }
             throw ExitCode(2)
         case .corrupt(let why):
             print("✖ the migration journal failed validation: \(why)")
@@ -489,11 +525,27 @@ struct MigrateProbe: ParsableCommand {
         AdaCLI.prepareIO()
         let fm = FileManager.default
         var isDir: ObjCBool = false
-        for root in [StoragePaths.configRoot, StoragePaths.dataRoot] {
-            guard fm.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
-                print("PROBE-FAIL: root missing: \(root.path)")
+        func dir(_ path: String) -> Bool {
+            fm.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+        }
+        // Per root pair: nothing of the old identity may be left behind
+        // (a root that existed must have moved), and the new identity must
+        // have at least one root to serve. A root the old install never had
+        // (e.g. data-only installs) is not required to exist — the first
+        // mutating command creates it (found by the root-combination
+        // tests, Codex Stage 4 round 1).
+        let roots = IdentityMigration.roots()
+        var served = 0
+        for (old, new) in [(roots.oldConfig, roots.newConfig), (roots.oldData, roots.newData)] {
+            if dir(old) && !dir(new) {
+                print("PROBE-FAIL: old root still in place, new root missing: \(old) → \(new)")
                 throw ExitCode(1)
             }
+            if dir(new) { served += 1 }
+        }
+        guard served > 0 else {
+            print("PROBE-FAIL: neither \(roots.newConfig) nor \(roots.newData) exists")
+            throw ExitCode(1)
         }
         if let problem = KeychainHelper.storeReadProblem() {
             print("PROBE-FAIL: secret store: \(problem)")

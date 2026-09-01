@@ -66,22 +66,38 @@ echo "Installed: $DEST_DIR/briglia"
 # --version and bundle-check above never do. `briglia migrate` journals
 # every step and restores the old install if it cannot complete; it is
 # safe to rerun.
-OLD_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/ada"
-OLD_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/ada"
-NEW_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/briglia"
-NEW_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/briglia"
+# The binary is the single source of truth for the state (exit 0 = nothing
+# to do, 3 = migration pending, 4 = old AND new roots coexist — a conflict
+# the user resolves by hand; this script never guesses from directories).
 MIGRATED=0
-if { [ -d "$OLD_CFG" ] || [ -d "$OLD_DATA" ]; } && [ ! -d "$NEW_CFG" ] && [ ! -d "$NEW_DATA" ]; then
-    echo
-    echo "An Ada CLI installation was found — migrating it to Briglia"
-    echo "(configuration, memory, watchers, service; nothing is deleted)…"
-    if "$DEST_DIR/briglia" migrate; then
-        MIGRATED=1
-    else
-        echo "⚠ The migration did not complete. Your Ada CLI install is untouched;"
-        echo "  run:  $DEST_DIR/briglia migrate   to retry (or --rollback)."
-    fi
-fi
+MIGRATE_STATE=0
+"$DEST_DIR/briglia" migrate --status >/dev/null 2>&1 || MIGRATE_STATE=$?
+case "$MIGRATE_STATE" in
+    0) ;;
+    3)
+        echo
+        echo "An Ada CLI installation was found — migrating it to Briglia"
+        echo "(configuration, memory, watchers, service; nothing is deleted)…"
+        if "$DEST_DIR/briglia" migrate; then
+            MIGRATED=1
+        else
+            echo "⚠ The migration did not complete. Your Ada CLI install is untouched;"
+            echo "  run:  $DEST_DIR/briglia migrate   to retry (or --rollback)."
+        fi
+        ;;
+    4)
+        echo
+        echo "⚠ CONFLICT: an Ada CLI installation AND Briglia directories both exist."
+        echo "  Nothing was migrated, and Briglia will not run on the Ada data until you resolve it:"
+        "$DEST_DIR/briglia" migrate --status || true
+        echo "  Move the Briglia directories aside (or remove the old Ada ones), then run:"
+        echo "      $DEST_DIR/briglia migrate"
+        ;;
+    *)
+        echo "⚠ Could not determine the migration state (briglia migrate --status exited $MIGRATE_STATE);"
+        echo "  run:  $DEST_DIR/briglia migrate --status"
+        ;;
+esac
 case ":$PATH:" in
     *":$DEST_DIR:"*) ;;
     *) echo "⚠ $DEST_DIR is not in your PATH — add it to your shell profile." ;;

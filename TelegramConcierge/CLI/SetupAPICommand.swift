@@ -974,14 +974,12 @@ enum SetupAPICore {
         let status = IdentityMigration.status()
         var block: [String: Any] = [
             "needed": status.pending,
-            "old_roots_present": [status.roots.oldConfig, status.roots.oldData]
-                .enumerated().compactMap { index, path in
-                    (index == 0 ? status.oldConfigPresent : status.oldDataPresent) ? path : nil
-                },
+            "conflict": status.conflict,
+            "old_roots_present": status.oldRootsPresent,
+            "new_roots_present": status.newRootsPresent,
             "recovery_command": IdentityMigration.recoveryCommand,
         ]
         if let state = status.journalState { block["journal_state"] = state }
-        if status.oldResidue { block["old_residue"] = true }
         return block
     }
 

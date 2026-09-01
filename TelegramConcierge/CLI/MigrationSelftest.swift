@@ -1800,8 +1800,8 @@ struct MigrationSelftest: AsyncParsableCommand {
                   !fm.fileExists(atPath: cfg + "/briglia") && !fm.fileExists(atPath: data + "/briglia"))
             do {
                 let r = runNew(["migrate", "--status"])
-                check("real identity: `migrate --status` reports PENDING",
-                      r.exitCode == 0 && r.output.contains("PENDING") && r.output.contains("briglia migrate"), r.tail)
+                check("real identity: `migrate --status` reports PENDING (exit 3 for the installers)",
+                      r.exitCode == 3 && r.output.contains("PENDING") && r.output.contains("briglia migrate"), r.tail)
                 let st = runNew(["setup-api", "status"])
                 if let obj = try? JSONSerialization.jsonObject(with: Data(st.output.utf8)) as? [String: Any],
                    let migration = obj["migration"] as? [String: Any] {
@@ -1856,6 +1856,108 @@ struct MigrationSelftest: AsyncParsableCommand {
                 check("real identity: `migrate --rollback` with no journal refuses and writes nothing",
                       r.exitCode == 2 && r.output.contains("nothing to roll back")
                       && snapshotDiff(before, snapshot(watched)).isEmpty, r.tail)
+            }
+
+            // Every partial / coexisting root combination (Codex Stage 4
+            // round 1): ANY old root closes the gate; old+new together is a
+            // CONFLICT — `migrate --status` exits 4, every mutating entry
+            // refuses without creating a root, setup-api reports conflict,
+            // and `briglia migrate` reaches the engine's pre-existing-
+            // destination refusal with zero writes. Old-only combos are a
+            // clean pending migration (exit 3) that completes.
+            do {
+                struct Combo { let oc: Bool, od: Bool, nc: Bool, nd: Bool }
+                let combos: [Combo] = [
+                    Combo(oc: true,  od: true,  nc: true,  nd: false),
+                    Combo(oc: true,  od: true,  nc: false, nd: true),
+                    Combo(oc: true,  od: true,  nc: true,  nd: true),
+                    Combo(oc: true,  od: false, nc: true,  nd: false),
+                    Combo(oc: false, od: true,  nc: false, nd: true),
+                    Combo(oc: true,  od: false, nc: false, nd: true),
+                    Combo(oc: false, od: true,  nc: true,  nd: false),
+                    Combo(oc: true,  od: false, nc: false, nd: false),
+                    Combo(oc: false, od: true,  nc: false, nd: false),
+                    Combo(oc: false, od: false, nc: true,  nd: true),
+                    Combo(oc: false, od: false, nc: false, nd: false),
+                ]
+                for (index, combo) in combos.enumerated() {
+                    let label = "old(cfg:\(combo.oc ? 1 : 0) data:\(combo.od ? 1 : 0)) new(cfg:\(combo.nc ? 1 : 0) data:\(combo.nd ? 1 : 0))"
+                    let root = tempRoot.appendingPathComponent("stage4-combo-\(index)").path
+                    let cHome = root + "/home", cCfg = root + "/cfg", cData = root + "/data", cState = root + "/state"
+                    try fm.createDirectory(atPath: cHome, withIntermediateDirectories: true)
+                    if combo.oc { try writeFile(cCfg + "/ada/secrets.json", "{\"assistant_name\": \"Ada\"}", mode: 0o600) }
+                    if combo.od { try writeFile(cData + "/ada/conversation.json", "{\"messages\": []}") }
+                    if combo.nc { try writeFile(cCfg + "/briglia/foreign.txt", "stray") }
+                    if combo.nd { try writeFile(cData + "/briglia/foreign.txt", "stray") }
+                    let cEnv: [String: String] = [
+                        "HOME": cHome, "XDG_CONFIG_HOME": cCfg, "XDG_DATA_HOME": cData, "XDG_STATE_HOME": cState,
+                        "BRIGLIA_TOOLCHAIN_BIN": bin, "BRIGLIA_MIGRATE_PREFS_DOMAINS": "none",
+                        "PATH": bin + ":" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"),
+                    ]
+                    func runC(_ args: [String]) -> MigrationEngine.RunResult {
+                        MigrationEngine.runBounded([newBinary] + args, timeout: 180, extraEnv: cEnv)
+                    }
+                    let oldAny = combo.oc || combo.od, newAny = combo.nc || combo.nd
+                    let expectedCode: Int32 = oldAny ? (newAny ? 4 : 3) : 0
+                    let st = runC(["migrate", "--status"])
+                    check("\(label): `migrate --status` exits \(expectedCode)"
+                          + (expectedCode == 4 ? " and says CONFLICT" : expectedCode == 3 ? " and says PENDING" : ""),
+                          st.exitCode == expectedCode
+                          && (expectedCode != 4 || st.output.contains("CONFLICT"))
+                          && (expectedCode != 3 || st.output.contains("PENDING")), "rc=\(st.exitCode) " + st.tail)
+                    let api = runC(["setup-api", "status"])
+                    if let obj = try? JSONSerialization.jsonObject(with: Data(api.output.utf8)) as? [String: Any],
+                       let migration = obj["migration"] as? [String: Any] {
+                        check("\(label): setup-api reports needed=\(oldAny) conflict=\(oldAny && newAny)",
+                              migration["needed"] as? Bool == oldAny
+                              && migration["conflict"] as? Bool == (oldAny && newAny)
+                              && (migration["old_roots_present"] as? [String])?.count == (combo.oc ? 1 : 0) + (combo.od ? 1 : 0)
+                              && (migration["new_roots_present"] as? [String])?.count == (combo.nc ? 1 : 0) + (combo.nd ? 1 : 0))
+                    } else {
+                        check("\(label): setup-api status parses", false, api.tail)
+                    }
+                    let watchedC = [cCfg, cData, cState, cHome]
+                    if oldAny {
+                        for args in [["trigger", UUID().uuidString], ["chat"], ["setup"]] {
+                            let before = snapshot(watchedC)
+                            let r = runC(args)
+                            let diffs = snapshotDiff(before, snapshot(watchedC))
+                            check("\(label): `\(args[0])` refuses (exit 2), creates no root, writes nothing",
+                                  r.exitCode == 2 && r.output.contains("briglia migrate") && diffs.isEmpty
+                                  && (combo.nc || !fm.fileExists(atPath: cCfg + "/briglia"))
+                                  && (combo.nd || !fm.fileExists(atPath: cData + "/briglia")),
+                                  "rc=\(r.exitCode) " + r.tail + (diffs.isEmpty ? "" : " diffs: " + diffs.prefix(3).joined(separator: "; ")))
+                        }
+                    }
+                    if oldAny && newAny {
+                        let before = snapshot(watchedC)
+                        let r = runC(["migrate"])
+                        // The engine's cross-process lock is a zero-byte
+                        // SIBLING of the (never created) journal dir — the
+                        // one documented side effect of asking it.
+                        let diffs = snapshotDiff(before, snapshot(watchedC))
+                            .filter { !$0.hasPrefix("state/briglia-migrate.lock:") && !$0.hasPrefix("state:") }
+                        check("\(label): `briglia migrate` reaches the engine's fail-closed refusal, zero writes, no journal",
+                              r.exitCode == 2 && r.output.contains("already exists") && r.output.contains("refused")
+                              && diffs.isEmpty && !fm.fileExists(atPath: cState + "/briglia-migrate/journal.json"),
+                              "rc=\(r.exitCode) " + r.tail)
+                        let d = runC(["doctor"])
+                        check("\(label): doctor flags the conflict as a problem with the resolution hint",
+                              d.output.contains("CONFLICT") && d.output.contains("move the Briglia directories aside"), d.tail)
+                    } else if oldAny {
+                        let r = runC(["migrate"])
+                        check("\(label): clean pending migration completes",
+                              r.exitCode == 0 && r.output.contains("migration committed and verified")
+                              && (!combo.oc || (fm.fileExists(atPath: cCfg + "/briglia/secrets.json") && !fm.fileExists(atPath: cCfg + "/ada")))
+                              && (!combo.od || (fm.fileExists(atPath: cData + "/briglia/conversation.json") && !fm.fileExists(atPath: cData + "/ada"))),
+                              "rc=\(r.exitCode) " + r.tail)
+                        let after = runC(["migrate", "--status"])
+                        check("\(label): after migrating, `migrate --status` exits 0", after.exitCode == 0, after.tail)
+                    } else {
+                        let r = runC(["migrate"])
+                        check("\(label): nothing to migrate, exit 0", r.exitCode == 0 && r.output.contains("Nothing to migrate"), r.tail)
+                    }
+                }
             }
 
             // The migration itself.
