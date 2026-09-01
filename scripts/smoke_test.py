@@ -225,8 +225,10 @@ def main():
     # service-state matrix, preferences-domain copy, diagnostics
     # no-mutation battery. Self-isolates into a temp root + fake systemctl.
     result = subprocess.run([ADA, "__migration-selftest"], capture_output=True, text=True, timeout=600)
+    combined = result.stdout + result.stderr
+    failed_lines = "\n".join(l for l in combined.splitlines() if l.startswith("\u2716"))
     check("migration-selftest", result.returncode == 0,
-          (result.stdout + result.stderr)[-1500:])
+          (failed_lines[:6000] + "\n---\n" if failed_lines else "") + combined[-1500:])
 
     # 3c2. watcher triage machinery (WATCHER_TRIAGE_PLAN phase 0-4
     # deterministic layers): durable fire-outbox produce/verdict/ack and
