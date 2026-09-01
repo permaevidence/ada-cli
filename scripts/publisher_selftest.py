@@ -317,35 +317,6 @@ def resolve_openssl():
     return r.stdout.strip()
 
 
-def make_legacy_dist(dist, version, sequence, key, channel="ada-cli",
-                     artifact_base="https://github.com/permaevidence/ada-cli/releases/download",
-                     payload_channel=None):
-    """A pre-rename `ada-cli` release as the live channel still serves it after the
-    repository rename (RENAME_PLAN §3.2): same key material, legacy channel + keyId
-    shape, artifacts under the old repository path. Signed here with openssl because
-    sign-envelope.sh (correctly) refuses the retired channel."""
-    dist = Path(dist); dist.mkdir(parents=True, exist_ok=True)
-    platforms = {p: {"url": f"{artifact_base}/v{version}/ada-{p}.tar.gz",
-                     "sha256": "00" * 32, "size": 1} for p in PLATFORMS}
-    manifest = {"schema": 1, "channel": payload_channel or channel, "sequence": sequence, "version": version,
-                "published": "2026-08-31T00:00:00Z", "expires": "2027-08-31T00:00:00Z", "platforms": platforms}
-    payload = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
-    ossl = resolve_openssl()
-    der = subprocess.run([ossl, "pkey", "-pubin", "-in", str(key["pub"]), "-pubout", "-outform", "DER"],
-                         capture_output=True, check=True).stdout
-    fp = hashlib.sha256(der[-32:]).hexdigest()
-    key_id = f"{channel}-release-v1-{fp[:16]}"
-    work = Path(tempfile.mkdtemp(prefix="legacy-sign-"))
-    (work / "input").write_bytes(b"ada-release-envelope-v1\0" + channel.encode() + b"\0" + key_id.encode() + b"\0" + payload)
-    subprocess.run([ossl, "pkeyutl", "-sign", "-rawin", "-inkey", str(key["priv"]),
-                    "-in", str(work / "input"), "-out", str(work / "sig")], check=True, capture_output=True)
-    envelope = {"format": "ada-release-envelope-v1", "channel": channel, "keyId": key_id,
-                "payload": base64.b64encode(payload).decode(),
-                "signature": base64.b64encode((work / "sig").read_bytes()).decode()}
-    (dist / "manifest.sig.json").write_bytes(json.dumps(envelope, separators=(",", ":")).encode())
-    return dist
-
-
 def seed_release(base, dist, version, latest=True, draft=False):
     assets = {p.name: base64.b64encode(p.read_bytes()).decode()
               for p in Path(dist).iterdir() if p.is_file()}
@@ -428,50 +399,6 @@ def body(work, base):
 
     # ---- Legacy-transition descriptor (RENAME_PLAN §3.2): the live "latest"
     # is the pre-rename ada-cli envelope until the first Briglia release.
-    print("— check-supersession.sh: legacy pre-rename live envelope —")
-    control(base, "/__control/reset", {})
-    legacy58 = make_legacy_dist(work / "legacy58", "0.1.58", 58, key)
-    seed_release(base, legacy58, "0.1.58")
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
-    check("legacy live 58: sequence 60 supersedes via the compiled descriptor",
-          rc == 0 and "supersedes live 58" in out and "LEGACY ada-cli envelope" in out, out)
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "58", "REF_NAME": "v0.2.0"})
-    check("legacy live 58: equal sequence is still superseded", rc != 0 and "superseded" in out, out)
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "57", "REF_NAME": "v0.2.0"})
-    check("legacy live 58: lower sequence is still superseded", rc != 0 and "superseded" in out, out)
-    control(base, "/__control/override", {"download_overrides": {
-        "manifest.sig.json": base64.b64encode(tampered_envelope(legacy58 / "manifest.sig.json")).decode()}})
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
-    check("hostile legacy envelope (bad signature) is a hard stop",
-          rc != 0 and "does not authenticate" in out, out)
-    control(base, "/__control/reset", {})
-    foreign = make_legacy_dist(work / "legacy-foreign", "0.1.58", 58, key,
-                               artifact_base="https://github.com/permaevidence/briglia-cli/releases/download")
-    seed_release(base, foreign, "0.1.58")
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
-    check("legacy-signed envelope whose artifacts are not under the old repository is refused",
-          rc != 0 and "not under https://github.com/permaevidence/ada-cli/releases/download/" in out, out)
-    control(base, "/__control/reset", {})
-    mislabeled = make_legacy_dist(work / "legacy-mislabeled", "0.1.58", 58, key, payload_channel="briglia-cli")
-    seed_release(base, mislabeled, "0.1.58")
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
-    check("legacy-signed envelope carrying a non-legacy payload channel is refused",
-          rc != 0 and "not a ada-cli schema-1 manifest" in out, out)
-    control(base, "/__control/reset", {})
-    unknown = make_legacy_dist(work / "legacy-unknown", "0.1.58", 58, key, channel="ada-ut")
-    seed_release(base, unknown, "0.1.58")
-    rc, out = run(SCRIPTS / "check-supersession.sh", common | {"SEQUENCE": "60", "REF_NAME": "v0.2.0"})
-    check("an envelope under any other retired channel does not authenticate",
-          rc != 0 and "does not authenticate" in out, out)
-    helper = (SCRIPTS / "legacy-transition.sh").read_text()
-    check("no bypass: the legacy descriptor is compiled into legacy-transition.sh, read by both call sites, with no environment override",
-          "LEGACY_CHANNEL=\"ada-cli\"" in helper and "${LEGACY" not in helper
-          and all("legacy-transition.sh" in (SCRIPTS / f).read_text() and "${LEGACY" not in (SCRIPTS / f).read_text()
-                  for f in ("check-supersession.sh", "verify-public-release.sh")))
-    control(base, "/__control/reset", {})
-    seed_release(base, dist58, "0.1.58")
-
-    # ------------------------------------------------------------------
     print("— publish-release.sh —")
     pub_env = {"GH_TOKEN": GH_TOKEN, "REPO": REPO, "GH_API_URL": base, "GH_UPLOADS_URL": base,
                "INSTALLER": str(REPO_ROOT / "scripts/get-briglia.sh")}
@@ -624,37 +551,6 @@ def body(work, base):
           rc != 0 and "never served an authenticated v0.1.59" in out and not ran, out)
     rc, out, ran = verify({"SEQUENCE": "60"})
     check("authenticated sequence mismatch is refused", rc != 0 and not ran, out)
-
-    # transition window (RENAME_PLAN §3.2): GitHub's latest pointer still
-    # serves the pre-rename LEGACY envelope for a while after the first
-    # Briglia release is published (about two minutes measured live in the
-    # Stage-7 rehearsal). Authenticated legacy = "not propagated yet"; a
-    # hostile legacy-shaped envelope stays a hard stop with no retry.
-    control(base, "/__control/reset", {})
-    leg_id = seed_release(base, legacy58, "0.1.58", latest=False)
-    seed_release(base, dist59, "0.1.59")
-    control(base, "/__control/override", {"latest_queue": [leg_id, leg_id]})
-    rc, out, ran = verify()
-    check("transition: latest still serving the authenticated legacy envelope retries, then passes",
-          rc == 0 and ran and "attempt 1, authenticated pre-rename legacy envelope" in out
-          and "attempt 2, authenticated pre-rename legacy envelope" in out and "attempt 3" not in out, out)
-    control(base, "/__control/reset", {})
-    seed_release(base, legacy58, "0.1.58")
-    rc, out, ran = verify({"ATTEMPTS": "2"})
-    check("transition: legacy latest never replaced → reported, exit nonzero, binary never executed",
-          rc != 0 and "never served an authenticated v0.1.59" in out and not ran, out)
-    control(base, "/__control/reset", {})
-    seed_release(base, foreign, "0.1.58")
-    rc, out, ran = verify()
-    check("transition: legacy-signed envelope whose artifacts are outside the old repository → hard stop, no retry",
-          rc != 0 and "does not authenticate" in out and "attempt 2" not in out and not ran, out)
-    control(base, "/__control/reset", {})
-    seed_release(base, legacy58, "0.1.58")
-    control(base, "/__control/override", {"download_overrides": {
-        "manifest.sig.json": base64.b64encode(tampered_envelope(legacy58 / "manifest.sig.json")).decode()}})
-    rc, out, ran = verify()
-    check("transition: tampered legacy envelope on latest → hard stop, no retry, binary never executed",
-          rc != 0 and "does not authenticate" in out and "attempt 2" not in out and not ran, out)
 
     # ------------------------------------------------------------------
     print("— workflow structure —")

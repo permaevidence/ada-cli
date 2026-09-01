@@ -50,15 +50,8 @@ trap 'rm -rf "$WORK"' EXIT
 
 # 1. Authenticate FIRST. A signature failure is final, not "not yet":
 #    the public channel is serving metadata that does not authenticate.
-#    Only an authenticated PREVIOUS state retries — an older version of this
-#    channel, or (transition window only, RENAME_PLAN.md §3.2) the exact
-#    pre-rename legacy envelope: GitHub's latest pointer lags a published
-#    release by up to a couple of minutes (measured in the Stage-7 rehearsal,
-#    2026-09-01), and during the transition the state it lags on is the
-#    legacy envelope, which by design does not authenticate under this
-#    channel. Anything that authenticates as neither is a hard stop.
-# shellcheck source=legacy-transition.sh
-. "$HERE/legacy-transition.sh"
+#    Only an authenticated OLDER version (GitHub's latest pointer lags a
+#    published release by up to a couple of minutes) retries.
 SERVED=""
 for attempt in $(seq 1 "$ATTEMPTS"); do
     SERVED=""; NOTE=""
@@ -68,8 +61,6 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
             SERVED="$(python3 -c "import json;print(json.load(open('$WORK/payload.json'))['version'])")"
             [ "$SERVED" = "$VERSION" ] && break
             NOTE=", authenticated v$SERVED"
-        elif legacy_live_authenticates "$WORK/public.sig.json" "$EXPECTED_PUBKEY" "$WORK/legacy-payload.json"; then
-            NOTE=", authenticated pre-rename legacy envelope"
         else
             echo "✖ the PUBLIC envelope does not authenticate against the committed key — refusing"; exit 1
         fi

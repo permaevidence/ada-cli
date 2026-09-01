@@ -30,33 +30,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# Legacy-transition descriptor (RENAME_PLAN.md §3.2): see legacy-transition.sh.
-# The old channel's envelope is accepted as the supersession floor ONLY when
-# it authenticates under that compiled descriptor AND our sequence is
-# strictly greater. No environment override, no bypass flag; the helper and
-# this call site are deleted in the follow-up commit after the first Briglia
-# release.
-# shellcheck source=legacy-transition.sh
-. "$HERE/legacy-transition.sh"
-
 if curl -fsSL --max-filesize 131072 -o "$WORK/live.sig.json" "$LIVE_ENVELOPE_URL"; then
     # Anything served that does not authenticate is a hard stop — a
     # tampered or malformed live envelope must never be "treated as absent".
-    if "$HERE/verify-envelope.sh" "$WORK/live.sig.json" "$EXPECTED_PUBKEY" "$CHANNEL" "$WORK/live-payload.json"; then
-        LIVE_KIND="current"
-    elif legacy_live_authenticates "$WORK/live.sig.json" "$EXPECTED_PUBKEY" "$WORK/live-payload.json"; then
-        LIVE_KIND="legacy"
-    else
-        echo "✖ the live envelope does not authenticate against the committed key (neither as $CHANNEL nor as the legacy $LEGACY_CHANNEL descriptor) — refusing"; exit 1
-    fi
+    "$HERE/verify-envelope.sh" "$WORK/live.sig.json" "$EXPECTED_PUBKEY" "$CHANNEL" "$WORK/live-payload.json" || {
+        echo "✖ the live envelope does not authenticate against the committed key — refusing"; exit 1; }
     LIVE_SEQ="$(python3 -c "import json;print(json.load(open('$WORK/live-payload.json'))['sequence'])")"
     LIVE_VER="$(python3 -c "import json;print(json.load(open('$WORK/live-payload.json'))['version'])")"
     [[ "$LIVE_SEQ" =~ ^[1-9][0-9]*$ ]] || { echo "✖ live sequence '$LIVE_SEQ' is not a positive integer"; exit 1; }
-    if [ "$LIVE_KIND" = "legacy" ]; then
-        echo "live release: v$LIVE_VER sequence $LIVE_SEQ (LEGACY $LEGACY_CHANNEL envelope — pre-rename channel state)"
-    else
-        echo "live release: v$LIVE_VER sequence $LIVE_SEQ"
-    fi
+    echo "live release: v$LIVE_VER sequence $LIVE_SEQ"
     [ "$SEQUENCE" -gt "$LIVE_SEQ" ] || {
         echo "✖ superseded: source sequence $SEQUENCE is not greater than live $LIVE_SEQ — publishing nothing"; exit 1; }
     echo "✔ sequence $SEQUENCE supersedes live $LIVE_SEQ"
