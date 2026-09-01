@@ -420,8 +420,19 @@ struct Migrate: ParsableCommand {
     @Flag(name: .long, help: "Report the migration state and exit without changing anything (exit 0 = nothing to do, 3 = migration pending, 4 = conflict to resolve by hand).")
     var status = false
 
+    @Flag(name: .long, help: .hidden)
+    var dumpSpec = false
+
     func run() throws {
         AdaCLI.prepareIO()
+        if dumpSpec {
+            // Read-only: the exact spec this binary would hand the engine.
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            let data = try encoder.encode(IdentityMigration.productionSpec())
+            print(String(data: data, encoding: .utf8) ?? "{}")
+            return
+        }
         let current = IdentityMigration.status()
         if status {
             let r = current.roots
@@ -528,17 +539,19 @@ struct MigrateProbe: ParsableCommand {
         func dir(_ path: String) -> Bool {
             fm.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
         }
-        // Per root pair: nothing of the old identity may be left behind
-        // (a root that existed must have moved), and the new identity must
-        // have at least one root to serve. A root the old install never had
-        // (e.g. data-only installs) is not required to exist — the first
-        // mutating command creates it (found by the root-combination
-        // tests, Codex Stage 4 round 1).
+        // No old root may remain at all — whatever the new side holds. The
+        // probe runs before retirement and again after commit: accepting
+        // an old root next to a new one would retire Ada and leave Briglia
+        // refusing to start on the very conflict it created (Codex Stage 4
+        // round 2). The new identity must serve at least one root; a root
+        // the old install never had (data-only installs) is not required —
+        // the first mutating command creates it.
         let roots = IdentityMigration.roots()
         var served = 0
         for (old, new) in [(roots.oldConfig, roots.newConfig), (roots.oldData, roots.newData)] {
-            if dir(old) && !dir(new) {
-                print("PROBE-FAIL: old root still in place, new root missing: \(old) → \(new)")
+            if dir(old) {
+                print("PROBE-FAIL: old root still present: \(old)"
+                    + (dir(new) ? " (new root \(new) also exists — mixed roots)" : " (new root \(new) missing)"))
                 throw ExitCode(1)
             }
             if dir(new) { served += 1 }

@@ -1917,6 +1917,21 @@ struct MigrationSelftest: AsyncParsableCommand {
                         check("\(label): setup-api status parses", false, api.tail)
                     }
                     let watchedC = [cCfg, cData, cState, cHome]
+                    // The health probe must fail on ANY remaining old root —
+                    // with or without a new root beside it (Codex round 2) —
+                    // and pass only when the new identity serves something.
+                    do {
+                        let pr = runC([MigrateProbe.configuration.commandName ?? "__migrate-probe"])
+                        let expectOK = !oldAny && newAny
+                        // The probe reports the FIRST old root it finds (config
+                        // before data): the mixed-roots wording is expected only
+                        // when that pair has a new root beside it.
+                        let samePairMixed = combo.oc ? combo.nc : (combo.od && combo.nd)
+                        check("\(label): __migrate-probe \(expectOK ? "passes" : "fails")",
+                              (pr.exitCode == 0) == expectOK
+                              && (expectOK || pr.output.contains("PROBE-FAIL"))
+                              && (!samePairMixed || pr.output.contains("mixed roots")), "rc=\(pr.exitCode) " + pr.tail)
+                    }
                     if oldAny {
                         for args in [["trigger", UUID().uuidString], ["chat"], ["setup"]] {
                             let before = snapshot(watchedC)
@@ -1958,6 +1973,126 @@ struct MigrationSelftest: AsyncParsableCommand {
                         check("\(label): nothing to migrate, exit 0", r.exitCode == 0 && r.output.contains("Nothing to migrate"), r.tail)
                     }
                 }
+            }
+
+            // End-to-end (Codex round 2): if an old root is (re)present when
+            // the health probe runs — mixed roots at the worst moment — the
+            // probe fails and the engine rolls back: roots restored, Ada's
+            // binary/unit untouched (never parked, no compat symlink), no
+            // Briglia unit left, no journal. The production spec is taken
+            // verbatim from `migrate --dump-spec`; only its probe is wrapped
+            // by a script that recreates the old config root first.
+            do {
+                let e2e = tempRoot.appendingPathComponent("stage4-probe-mixed").path
+                let eHome = e2e + "/home", eCfg = e2e + "/cfg", eData = e2e + "/data", eState = e2e + "/state"
+                let eBin = eHome + "/.local/bin", eUnitDir = eHome + "/.config/systemd/user", eSysd = e2e + "/sysd"
+                for dir in [eBin, eUnitDir, eSysd] { try fm.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+                let eNew = eBin + "/briglia", eOld = eBin + "/ada"
+                try fm.copyItem(atPath: adaBinary, toPath: eNew)
+                try fm.copyItem(atPath: adaBinary, toPath: eOld)
+                if fm.fileExists(atPath: bundleSrc) {
+                    try fm.copyItem(atPath: bundleSrc, toPath: eBin + "/" + BundleCheck.bundleName)
+                }
+                try writeFile(eCfg + "/ada/secrets.json", "{\"assistant_name\": \"Ada\"}", mode: 0o600)
+                try writeFile(eData + "/ada/conversation.json", "{\"messages\": []}")
+                try writeFile(eUnitDir + "/ada.service", AgentServiceSupport.userUnitText(adaPath: eOld, home: eHome))
+                try writeFile(eSysd + "/ada.service.enabled", "")
+                // Reuse the Stage-4 fake systemctl shape, bound to this fixture.
+                let eSystemctl = eSysd + "/systemctl"
+                try writeScript(eSystemctl, """
+                #!/bin/sh
+                SD="\(eSysd)"
+                echo "$@" >> "$SD/log"
+                if [ "$1" = "--user" ]; then shift; fi
+                verb="$1"; unit="$2"
+                loaded=1
+                if [ -n "$unit" ] && [ ! -f "\(eUnitDir)/$unit" ]; then loaded=0; fi
+                case "$verb" in
+                  daemon-reload) exit 0;;
+                  is-enabled) if [ "$loaded" = 0 ]; then echo "Failed to get unit file state for $unit: No such file or directory"; exit 1; fi
+                              if [ -f "$SD/$unit.enabled" ]; then echo enabled; else echo disabled; fi; exit 0;;
+                  is-active)  if [ -f "$SD/$unit.active" ]; then echo active; else echo inactive; fi; exit 0;;
+                  enable)  if [ "$loaded" = 0 ]; then echo "Unit $unit not loaded."; exit 5; fi; touch "$SD/$unit.enabled"; exit 0;;
+                  disable) rm -f "$SD/$unit.enabled"; exit 0;;
+                  stop)    rm -f "$SD/$unit.active"; exit 0;;
+                  start)   if [ "$loaded" = 0 ]; then echo "Unit $unit not loaded."; exit 5; fi; touch "$SD/$unit.active"; exit 0;;
+                esac
+                exit 0
+                """)
+                let eEnv: [String: String] = [
+                    "HOME": eHome, "XDG_CONFIG_HOME": eCfg, "XDG_DATA_HOME": eData, "XDG_STATE_HOME": eState,
+                    "BRIGLIA_TOOLCHAIN_BIN": eBin, "BRIGLIA_MIGRATE_SYSTEMCTL": eSystemctl,
+                    "BRIGLIA_MIGRATE_PREFS_DOMAINS": "none",
+                    "PATH": eBin + ":" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"),
+                ]
+                let dump = MigrationEngine.runBounded([eNew, "migrate", "--dump-spec"], timeout: 60, extraEnv: eEnv)
+                var spec = try JSONDecoder().decode(MigrationSpec.self, from: Data(dump.output.utf8))
+                check("probe-mixed e2e: `migrate --dump-spec` yields the production spec (probe = __migrate-probe, roots = fixture)",
+                      spec.healthProbe == [eNew, "__migrate-probe"] && spec.oldConfigRoot == eCfg + "/ada"
+                      && spec.newDataRoot == eData + "/briglia" && spec.oldBinary == eOld, dump.tail)
+                let specPath = eSysd + "/spec.json"
+                let oldBinHash = sha(eOld)
+                var st = stat()
+                func adaNotRetired() -> Bool {
+                    lstat(eOld, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && sha(eOld) == oldBinHash
+                        && fm.fileExists(atPath: eUnitDir + "/ada.service")
+                        && !fm.fileExists(atPath: eUnitDir + "/briglia.service")
+                        && ((try? fm.contentsOfDirectory(atPath: eState + "/briglia-migrate/parked")) ?? []).isEmpty
+                }
+
+                // Variant B first: the foreign old root STAYS after the probe.
+                // The probe fails; the engine cannot put the old roots back
+                // over a path something else now occupies, so it HOLDS with
+                // the journal (never guesses) — Ada is not retired either way.
+                let stayer = eSysd + "/probe-old-root-stays.sh"
+                try writeScript(stayer, "#!/bin/sh\nmkdir -p '\(eCfg)/ada'\nexec '\(eNew)' __migrate-probe\n")
+                spec.healthProbe = [stayer]
+                try JSONEncoder().encode(spec).write(to: URL(fileURLWithPath: specPath))
+                let held = MigrationEngine.runBounded([eNew, "__migrate-run", "--spec", specPath], timeout: 180, extraEnv: eEnv)
+                check("probe-mixed e2e (foreign root stays): the migration FAILS at the health probe with the mixed-roots reason",
+                      held.exitCode == 1 && held.output.contains("health probe") && held.output.contains("mixed roots"), "rc=\(held.exitCode) " + held.tail)
+                check("probe-mixed e2e (foreign root stays): Ada NOT retired — binary regular + original hash, old unit intact, no Briglia unit, nothing parked",
+                      adaNotRetired(), held.tail)
+                check("probe-mixed e2e (foreign root stays): engine holds with its journal for recovery rather than guessing",
+                      fm.fileExists(atPath: eState + "/briglia-migrate/journal.json"), held.tail)
+                let stHeld = MigrationEngine.runBounded([eNew, "migrate", "--status"], timeout: 60, extraEnv: eEnv)
+                check("probe-mixed e2e (foreign root stays): `migrate --status` reports the interrupted journal (exit 3)",
+                      stHeld.exitCode == 3 && stHeld.output.contains("journal:") && !stHeld.output.contains("journal:    none"), stHeld.tail)
+                let gate = MigrationEngine.runBounded([eNew, "chat"], timeout: 60, extraEnv: eEnv)
+                check("probe-mixed e2e (foreign root stays): chat refuses until recovered",
+                      gate.exitCode == 2 && gate.output.contains("interrupted"), gate.tail)
+                // The user removes the foreign directory; explicit rollback
+                // restores Ada. (Through the harness with the SAME spec the
+                // journal was written under — the engine refuses a journal
+                // written for a different spec, and this test's spec differs
+                // from production only by the wrapped probe.)
+                try fm.removeItem(atPath: eCfg + "/ada")
+                let rb = MigrationEngine.runBounded([eNew, "__migrate-run", "--spec", specPath, "--rollback"], timeout: 180, extraEnv: eEnv)
+                check("probe-mixed e2e (foreign root stays): after removing it, `migrate --rollback` restores the Ada install",
+                      rb.exitCode == 0 && fm.fileExists(atPath: eCfg + "/ada/secrets.json") && fm.fileExists(atPath: eData + "/ada/conversation.json")
+                      && !fm.fileExists(atPath: eCfg + "/briglia") && !fm.fileExists(atPath: eData + "/briglia")
+                      && !fm.fileExists(atPath: eState + "/briglia-migrate/journal.json") && adaNotRetired(), "rc=\(rb.exitCode) " + rb.tail)
+
+                // Variant A: the old root is present exactly while the probe
+                // runs and gone right after — the engine rolls back on the
+                // spot, byte-identically.
+                let flasher = eSysd + "/probe-old-root-flashes.sh"
+                try writeScript(flasher, "#!/bin/sh\nmkdir -p '\(eCfg)/ada'\n'\(eNew)' __migrate-probe\nrc=$?\nrmdir '\(eCfg)/ada'\nexit $rc\n")
+                spec.healthProbe = [flasher]
+                try JSONEncoder().encode(spec).write(to: URL(fileURLWithPath: specPath))
+                let before = snapshot([eCfg, eData, eUnitDir])
+                let run = MigrationEngine.runBounded([eNew, "__migrate-run", "--spec", specPath], timeout: 180, extraEnv: eEnv)
+                check("probe-mixed e2e (transient): the migration FAILS at the health probe with the mixed-roots reason",
+                      run.exitCode == 1 && run.output.contains("health probe") && run.output.contains("mixed roots"), "rc=\(run.exitCode) " + run.tail)
+                let diffs = snapshotDiff(before, snapshot([eCfg, eData, eUnitDir]))
+                check("probe-mixed e2e (transient): rolled back byte-identically — old roots back, no new roots, old unit intact, no Briglia unit",
+                      diffs.isEmpty && fm.fileExists(atPath: eCfg + "/ada/secrets.json") && !fm.fileExists(atPath: eData + "/briglia"),
+                      diffs.prefix(6).joined(separator: "; ") + " | " + run.tail)
+                check("probe-mixed e2e (transient): Ada NOT retired, no journal left",
+                      adaNotRetired() && !fm.fileExists(atPath: eState + "/briglia-migrate/journal.json"), run.tail)
+                let stAfter = MigrationEngine.runBounded([eNew, "migrate", "--status"], timeout: 60, extraEnv: eEnv)
+                check("probe-mixed e2e (transient): afterwards the install is a clean PENDING migration again (exit 3)",
+                      stAfter.exitCode == 3 && stAfter.output.contains("PENDING"), stAfter.tail)
             }
 
             // The migration itself.

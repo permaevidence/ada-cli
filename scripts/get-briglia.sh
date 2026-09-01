@@ -400,7 +400,14 @@ echo
 # alone would fail right now even when future terminals are fine.
 NEXT="setup"
 [ "$MIGRATED" = "1" ] && NEXT=""
-if [ "$ON_PATH" = "1" ]; then
+if [ "$MIGRATE_STATE" = "4" ]; then
+    # A conflict was reported above: `briglia setup` would only refuse.
+    echo "✔ Briglia CLI is installed, but it will not run until the conflict above is resolved."
+    echo "  Move the Briglia directories aside (or remove the old Ada ones), then run:"
+    echo
+    echo "    $DEST_DIR/briglia migrate"
+    echo
+elif [ "$ON_PATH" = "1" ]; then
     echo "✔ Briglia CLI is installed. Next step:  briglia${NEXT:+ $NEXT}"
 else
     echo "✔ Briglia CLI is installed. Next step (copy-paste exactly):"
