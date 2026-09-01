@@ -2099,10 +2099,21 @@ struct MigrationSelftest: AsyncParsableCommand {
             let mig = runNew(["migrate"])
             check("real identity: `briglia migrate` completes",
                   mig.exitCode == 0 && mig.output.contains("migration committed and verified"), mig.tail)
+            let rootsDetail = [
+                "cfg/briglia/secrets.json=\(fm.fileExists(atPath: cfg + "/briglia/secrets.json"))",
+                "data/briglia/conversation.json=\(fm.fileExists(atPath: data + "/briglia/conversation.json"))",
+                "cfg/ada=\(fm.fileExists(atPath: cfg + "/ada"))",
+                "data/ada=\(fm.fileExists(atPath: data + "/ada"))",
+                "ls cfg: " + ((try? fm.contentsOfDirectory(atPath: cfg)) ?? []).joined(separator: ","),
+                "ls data: " + ((try? fm.contentsOfDirectory(atPath: data)) ?? []).joined(separator: ","),
+                "ls data/ada: " + ((try? fm.contentsOfDirectory(atPath: data + "/ada")) ?? []).joined(separator: ","),
+                "ls cfg/ada: " + ((try? fm.contentsOfDirectory(atPath: cfg + "/ada")) ?? []).joined(separator: ","),
+            ].joined(separator: " | ")
             check("real identity: roots moved (new present, old absent)",
                   fm.fileExists(atPath: cfg + "/briglia/secrets.json")
                   && fm.fileExists(atPath: data + "/briglia/conversation.json")
-                  && !fm.fileExists(atPath: cfg + "/ada") && !fm.fileExists(atPath: data + "/ada"))
+                  && !fm.fileExists(atPath: cfg + "/ada") && !fm.fileExists(atPath: data + "/ada"),
+                  rootsDetail + " | " + mig.tail)
             check("real identity: landing zone moved",
                   fm.fileExists(atPath: home + "/Documents/Briglia/telegram")
                   && !fm.fileExists(atPath: home + "/Documents/AdaCLI"))
