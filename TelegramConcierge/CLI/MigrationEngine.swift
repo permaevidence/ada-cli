@@ -420,7 +420,7 @@ final class MigrationEngine {
         if let path = spec.newWakelockUnitPath {
             allowed.append((path as NSString).deletingLastPathComponent)
         }
-        let canonicalAllowed = allowed.compactMap { canonicalize($0) }
+        let canonicalAllowed = allowed.compactMap { canonicalize($0, dereferenceLeaf: true) }
         func strictlyInside(_ path: String) -> Bool {
             guard let canonical = canonicalize(path) else { return false }
             return canonicalAllowed.contains { root in
@@ -512,14 +512,26 @@ final class MigrationEngine {
     }
 
     /// Canonical form for containment checks: realpath(3) of the deepest
-    /// EXISTING ancestor (defeating symlinked parents), with the
-    /// not-yet-existing remainder re-appended (already traversal-checked).
-    static func canonicalize(_ path: String) -> String? {
-        guard path.hasPrefix("/"), !path.split(separator: "/").contains("..") else {
+    /// EXISTING ancestor of the PARENT (defeating symlinked parents), with
+    /// the leaf and any not-yet-existing remainder re-appended (already
+    /// traversal-checked). The leaf itself is never dereferenced: recorded
+    /// paths are directory ENTRIES the engine manipulates with lstat
+    /// semantics — a recorded `absent` path that currently holds the compat
+    /// symlink (dangling once the new binary is gone) must still validate
+    /// as the entry it names, not as wherever the link points.
+    static func canonicalize(_ path: String, dereferenceLeaf: Bool = false) -> String? {
+        guard path.hasPrefix("/"), path != "/",
+              !path.split(separator: "/").contains("..") else {
             return nil
         }
         var existing = path
         var remainder: [String] = []
+        if !dereferenceLeaf {
+            // Recorded entry: canonicalize the parent chain only.
+            existing = (path as NSString).deletingLastPathComponent
+            if existing.isEmpty { existing = "/" }
+            remainder = [(path as NSString).lastPathComponent]
+        }
         while existing != "/" {
             var st = stat()
             if lstat(existing, &st) == 0 { break }
@@ -570,9 +582,17 @@ final class MigrationEngine {
     // ----------------------------------------------------- crash seams
 
     /// Fault-injection seam for durability tests (same pattern as
-    /// ADA_TOOLCHAIN_FAULT): "rollback-move-fsync" | "prefs-sync".
+    /// ADA_TOOLCHAIN_FAULT): "prefs-sync" | "fsync=<exact path>". The fsync
+    /// fault fires INSIDE `fsyncPath`, before the real fsync(2) is issued —
+    /// a fault injected after a real barrier already succeeded would prove
+    /// nothing about the failure path (Codex Stage 3 round 3 #2).
     static var faultPoint: String? {
         ProcessInfo.processInfo.environment["ADA_MIGRATE_FAULT"]
+    }
+
+    static var fsyncFaultPath: String? {
+        guard let fault = faultPoint, fault.hasPrefix("fsync=") else { return nil }
+        return String(fault.dropFirst("fsync=".count))
     }
 
     /// Test-only crash injection: a REAL process death (no defers, no
@@ -588,6 +608,9 @@ final class MigrationEngine {
     // --------------------------------------------------- durable writes
 
     static func fsyncPath(_ url: URL) -> String? {
+        if let faultPath = fsyncFaultPath, faultPath == url.path {
+            return "fsync failed for \(url.path): injected fault (no barrier was issued)"
+        }
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else {
             return "could not open \(url.path) for fsync: \(String(cString: strerror(errno)))"
@@ -667,14 +690,19 @@ final class MigrationEngine {
     /// Deterministic recursive hash of a directory tree: sorted relative
     /// paths with per-entry type, mode and content hash. Used to verify
     /// parked bundles byte-for-byte before a park-restoring rollback.
+    /// Content+metadata hash of a tree, keyed by paths RELATIVE to `root`.
+    /// Uses the path-based enumerator, which yields relative subpaths
+    /// directly: the URL-based one can hand back paths with a different
+    /// prefix than `root.path` (e.g. /var → /private/var on macOS), and a
+    /// prefix-length `dropFirst` then produces garbage that depends on the
+    /// root's path length — the same tree hashed at its original location
+    /// and inside parked/ would not match.
     static func treeHash(of root: URL) -> String? {
         let fm = FileManager.default
-        guard let enumerator = fm.enumerator(at: root,
-                                             includingPropertiesForKeys: nil,
-                                             options: []) else { return nil }
+        guard let enumerator = fm.enumerator(atPath: root.path) else { return nil }
         var entries: [String] = []
-        for case let url as URL in enumerator {
-            let rel = url.path.dropFirst(root.path.count)
+        for case let rel as String in enumerator {
+            let url = root.appendingPathComponent(rel)
             var st = stat()
             guard lstat(url.path, &st) == 0 else { return nil }
             let mode = st.st_mode & 0o7777
@@ -838,16 +866,42 @@ final class MigrationEngine {
     /// Stage 3 round 2 #4).
     struct UnitQueryFailure: Error { let message: String }
 
+    /// Transitional unit states (systemd's `activating`, `deactivating`,
+    /// `reloading`, `refreshing`, `maintenance`) are NEITHER running nor
+    /// stopped: reading `activating` as inactive would let the migration
+    /// skip stopping an old daemon that is still starting (Codex Stage 3
+    /// round 3 #3). The probe waits a bounded time for the unit to settle,
+    /// then refuses — capture/rollback/recovery must retry, never guess.
+    static let transitionalStates: Set<String> =
+        ["activating", "deactivating", "reloading", "refreshing", "maintenance"]
+    static let transitionalWaitSeconds: TimeInterval = 5
+    static let transitionalPollInterval: UInt32 = 250_000   // µs
+
     func queryActive(_ name: String, system: Bool) throws -> Bool {
-        let result = system ? systemctlSystem(["is-active", name])
-                            : systemctl(["is-active", name])
-        let out = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        if out == "active" || out == "activating" { return out == "active" }
-        let negative = ["inactive", "failed", "unknown", "deactivating", "not-found"]
-        if negative.contains(out) { return false }
-        throw UnitQueryFailure(message: "could not determine whether \(name) is active "
-            + "(systemctl is-active exit \(result.exitCode): "
-            + "\(out.isEmpty ? "no output" : out))")
+        let deadline = Date().addingTimeInterval(Self.transitionalWaitSeconds)
+        var lastTransitional: String? = nil
+        while true {
+            let result = system ? systemctlSystem(["is-active", name])
+                                : systemctl(["is-active", name])
+            let out = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if out == "active" { return true }
+            let negative = ["inactive", "failed", "unknown", "not-found"]
+            if negative.contains(out) { return false }
+            if Self.transitionalStates.contains(out) {
+                lastTransitional = out
+                if Date() < deadline {
+                    usleep(Self.transitionalPollInterval)
+                    continue
+                }
+                throw UnitQueryFailure(message: "\(name) is still in the transitional state "
+                    + "\"\(out)\" after \(Int(Self.transitionalWaitSeconds))s — refusing to treat "
+                    + "a unit that is starting or stopping as settled; retry once it has settled")
+            }
+            throw UnitQueryFailure(message: "could not determine whether \(name) is active "
+                + "(systemctl is-active exit \(result.exitCode): "
+                + "\(out.isEmpty ? "no output" : out)"
+                + (lastTransitional.map { "; last transitional state seen: \($0)" } ?? "") + ")")
+        }
     }
 
     func queryEnabled(_ name: String, system: Bool) throws -> Bool {
@@ -1069,21 +1123,33 @@ final class MigrationEngine {
         for index in journal.roots.indices where journal.roots[index].existed {
             let root = journal.roots[index]
             guard !root.moved else { continue }
+            let parent = (root.new as NSString).deletingLastPathComponent
+            let oldParent = (root.old as NSString).deletingLastPathComponent
             // Disk reconciliation for recovery re-entry: a crash between the
             // rename and the journal write leaves moved=false with the move
-            // already done on disk.
+            // already done on disk. The rename may have happened but its
+            // barriers may NOT have (the crash could sit between the two) —
+            // the barriers are repeated before the journal records
+            // completion, never skipped (Codex Stage 3 round 3 #2).
             if !fm.fileExists(atPath: root.old), fm.fileExists(atPath: root.new) {
+                for dir in [parent, oldParent] {
+                    if let why = Self.fsyncPath(URL(fileURLWithPath: dir)) {
+                        throw EngineError(outcome: handleMidTransactionFailure(
+                            "root move of \(root.old) (found already done) is not durable: \(why)"))
+                    }
+                }
                 journal.roots[index].moved = true
                 try persistJournal()
+                log("reconciled \(root.old) → \(root.new) (already moved on disk)")
                 continue
             }
-            let parent = (root.new as NSString).deletingLastPathComponent
             try fm.createDirectory(atPath: parent, withIntermediateDirectories: true)
             guard rename(root.old, root.new) == 0 else {
                 throw EngineError(outcome: handleMidTransactionFailure(
                     "could not move \(root.old) → \(root.new): \(String(cString: strerror(errno)))"))
             }
-            for dir in [parent, (root.old as NSString).deletingLastPathComponent] {
+            Self.crashPoint("after-root-rename")
+            for dir in [parent, oldParent] {
                 if let why = Self.fsyncPath(URL(fileURLWithPath: dir)) {
                     throw EngineError(outcome: handleMidTransactionFailure(
                         "root move of \(root.old) is not durable: \(why)"))
@@ -1942,11 +2008,70 @@ final class MigrationEngine {
         return path   // outside every moved root (bin dir, unit dir, …)
     }
 
+    /// Verify EVERY stored rollback asset against the journal BEFORE the
+    /// rollback modifies anything: a damaged preimage must be rejected
+    /// while the healthy file it would overwrite is still untouched (Codex
+    /// Stage 3 round 3 #1). Returns the first problem, or nil when the whole
+    /// set verifies. Reads only.
+    func rollbackAssetsProblem() -> String? {
+        for pre in journal.preimages {
+            switch pre.type {
+            case "file", "prefs-old-domain":
+                let stored = preimagesDir.appendingPathComponent(pre.id)
+                guard let expected = pre.sha256 else {
+                    return "preimage \(pre.id) of \(pre.path) has no recorded hash"
+                }
+                var st = stat()
+                guard lstat(stored.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
+                    return "stored preimage \(pre.id) of \(pre.path) is missing or not a regular file"
+                }
+                guard Self.sha256(ofFile: stored) == expected else {
+                    return "stored preimage \(pre.id) of \(pre.path) does not match its recorded hash"
+                }
+                if pre.type == "prefs-old-domain" {
+                    guard let data = try? Data(contentsOf: stored),
+                          (try? PropertyListSerialization.propertyList(
+                              from: data, format: nil)) as? [String: Any] != nil else {
+                        return "stored preferences export \(pre.id) of \(pre.path) is not a plist dictionary"
+                    }
+                }
+            case "symlink":
+                guard let target = pre.target, !target.isEmpty else {
+                    return "symlink preimage \(pre.id) of \(pre.path) has no recorded target"
+                }
+            case "absent", "prefs-new-domain":
+                continue
+            default:
+                return "preimage \(pre.id) has unknown type \(pre.type)"
+            }
+        }
+        return nil
+    }
+
+    /// Refuse-and-hold when the rollback assets do not verify: nothing has
+    /// been modified yet, and nothing will be.
+    func requireVerifiedRollbackAssets(context: String) throws {
+        if let problem = rollbackAssetsProblem() {
+            throw EngineError(outcome: .failed(
+                "\(context) refused BEFORE modifying anything: \(problem) — a rollback from "
+                + "unverified assets could overwrite healthy files; everything was held for "
+                + "inspection at \(spec.stateDir)"))
+        }
+        if let problem = parkedAssetsProblem() {
+            throw EngineError(outcome: .failed(
+                "\(context) refused BEFORE modifying anything: \(problem) — everything was held "
+                + "for inspection at \(spec.stateDir)"))
+        }
+    }
+
     /// Ordinary rollback — valid strictly BEFORE `committing` (nothing has
     /// been parked or retired yet). Restores roots, preimages (verified by
     /// hash), service topology; deletes everything the migration created.
     func rollback(reason: String?) throws {
         if let reason { log("rolling back: \(reason)") }
+        // Every stored preimage is verified against the journal BEFORE the
+        // first modification — including the service stops below.
+        try requireVerifiedRollbackAssets(context: "rollback")
         // Stop/disable anything we started on the new identity — CHECKED (a
         // rollback that leaves the new service running while reporting
         // success would be a lie), but guarded by CURRENT state, not the
@@ -2063,7 +2188,26 @@ final class MigrationEngine {
             guard root.existed else { continue }
             let oldThere = fm.fileExists(atPath: root.old)
             let newThere = fm.fileExists(atPath: root.new)
-            if oldThere && !newThere { continue }        // never moved / already back
+            let parents = [(root.old as NSString).deletingLastPathComponent,
+                           (root.new as NSString).deletingLastPathComponent]
+            if oldThere && !newThere {
+                // Never moved — or already back. If the journal still says
+                // moved, a previous rollback attempt renamed it back and
+                // died before its barriers: repeat them before recording
+                // (Codex Stage 3 round 3 #2).
+                if root.moved {
+                    for dir in parents {
+                        if let why = Self.fsyncPath(URL(fileURLWithPath: dir)) {
+                            throw EngineError(outcome: .failed(
+                                "rollback found \(root.old) already back but the move is not durable: "
+                                + "\(why) — the journal is preserved; re-run `\(spec.recoveryHint)` to retry"))
+                        }
+                    }
+                    journal.roots[index].moved = false
+                    try persistJournal()
+                }
+                continue
+            }
             if !oldThere && newThere {
                 guard rename(root.new, root.old) == 0 else {
                     throw EngineError(outcome: .failed(
@@ -2071,13 +2215,9 @@ final class MigrationEngine {
                         + "\(String(cString: strerror(errno))) — the journal is preserved; "
                         + "re-run `\(spec.recoveryHint)` to retry"))
                 }
-                for dir in [(root.old as NSString).deletingLastPathComponent,
-                            (root.new as NSString).deletingLastPathComponent] {
-                    var why = Self.fsyncPath(URL(fileURLWithPath: dir))
-                    if Self.faultPoint == "rollback-move-fsync" {
-                        why = "injected rollback-move-fsync fault"
-                    }
-                    if let why {
+                Self.crashPoint("after-rollback-rename")
+                for dir in parents {
+                    if let why = Self.fsyncPath(URL(fileURLWithPath: dir)) {
                         throw EngineError(outcome: .failed(
                             "rollback moved \(root.new) back but the move is not durable: \(why) "
                             + "— the journal is preserved; re-run `\(spec.recoveryHint)` to retry"))
@@ -2180,6 +2320,8 @@ final class MigrationEngine {
     /// domain, then runs the ordinary rollback.
     func parkRestoringRollback() throws {
         log("park-restoring rollback")
+        // Parked assets AND preimages verified before the first modification.
+        try requireVerifiedRollbackAssets(context: "park-restoring rollback")
         // Anything started on the new identity goes down first, so old and
         // new never run side by side during the restore.
         try stopNewIdentityUnits(context: "park-restoring rollback")
@@ -2192,7 +2334,16 @@ final class MigrationEngine {
         var restoredPaths: Set<String> = []
         for parked in journal.parked.reversed() {
             let stored = parkedDir.appendingPathComponent(parked.id)
-            guard fm.fileExists(atPath: stored.path) else { continue }
+            guard fm.fileExists(atPath: stored.path) else {
+                // Already restored by an earlier, interrupted attempt (or
+                // never parked): it counts as restored, so the `absent`
+                // record at the same path is dropped below — otherwise a
+                // RETRIED park-restoring rollback would delete the binary
+                // its first attempt had just put back.
+                var st = stat()
+                if lstat(parked.originalPath, &st) == 0 { restoredPaths.insert(parked.originalPath) }
+                continue
+            }
             try? fm.removeItem(atPath: parked.originalPath)
             guard rename(stored.path, parked.originalPath) == 0 else {
                 throw EngineError(outcome: .failed(
@@ -2215,8 +2366,14 @@ final class MigrationEngine {
                     }
                 }
             }
+            // Barriers on the file itself (mode/ownership), the destination
+            // parent (the rename's new entry) AND the source parked/
+            // directory (the rename's removed entry) — a crash after an
+            // un-synced source would let the asset reappear in parked/ and
+            // be "restored" again over the live file (Codex round 3 #2).
             for target in [parked.originalPath,
-                           (parked.originalPath as NSString).deletingLastPathComponent]
+                           (parked.originalPath as NSString).deletingLastPathComponent,
+                           parkedDir.path]
                 where parked.kind != "symlink" || target != parked.originalPath {
                 if let why = Self.fsyncPath(URL(fileURLWithPath: target)) {
                     throw EngineError(outcome: .failed(
@@ -2281,6 +2438,18 @@ final class MigrationEngine {
         }
     }
 
+    /// True when every root that existed is still at its OLD path and its
+    /// new path is absent — the only situation in which a journal may be
+    /// dropped without a rollback.
+    func rootsUntouchedOnDisk() -> Bool {
+        for root in journal.roots where root.existed {
+            guard fm.fileExists(atPath: root.old), !fm.fileExists(atPath: root.new) else {
+                return false
+            }
+        }
+        return true
+    }
+
     /// A failure while the transaction is still before `committing`: roll
     /// back now and report honestly whether the restore succeeded.
     func handleMidTransactionFailure(_ why: String) -> MigrationOutcome {
@@ -2295,8 +2464,14 @@ final class MigrationEngine {
         }
         // Pre-move failures (state prepared, nothing moved): restore the
         // service, drop the journal, report honestly — including a restart
-        // that did not work.
-        if journal.state == "prepared", !journal.roots.contains(where: { $0.moved }) {
+        // that did not work. "Nothing moved" is decided by the DISK, not by
+        // the journal flags alone: a root whose rename succeeded but whose
+        // barrier failed (or a crash between the two, reconciled on
+        // recovery) is moved with moved=false in the journal — dropping the
+        // journal there would strand the root at its new path with no
+        // record of the move.
+        if journal.state == "prepared", !journal.roots.contains(where: { $0.moved }),
+           rootsUntouchedOnDisk() {
             let restartProblem = restoreServiceAfterRefusal()
             cleanupJournalArea()
             if let restartProblem {

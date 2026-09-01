@@ -243,7 +243,15 @@ struct MigrationSelftest: AsyncParsableCommand {
               daemon-reload) exit 0;;
               is-enabled) if [ "$loaded" = 0 ]; then echo "Failed to get unit file state for $unit: No such file or directory"; exit 1; fi
                           if [ -f "$SD/$unit.enabled" ]; then echo enabled; else echo disabled; fi; exit 0;;
-              is-active)  if [ -f "$SD/$unit.active" ]; then echo active; else echo inactive; fi; exit 0;;
+              is-active)  # Transitional-state seam (Codex round 3 #3): a
+                          # countdown file makes the unit answer "activating"
+                          # that many times before settling.
+                          if [ -f "$SD/$unit.transitional" ]; then
+                              n=$(cat "$SD/$unit.transitional"); n=$((n-1))
+                              if [ $n -le 0 ]; then rm -f "$SD/$unit.transitional"; else echo $n > "$SD/$unit.transitional"; fi
+                              echo activating; exit 0
+                          fi
+                          if [ -f "$SD/$unit.active" ]; then echo active; else echo inactive; fi; exit 0;;
               enable|disable|start|stop)
                           if [ "$loaded" = 0 ]; then echo "Unit $unit not loaded."; exit 5; fi;;
             esac
@@ -772,7 +780,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         // ============================================================
         print("\n— crash matrix: forward recovery after every destructive sub-step —")
 
-        let forwardPoints = ["after-prepared", "between-root-moves", "after-moved",
+        let forwardPoints = ["after-prepared", "after-root-rename", "between-root-moves", "after-moved",
                              "mid-fixups", "after-fixups", "after-committing-marker",
                              "after-unit-retirement", "after-wakelock-retirement",
                              "after-binary-park", "after-bundle-park", "after-symlink",
@@ -792,7 +800,8 @@ struct MigrationSelftest: AsyncParsableCommand {
         // ============================================================
         print("\n— crash matrix: explicit rollback before the commit point —")
 
-        for point in ["between-root-moves", "after-moved", "mid-fixups", "after-fixups"] {
+        for point in ["after-root-rename", "between-root-moves", "after-moved", "mid-fixups",
+                      "after-fixups"] {
             let fixture = try makeFixture("rb-\(point)", wakelock: true,
                                           prefs: point == "after-fixups")
             defer { killHolders(fixture) }
@@ -1169,10 +1178,13 @@ struct MigrationSelftest: AsyncParsableCommand {
             let before = snapshot(fixture.restoreRoots)
             let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-moved"])
             check("rollback-fsync-fault: crash injected", crashed.code == 137)
+            // The fault fires INSIDE fsyncPath for the roots' parent
+            // directory — before any real barrier is issued (round 3 #2).
             let faulted = runEngine(fixture, args: ["--rollback"],
-                                    env: ["ADA_MIGRATE_FAULT": "rollback-move-fsync"])
-            check("rollback-fsync-fault: durability failure surfaces, journal kept",
+                                    env: ["ADA_MIGRATE_FAULT": "fsync=" + fixture.root + "/xdg-config"])
+            check("rollback-fsync-fault: real fsync failure surfaces, journal kept",
                   faulted.code == 1 && faulted.output.contains("not durable")
+                  && faulted.output.contains("injected fault")
                   && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), faulted.output)
             let retried = runEngine(fixture, args: ["--rollback"])
             check("rollback-fsync-fault: clean retry restores byte-identically",
@@ -1234,6 +1246,220 @@ struct MigrationSelftest: AsyncParsableCommand {
                       finished.code == 0 && !fm.fileExists(atPath: fixture.stateDir),
                       finished.output)
             }
+        }
+
+        // ============================================================
+        print("\n— round 3: pre-verified rollback assets, repeated barriers, transitional units —")
+
+        /// First "file"-type preimage recorded in a live journal.
+        func firstFilePreimage(_ fixture: Fixture) -> (id: String, path: String)? {
+            guard let data = fm.contents(atPath: fixture.stateDir + "/journal.json"),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let preimages = object["preimages"] as? [[String: Any]] else { return nil }
+            for pre in preimages where pre["type"] as? String == "file" {
+                if let id = pre["id"] as? String, let path = pre["path"] as? String {
+                    return (id, path)
+                }
+            }
+            return nil
+        }
+        let rootPairs: (Fixture) -> [(old: String, new: String)] = { f in
+            [(f.oldConfig, f.newConfig), (f.oldData, f.newData), (f.oldLanding, f.newLanding)]
+        }
+        /// Parent directory of the first root currently sitting at its NEW path.
+        func firstMovedParent(_ fixture: Fixture) -> String? {
+            for pair in rootPairs(fixture)
+                where !fm.fileExists(atPath: pair.old) && fm.fileExists(atPath: pair.new) {
+                return (pair.old as NSString).deletingLastPathComponent
+            }
+            return nil
+        }
+        /// Parent directory of the first root currently back at its OLD path.
+        func firstBackParent(_ fixture: Fixture) -> String? {
+            for pair in rootPairs(fixture)
+                where fm.fileExists(atPath: pair.old) && !fm.fileExists(atPath: pair.new) {
+                return (pair.old as NSString).deletingLastPathComponent
+            }
+            return nil
+        }
+
+        preimageCorrupt: do {
+            // #1 — a damaged stored preimage is rejected BEFORE rollback
+            // modifies anything; the healthy live file is never overwritten.
+            let fixture = try makeFixture("preimage-corrupt")
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-fixups"])
+            check("preimage-corrupt: crash injected after fixups", crashed.code == 137,
+                  crashed.output)
+            guard let pre = firstFilePreimage(fixture) else {
+                check("preimage-corrupt: the journal records a file preimage", false)
+                break preimageCorrupt
+            }
+            let storedPath = fixture.stateDir + "/preimages/" + pre.id
+            let journalPath = fixture.stateDir + "/journal.json"
+            let originalBytes = fm.contents(atPath: storedPath) ?? Data()
+            try Data("tampered preimage".utf8).write(to: URL(fileURLWithPath: storedPath))
+            let liveRoots = fixture.restoreRoots + [fixture.newConfig, fixture.newData,
+                                                   fixture.newLanding]
+            let held = snapshot(liveRoots)
+            let journalBefore = sha(journalPath)
+            let corrupted = runEngine(fixture, args: ["--rollback"])
+            check("preimage-corrupt: rollback refused BEFORE any modification",
+                  corrupted.code == 1 && corrupted.output.contains("BEFORE modifying anything")
+                  && corrupted.output.contains("does not match its recorded hash"),
+                  corrupted.output)
+            let diffs = snapshotDiff(held, snapshot(liveRoots))
+            check("preimage-corrupt: zero mutations — live file, roots, units untouched",
+                  diffs.isEmpty && sha(journalPath) == journalBefore
+                  && fm.fileExists(atPath: fixture.newData),
+                  diffs.prefix(5).joined(separator: "; "))
+            try fm.removeItem(atPath: storedPath)
+            let missing = runEngine(fixture, args: ["--rollback"])
+            check("preimage-corrupt: a MISSING stored preimage is refused the same way",
+                  missing.code == 1 && missing.output.contains("BEFORE modifying anything")
+                  && missing.output.contains("missing"), missing.output)
+            check("preimage-corrupt: still zero mutations after the second refusal",
+                  snapshotDiff(held, snapshot(liveRoots)).isEmpty)
+            try originalBytes.write(to: URL(fileURLWithPath: storedPath))
+            let restored = runEngine(fixture, args: ["--rollback"])
+            check("preimage-corrupt: with the preimage intact again, rollback restores byte-identically",
+                  restored.code == 0
+                  && snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty,
+                  restored.output)
+        }
+
+        parkPreimageCorrupt: do {
+            // #1 on the park-restoring path: preimages are verified there too,
+            // before the parked assets move or any unit is touched.
+            let fixture = try makeFixture("park-preimage-corrupt")
+            defer { killHolders(fixture) }
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-binary-park"])
+            check("park-preimage-corrupt: crash injected after binary parking",
+                  crashed.code == 137, crashed.output)
+            try fm.removeItem(atPath: fixture.newBinary)
+            guard let pre = firstFilePreimage(fixture) else {
+                check("park-preimage-corrupt: the journal records a file preimage", false)
+                break parkPreimageCorrupt
+            }
+            let storedPath = fixture.stateDir + "/preimages/" + pre.id
+            let originalBytes = fm.contents(atPath: storedPath) ?? Data()
+            try Data("tampered preimage".utf8).write(to: URL(fileURLWithPath: storedPath))
+            let parkedBinary = fixture.stateDir + "/parked/binary"
+            let result = runEngine(fixture)
+            check("park-preimage-corrupt: park-restoring rollback refused BEFORE any modification",
+                  result.code == 1 && result.output.contains("BEFORE modifying anything"),
+                  result.output)
+            check("park-preimage-corrupt: parked binary still parked, nothing restored",
+                  fm.fileExists(atPath: parkedBinary) && !fm.fileExists(atPath: fixture.oldBinary))
+            try originalBytes.write(to: URL(fileURLWithPath: storedPath))
+            let restored = runEngine(fixture)
+            check("park-preimage-corrupt: intact again ⇒ park-restoring rollback completes",
+                  restored.code == 1 && restored.output.contains("restored byte-identically")
+                  && fm.fileExists(atPath: fixture.oldBinary), restored.output)
+        }
+
+        do {
+            // #2a — forward reconciliation: a crash between a root's rename
+            // and its barriers; recovery must repeat the barriers, and an
+            // fsync failure there must surface (with the journal kept).
+            let fixture = try makeFixture("reconcile-move-fsync")
+            defer { killHolders(fixture) }
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-root-rename"])
+            check("reconcile-move-fsync: crash injected between rename and barrier",
+                  crashed.code == 137, crashed.output)
+            let parent = firstMovedParent(fixture) ?? "?"
+            let faulted = runEngine(fixture, env: ["ADA_MIGRATE_FAULT": "fsync=" + parent])
+            check("reconcile-move-fsync: the repeated barrier's failure surfaces honestly",
+                  faulted.code == 1 && faulted.output.contains("found already done")
+                  && faulted.output.contains("not durable"), faulted.output)
+            check("reconcile-move-fsync: journal kept (the moved root is NOT stranded)",
+                  fm.fileExists(atPath: fixture.stateDir + "/journal.json"))
+            let recovered = runEngine(fixture)
+            check("reconcile-move-fsync: clean recovery completes forward", recovered.code == 0,
+                  recovered.output)
+            assertMigratedState(fixture, label: "reconcile-move-fsync")
+        }
+
+        do {
+            // #2b — rollback reconciliation: a crash between a root's rename
+            // BACK and its barriers; the retried rollback finds the root
+            // already back and must repeat the barriers.
+            let fixture = try makeFixture("reconcile-rollback-fsync")
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-moved"])
+            check("reconcile-rollback-fsync: crash injected after moved", crashed.code == 137)
+            let crashedBack = runEngine(fixture, args: ["--rollback"],
+                                        env: ["ADA_MIGRATE_CRASH_POINT": "after-rollback-rename"])
+            check("reconcile-rollback-fsync: rollback crashed between rename-back and barrier",
+                  crashedBack.code == 137, crashedBack.output)
+            let parent = firstBackParent(fixture) ?? "?"
+            let faulted = runEngine(fixture, args: ["--rollback"],
+                                    env: ["ADA_MIGRATE_FAULT": "fsync=" + parent])
+            check("reconcile-rollback-fsync: repeated barrier failure surfaces, journal kept",
+                  faulted.code == 1 && faulted.output.contains("already back")
+                  && faulted.output.contains("not durable")
+                  && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), faulted.output)
+            let retried = runEngine(fixture, args: ["--rollback"])
+            check("reconcile-rollback-fsync: clean retry restores byte-identically",
+                  retried.code == 0
+                  && snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty,
+                  retried.output)
+        }
+
+        do {
+            // #2c — parked-asset restore syncs the SOURCE parked/ directory;
+            // a failure there surfaces, and the retry (after one asset was
+            // already put back) still ends byte-identical — including the
+            // binary that had an `absent` compat-symlink record at its path.
+            let fixture = try makeFixture("park-restore-fsync")
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-symlink"])
+            check("park-restore-fsync: crash injected after the compat symlink",
+                  crashed.code == 137, crashed.output)
+            try fm.removeItem(atPath: fixture.newBinary)
+            let faulted = runEngine(fixture,
+                                    env: ["ADA_MIGRATE_FAULT": "fsync=" + fixture.stateDir + "/parked"])
+            check("park-restore-fsync: parked/ barrier failure surfaces, journal kept",
+                  faulted.code == 1 && faulted.output.contains("not durable")
+                  && faulted.output.contains("/parked")
+                  && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), faulted.output)
+            let retried = runEngine(fixture)
+            check("park-restore-fsync: retry completes the park-restoring rollback",
+                  retried.code == 1 && retried.output.contains("restored byte-identically"),
+                  retried.output)
+            try writeScript(fixture.newBinary, "#!/bin/sh\necho new-briglia\n")
+            let diffs = snapshotDiff(before, snapshot(fixture.restoreRoots))
+            check("park-restore-fsync: byte-identical after the retry (restored binary kept)",
+                  diffs.isEmpty, diffs.prefix(5).joined(separator: "; "))
+        }
+
+        do {
+            // #3 — a unit in a transitional state is neither running nor
+            // stopped: capture waits a bounded time, then REFUSES.
+            let fixture = try makeFixture("transitional-stuck")
+            let before = snapshot(fixture.restoreRoots)
+            try writeFile(fixture.sysd + "/ada-test.service.transitional", "999")
+            let result = runEngine(fixture)
+            check("transitional-stuck: capture refuses a unit stuck in `activating`",
+                  result.code == 2 && result.output.contains("transitional state")
+                  && result.output.contains("activating"), result.output)
+            check("transitional-stuck: nothing changed, no journal left",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty
+                  && !fm.fileExists(atPath: fixture.stateDir))
+        }
+
+        do {
+            // #3 — a unit that settles within the wait proceeds normally.
+            let fixture = try makeFixture("transitional-settles")
+            defer { killHolders(fixture) }
+            try writeFile(fixture.sysd + "/ada-test.service.transitional", "3")
+            let result = runEngine(fixture)
+            check("transitional-settles: an `activating` unit that settles is captured as active and migrated",
+                  result.code == 0, result.output)
+            assertMigratedState(fixture, label: "transitional-settles")
         }
 
         // ============================================================
