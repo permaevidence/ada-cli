@@ -64,8 +64,12 @@ command -v tar  >/dev/null 2>&1 || { echo "✖ tar is required.";  exit 1; }
 if [ "$OS" = "Linux" ]; then
     missing=""
     if command -v ldconfig >/dev/null 2>&1; then
-        ldconfig -p 2>/dev/null | grep -q 'libcurl\.so\.4'  || missing="$missing libcurl4"
-        ldconfig -p 2>/dev/null | grep -q 'libxml2\.so\.2'  || missing="$missing libxml2"
+        # grep must read ldconfig to EOF: `grep -q` exits at the first match,
+        # ldconfig then dies of SIGPIPE, and under `pipefail` the pipeline
+        # reports failure although the library IS installed (false "missing
+        # libxml2" seen on a Debian box, 2026-08-22 and 2026-09-01).
+        ldconfig -p 2>/dev/null | grep 'libcurl\.so\.4' >/dev/null || missing="$missing libcurl4"
+        ldconfig -p 2>/dev/null | grep 'libxml2\.so\.2' >/dev/null || missing="$missing libxml2"
     fi
     if [ -n "$missing" ]; then
         echo "✖ Missing system libraries:$missing"

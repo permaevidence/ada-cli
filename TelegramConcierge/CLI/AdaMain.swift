@@ -37,7 +37,7 @@ struct AdaCLI: AsyncParsableCommand {
                       VerifyEnvelopeCommand.self, TestSignEnvelopeCommand.self,
                       MindSelftest.self, SetupAPISelftest.self,
                       MigrationRunCommand.self, MigrationSelftest.self,
-                      Migrate.self, MigrateProbe.self,
+                      Migrate.self, MigrateProbe.self, MigrateGate.self,
                       AppChatSocketSelftest.self,
                       CommandMenuSelftest.self, BotSwitchSelftest.self,
                       EmailCalendarSelftest.self, AgentMailKeyCommand.self,

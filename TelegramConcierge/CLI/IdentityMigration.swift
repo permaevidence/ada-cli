@@ -258,9 +258,27 @@ enum IdentityMigration {
         var newConfigPresent: Bool
         var newDataPresent: Bool
         var journalState: String?
+        /// The engine's transaction lock is held right now by ANOTHER
+        /// process: a migration (or recovery) is live. flock dies with its
+        /// holder, so a crashed migrator never leaves this true.
+        var migrationLockHeld: Bool
+        /// The live journal's durable "new install ready" flag: roots moved
+        /// and every fixup applied — the migrator set it before starting
+        /// the new service and probing it.
+        var newInstallReady: Bool
         var roots: Roots
 
         var oldPresent: Bool { oldConfigPresent || oldDataPresent }
+        /// A journal exists AND its owner is alive: mid-transaction, not
+        /// interrupted.
+        var migrationRunning: Bool { journalState != nil && migrationLockHeld }
+        /// The one legitimate start against a live journal: the migrator has
+        /// finished moving/fixing the roots and is now health-probing the
+        /// new identity — which means STARTING its daemon (systemd) and
+        /// running `__migrate-probe`. Both must be admitted, or the probe
+        /// waits for a lock the refused daemon never takes and rolls back
+        /// (the 0.2.0 Linux defect). No old root may remain, as everywhere.
+        var servedByLiveMigration: Bool { migrationRunning && newInstallReady && !oldPresent }
         var newPresent: Bool { newConfigPresent || newDataPresent }
         /// Old AND new roots coexist with no journal explaining it: a
         /// CONFLICT the user must resolve by hand — never "harmless
@@ -270,7 +288,7 @@ enum IdentityMigration {
         var conflict: Bool { journalState == nil && oldPresent && newPresent }
         /// The gate: ANY old root present (clean pending migration or
         /// conflict), or an interrupted migration's journal.
-        var pending: Bool { journalState != nil || oldPresent }
+        var pending: Bool { !servedByLiveMigration && (journalState != nil || oldPresent) }
         var oldRootsPresent: [String] {
             [(oldConfigPresent, roots.oldConfig), (oldDataPresent, roots.oldData)]
                 .compactMap { $0.0 ? $0.1 : nil }
@@ -296,24 +314,46 @@ enum IdentityMigration {
         let journalPath = URL(fileURLWithPath: stateDir(environment: environment))
             .appendingPathComponent("journal.json")
         var state: String? = nil
+        var ready = false
         if fm.fileExists(atPath: journalPath.path) {
             if let data = try? Data(contentsOf: journalPath),
                let parsed = try? JSONDecoder().decode(MigrationJournal.self, from: data) {
                 state = parsed.state
+                ready = parsed.newInstallReady == true
             } else {
                 state = "unreadable"
             }
         }
+        // Same lock the engine holds for its whole transaction (a SIBLING
+        // of the state dir; see MigrationEngine.run). Probed with LOCK_NB
+        // and released at once — never kept.
+        let lockHeld = state != nil
+            && MigrationEngine.lockHeld(migrationLockPath(environment: environment))
         return Status(oldConfigPresent: present(roots.oldConfig),
                       oldDataPresent: present(roots.oldData),
                       newConfigPresent: present(roots.newConfig),
                       newDataPresent: present(roots.newData),
-                      journalState: state, roots: roots)
+                      journalState: state, migrationLockHeld: lockHeld,
+                      newInstallReady: ready, roots: roots)
+    }
+
+    /// The engine's transaction lock path for this environment — MUST match
+    /// what MigrationEngine derives from the production spec's `stateDir`
+    /// (the migration selftest pins the equality).
+    static func migrationLockPath(environment: [String: String] = ProcessInfo.processInfo.environment) -> String {
+        let dir = stateDir(environment: environment)
+        return (dir.hasSuffix("/") ? String(dir.dropLast()) : dir) + ".lock"
     }
 
     /// The refusal text for an interactive start against an unmigrated
     /// install (plan §4.2). Exact command included; nothing is done.
     static func pendingMessage(_ status: Status) -> String {
+        if let state = status.journalState, status.migrationRunning {
+            return "✖ An identity migration is running right now (journal state: \(state)).\n"
+                + "  Wait for it to finish — it starts Briglia itself once the migrated install "
+                + "passes its health probe. If it was interrupted, run `\(recoveryCommand)` to recover.\n"
+                + "  Diagnostics (`briglia doctor`, `briglia setup-api status`) work meanwhile."
+        }
         if let state = status.journalState {
             return "✖ An identity migration was interrupted (journal state: \(state)).\n"
                 + "  Run `\(recoveryCommand)` to recover — nothing is changed until you do.\n"
@@ -371,7 +411,11 @@ enum IdentityMigration {
     static func doctorFindings() -> [(problem: Bool, text: String, hint: String?)] {
         var out: [(Bool, String, String?)] = []
         let current = status()
-        if let state = current.journalState {
+        if let state = current.journalState, current.migrationRunning {
+            out.append((false, "an identity migration is running right now (journal state: \(state)"
+                + (current.newInstallReady ? ", new install ready" : "") + ")",
+                "wait for it to finish; `\(recoveryCommand)` recovers it only if it was interrupted"))
+        } else if let state = current.journalState {
             out.append((true, "interrupted identity migration (journal state: \(state))",
                         "run `\(recoveryCommand)` to recover — nothing is changed until you do"))
         } else if current.conflict {
@@ -568,6 +612,41 @@ struct MigrateProbe: ParsableCommand {
             print("PROBE-FAIL: setup-api schema \(SetupAPICore.schemaVersion) (expected 2)")
             throw ExitCode(1)
         }
+        // The daemon the migrator (re)starts runs the SAME startup gate as
+        // every mutating command. If that gate would refuse right now, the
+        // migrated install is not healthy whatever the roots look like —
+        // fail here, in seconds, with the reason, instead of waiting for an
+        // instance lock a refused daemon never takes (0.2.0 Linux defect).
+        let gate = IdentityMigration.status()
+        if gate.pending {
+            print("PROBE-FAIL: the startup gate would refuse `briglia daemon` right now — "
+                + IdentityMigration.pendingMessage(gate).split(separator: "\n").first.map(String.init).orEmpty)
+            throw ExitCode(1)
+        }
         print("PROBE-OK schema=\(SetupAPICore.schemaVersion) config=\(StoragePaths.configRoot.path) data=\(StoragePaths.dataRoot.path)")
+    }
+}
+
+private extension Optional where Wrapped == String {
+    var orEmpty: String { self ?? "" }
+}
+
+/// Hidden: exactly the startup gate `briglia daemon`/`chat` run, and nothing
+/// else — exit 0 (GATE-OK) when a mutating entry would be admitted right
+/// now, the refusal text and exit 2 otherwise. The migration selftest's
+/// fake systemd runs it in place of the real daemon so the "started daemon
+/// takes the instance lock" check exercises the real gate rather than a
+/// lock-holder that cannot refuse (how 0.2.0 shipped blind).
+struct MigrateGate: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "__migrate-gate",
+        abstract: "Internal: would a mutating command be admitted right now?",
+        shouldDisplay: false
+    )
+
+    func run() throws {
+        AdaCLI.prepareIO()
+        try IdentityMigration.gateMutatingEntry()
+        print("GATE-OK config=\(StoragePaths.configRoot.path) data=\(StoragePaths.dataRoot.path)")
     }
 }

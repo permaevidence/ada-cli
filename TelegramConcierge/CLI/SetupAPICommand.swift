@@ -979,7 +979,11 @@ enum SetupAPICore {
             "new_roots_present": status.newRootsPresent,
             "recovery_command": IdentityMigration.recoveryCommand,
         ]
-        if let state = status.journalState { block["journal_state"] = state }
+        if let state = status.journalState {
+            block["journal_state"] = state
+            block["in_progress"] = status.migrationRunning
+            block["new_install_ready"] = status.newInstallReady
+        }
         return block
     }
 

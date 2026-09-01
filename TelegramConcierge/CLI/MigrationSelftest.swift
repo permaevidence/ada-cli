@@ -781,7 +781,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         print("\n— crash matrix: forward recovery after every destructive sub-step —")
 
         let forwardPoints = ["after-prepared", "after-root-rename", "between-root-moves", "after-moved",
-                             "mid-fixups", "after-fixups", "after-committing-marker",
+                             "mid-fixups", "after-fixups", "after-new-install-ready", "after-committing-marker",
                              "after-unit-retirement", "after-wakelock-retirement",
                              "after-binary-park", "after-bundle-park", "after-symlink",
                              "after-committed", "during-post-verify"]
@@ -1750,7 +1750,17 @@ struct MigrationSelftest: AsyncParsableCommand {
               start)   if [ "$loaded" = 0 ]; then echo "Unit $unit not loaded."; exit 5; fi
                        touch "$SD/$unit.active"
                        if [ "$unit" = "briglia.service" ]; then
-                         nohup python3 "$SD/lockholder.py" "\(data)/briglia/instance.lock" "$SD/$unit.pid" >/dev/null 2>&1 &
+                         # Like systemd: `start` succeeds even if the service then
+                         # exits at once. The daemon it launches runs the startup
+                         # gate first — so run exactly that gate (the real binary,
+                         # this environment) and hold the instance lock ONLY when
+                         # it admits. A lock-holder that cannot refuse is how the
+                         # 0.2.0 systemd rollback shipped blind.
+                         if "\(newBinary)" __migrate-gate >> "$SD/gate.log" 2>&1; then
+                           nohup python3 "$SD/lockholder.py" "\(data)/briglia/instance.lock" "$SD/$unit.pid" >/dev/null 2>&1 &
+                         else
+                           echo "gate refused (exit $?)" >> "$SD/gate.log"
+                         fi
                        fi
                        exit 0;;
             esac
@@ -2164,6 +2174,9 @@ struct MigrationSelftest: AsyncParsableCommand {
             check("§4.3.5b: the new daemon was started and held the new instance lock before retirement",
                   log.contains("start briglia.service") && fm.fileExists(atPath: sysd + "/briglia.service.pid")
                   && MigrationEngine.lockHeld(data + "/briglia/instance.lock"), log)
+            let gateLog = readText(sysd + "/gate.log")
+            check("§4.3.5a/5b: the systemd-started daemon passed the REAL startup gate on the live journal (0.2.0 regression)",
+                  gateLog.contains("GATE-OK") && !gateLog.contains("refused") && !gateLog.contains("✖"), gateLog)
             // Read the domains the way the migrated binary does — in a
             // child under the fixture environment (the only correct view
             // on Linux; identical through cfprefsd on macOS).
@@ -2245,6 +2258,121 @@ struct MigrationSelftest: AsyncParsableCommand {
                 check("setup-api migrate: rerun reports nothing_to_do",
                       obj2?["ok"] as? Bool == true && obj2?["outcome"] as? String == "nothing_to_do", r2.tail)
             }
+        }
+
+        // ============================================================
+        print("\n— startup gate vs a LIVE migration journal (the 0.2.0 systemd rollback) —")
+        do {
+            let g = tempRoot.appendingPathComponent("gate").path
+            let gHome = g + "/home", gCfg = g + "/cfg", gData = g + "/data", gState = g + "/state"
+            for d in [gHome, gCfg, gData, gState] {
+                try fm.createDirectory(atPath: d, withIntermediateDirectories: true)
+            }
+            let gEnv: [String: String] = [
+                "HOME": gHome, "XDG_CONFIG_HOME": gCfg, "XDG_DATA_HOME": gData, "XDG_STATE_HOME": gState,
+                "BRIGLIA_TOOLCHAIN_BIN": g + "/bin", "BRIGLIA_MIGRATE_SYSTEMCTL": "/usr/bin/false",
+                "BRIGLIA_MIGRATE_PREFS_DOMAINS": "none",
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+            ]
+            let spec = IdentityMigration.productionSpec(environment: gEnv)
+            let stateDir = IdentityMigration.stateDir(environment: gEnv)
+            let lockPath = IdentityMigration.migrationLockPath(environment: gEnv)
+            let engineLock = (spec.stateDir.hasSuffix("/") ? String(spec.stateDir.dropLast()) : spec.stateDir) + ".lock"
+            check("gate: IdentityMigration.migrationLockPath equals the engine's lock derived from the production spec",
+                  engineLock == lockPath && lockPath == gState + "/briglia-migrate.lock", lockPath)
+            let journalPath = stateDir + "/journal.json"
+            func writeJournal(state: String, ready: Bool?, dropKey: Bool = false) throws {
+                var j = MigrationEngine.freshJournal(spec: spec)
+                j.state = state
+                j.newInstallReady = ready
+                try fm.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+                var data = try JSONEncoder().encode(j)
+                if dropKey {   // a journal written by 0.2.0 — no such key at all
+                    var obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+                    obj.removeValue(forKey: "newInstallReady")
+                    data = try JSONSerialization.data(withJSONObject: obj)
+                }
+                try data.write(to: URL(fileURLWithPath: journalPath))
+            }
+            func status() -> IdentityMigration.Status { IdentityMigration.status(environment: gEnv) }
+            func runGate(_ args: [String]) -> MigrationEngine.RunResult {
+                MigrationEngine.runBounded([adaBinary] + args, timeout: 60, extraEnv: gEnv)
+            }
+            // Hold the engine's lock from here: flock is per open file
+            // description, so a probe on another fd sees it as held.
+            let lockFD = open(lockPath, O_WRONLY | O_CREAT, 0o600)
+            check("gate: fixture can create the migration lock", lockFD >= 0)
+            var held = false
+            func hold() { if !held { held = flock(lockFD, LOCK_EX | LOCK_NB) == 0 } }
+            func release() { if held { flock(lockFD, LOCK_UN); held = false } }
+            defer { release(); close(lockFD) }
+            let newCfg = gCfg + "/briglia", newData = gData + "/briglia"
+            let oldCfg = gCfg + "/ada"
+
+            var s0 = status()
+            check("gate: no journal, no roots → nothing pending, no lock seen",
+                  !s0.pending && !s0.migrationRunning && !s0.migrationLockHeld)
+
+            // A live migrator BEFORE the ready flag (roots already moved so
+            // the gate — not a missing root — is what the probe reports).
+            try fm.createDirectory(atPath: newCfg, withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: newData, withIntermediateDirectories: true)
+            try writeJournal(state: "fixups", ready: false); hold()
+            s0 = status()
+            check("gate: live journal (lock held) but new install not ready → REFUSED as running",
+                  s0.pending && s0.migrationRunning && !s0.servedByLiveMigration
+                  && IdentityMigration.pendingMessage(s0).contains("running right now"),
+                  IdentityMigration.pendingMessage(s0))
+            var r = runGate(["__migrate-gate"])
+            check("gate: real binary `__migrate-gate` refuses (exit 2, 'running right now') before ready",
+                  r.exitCode == 2 && r.output.contains("running right now"), r.tail)
+            r = runGate(["__migrate-probe"])
+            check("gate: `__migrate-probe` fails on the not-ready live journal naming the startup gate",
+                  r.exitCode != 0 && r.output.contains("PROBE-FAIL") && r.output.contains("startup gate"), r.tail)
+
+            // The migrator set the flag and is now probing/starting: ADMIT.
+            try writeJournal(state: "fixups", ready: true)
+            s0 = status()
+            check("gate: live journal + new install ready + no old root → admitted (served by the live migration)",
+                  !s0.pending && s0.servedByLiveMigration && s0.newInstallReady)
+            r = runGate(["__migrate-gate"])
+            check("gate: real binary `__migrate-gate` admits (GATE-OK) exactly as the daemon would",
+                  r.exitCode == 0 && r.output.contains("GATE-OK"), r.tail)
+            r = runGate(["__migrate-probe"])
+            check("gate: `__migrate-probe` passes on the ready live journal", r.exitCode == 0 && r.output.contains("PROBE-OK"), r.tail)
+            for st in ["committing", "committed", "done"] {
+                try writeJournal(state: st, ready: true)
+                check("gate: live journal in state \(st) + ready → admitted (roll-forward recovery restarts the daemon)",
+                      !status().pending)
+            }
+            try writeJournal(state: "fixups", ready: true)
+
+            // Same flag, but an old root is back: the invariant wins.
+            try fm.createDirectory(atPath: oldCfg, withIntermediateDirectories: true)
+            s0 = status()
+            check("gate: ready live journal but an old root present → refused (ANY old root closes the gate)",
+                  s0.pending && !s0.servedByLiveMigration)
+            r = runGate(["__migrate-gate"])
+            check("gate: real binary refuses with an old root present even mid-live-migration", r.exitCode == 2, r.tail)
+            try fm.removeItem(atPath: oldCfg)
+
+            // The migrator died: same journal, nobody holds the lock.
+            release()
+            s0 = status()
+            check("gate: same ready journal with NO live holder → interrupted, refused ('was interrupted')",
+                  s0.pending && !s0.migrationLockHeld && !s0.migrationRunning
+                  && IdentityMigration.pendingMessage(s0).contains("was interrupted"),
+                  IdentityMigration.pendingMessage(s0))
+            r = runGate(["__migrate-gate"])
+            check("gate: real binary refuses the orphaned journal (exit 2)", r.exitCode == 2 && r.output.contains("interrupted"), r.tail)
+
+            // A 0.2.0-era journal (no flag key) under a live holder: never admitted by guesswork.
+            try writeJournal(state: "fixups", ready: nil, dropKey: true); hold()
+            s0 = status()
+            check("gate: pre-flag (0.2.0) journal decodes and is refused even under a live lock",
+                  s0.journalState == "fixups" && s0.migrationRunning && !s0.newInstallReady && s0.pending)
+            release()
+            try? fm.removeItem(atPath: journalPath)
         }
 
         // ============================================================

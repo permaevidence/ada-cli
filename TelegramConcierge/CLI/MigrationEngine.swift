@@ -211,6 +211,12 @@ struct MigrationJournal: Codable {
     /// left untouched and no compat symlink was created.
     var binaryParkSkipped: Bool
     var warnings: [String]
+    /// Set durably at the top of commit(): roots moved and every fixup
+    /// applied, so the NEW identity may serve — the startup gate admits a
+    /// daemon started by the live (lock-holding) migrator only on this
+    /// flag. Optional for journals written before it existed (read as
+    /// false: such a daemon is refused, never admitted by guesswork).
+    var newInstallReady: Bool?
 }
 
 enum MigrationOutcome {
@@ -561,7 +567,7 @@ final class MigrationEngine {
             startedNewUnit: false,
             newWakelockInstalled: false, newWakelockEnabled: false,
             startedNewWakelock: false, symlinkCreated: false,
-            binaryParkSkipped: false, warnings: [])
+            binaryParkSkipped: false, warnings: [], newInstallReady: false)
     }
 
     /// Resolve the default journal home from the environment:
@@ -1456,6 +1462,19 @@ final class MigrationEngine {
     // =========================================================== commit
 
     func commit() throws {
+        // 5·0. Durable "the new install may serve" marker BEFORE anything
+        // starts or probes it: the daemon systemd launches in 5a and the
+        // `__migrate-probe` in 5b both run the startup gate, which admits a
+        // live journal only on this flag (+ our held lock, + no old root).
+        // Without it the daemon exits 2 on its own journal, systemd loops
+        // it, and 5b waits for an instance lock nobody takes → rollback —
+        // exactly what 0.2.0 did on every systemd-managed install.
+        if journal.newInstallReady != true {
+            journal.newInstallReady = true
+            try persistJournal()
+        }
+        Self.crashPoint("after-new-install-ready")
+
         // 5a. Recreate the captured service topology on the new identity —
         // installed/enabled/active as three independent flags.
         if let service = journal.oldService, service.installed, unitManaged,
