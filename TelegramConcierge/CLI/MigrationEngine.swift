@@ -1927,32 +1927,80 @@ final class MigrationEngine {
         return nil
     }
 
+    /// lstat-based presence and kind — `fileExists` follows symlinks and
+    /// would report a dangling compat symlink as "nothing there".
+    static func entryKind(_ path: String) -> String? {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return nil }
+        switch st.st_mode & S_IFMT {
+        case S_IFLNK: return "symlink"
+        case S_IFDIR: return "directory"
+        default: return "file"
+        }
+    }
+
+    /// Verify a parked asset's recorded kind + hash/target against the
+    /// object at `path` (its parked copy or its original location).
+    func parkedContentProblem(_ parked: MigrationJournal.Parked, at path: String,
+                              label: String) -> String? {
+        guard let kind = Self.entryKind(path) else {
+            return "\(label) \(parked.id) at \(path) is unreadable"
+        }
+        guard kind == parked.kind else {
+            return "\(label) \(parked.id) at \(path) is a \(kind), recorded as \(parked.kind)"
+        }
+        switch parked.kind {
+        case "file":
+            if Self.sha256(ofFile: URL(fileURLWithPath: path)) != parked.sha256 {
+                return "\(label) \(parked.id) at \(path) does not match its recorded hash"
+            }
+        case "directory":
+            if Self.treeHash(of: URL(fileURLWithPath: path)) != parked.sha256 {
+                return "\(label) \(parked.id) tree at \(path) does not match its recorded hash"
+            }
+        case "symlink":
+            if (try? fm.destinationOfSymbolicLink(atPath: path)) != parked.target {
+                return "\(label) \(parked.id) symlink target at \(path) changed"
+            }
+        default:
+            return "parked \(parked.id) has unknown kind \(parked.kind)"
+        }
+        return nil
+    }
+
+    /// Verify one parked asset at WHICHEVER location currently holds it:
+    /// its parked copy, or its original path when an interrupted rollback
+    /// already put it back (Codex Stage 3 round 4). Both present is refused
+    /// — the engine never guesses which copy is genuine — except for the
+    /// one expected state: the parked binary while its original path holds
+    /// the compat symlink to the new binary (an `absent` record that the
+    /// restore removes first). Nowhere present is refused as missing.
+    func parkedAssetProblem(_ parked: MigrationJournal.Parked) -> String? {
+        let stored = parkedDir.appendingPathComponent(parked.id).path
+        let parkedThere = Self.entryKind(stored) != nil
+        let originalThere = Self.entryKind(parked.originalPath) != nil
+        if parkedThere && originalThere {
+            let compatSymlink = parked.id == "binary" && journal.symlinkCreated
+                && Self.entryKind(parked.originalPath) == "symlink"
+                && (try? fm.destinationOfSymbolicLink(atPath: parked.originalPath)) == spec.newBinary
+            guard compatSymlink else {
+                return "parked \(parked.id) exists BOTH in parked/ and at \(parked.originalPath) "
+                    + "— refusing to guess which copy is genuine"
+            }
+            return parkedContentProblem(parked, at: stored, label: "parked")
+        }
+        if parkedThere {
+            return parkedContentProblem(parked, at: stored, label: "parked")
+        }
+        if originalThere {
+            return parkedContentProblem(parked, at: parked.originalPath, label: "already-restored")
+        }
+        return "parked asset \(parked.id) is missing entirely"
+    }
+
     func parkedAssetsProblem() -> String? {
         for parked in journal.parked {
-            let path = parkedDir.appendingPathComponent(parked.id)
-            // A recorded-but-never-moved asset is still at its original
-            // place — that's fine for restore (nothing to move back).
-            guard fm.fileExists(atPath: path.path)
-                || fm.fileExists(atPath: parked.originalPath) else {
-                return "parked asset \(parked.id) is missing entirely"
-            }
-            guard fm.fileExists(atPath: path.path) else { continue }
-            switch parked.kind {
-            case "file":
-                if Self.sha256(ofFile: path) != parked.sha256 {
-                    return "parked \(parked.id) does not match its recorded hash"
-                }
-            case "directory":
-                if Self.treeHash(of: path) != parked.sha256 {
-                    return "parked \(parked.id) tree does not match its recorded hash"
-                }
-            case "symlink":
-                if (try? fm.destinationOfSymbolicLink(atPath: path.path)) != parked.target {
-                    return "parked \(parked.id) symlink target changed"
-                }
-            default:
-                return "parked \(parked.id) has unknown kind \(parked.kind)"
-            }
+            if let problem = parkedAssetProblem(parked) { return problem }
         }
         return nil
     }
@@ -2334,14 +2382,22 @@ final class MigrationEngine {
         var restoredPaths: Set<String> = []
         for parked in journal.parked.reversed() {
             let stored = parkedDir.appendingPathComponent(parked.id)
-            guard fm.fileExists(atPath: stored.path) else {
+            guard Self.entryKind(stored.path) != nil else {
                 // Already restored by an earlier, interrupted attempt (or
-                // never parked): it counts as restored, so the `absent`
-                // record at the same path is dropped below — otherwise a
-                // RETRIED park-restoring rollback would delete the binary
-                // its first attempt had just put back.
-                var st = stat()
-                if lstat(parked.originalPath, &st) == 0 { restoredPaths.insert(parked.originalPath) }
+                // never parked): it counts as restored ONLY if the object
+                // at the original path verifies against the record — then
+                // its `absent` record is dropped below, otherwise a RETRIED
+                // park-restoring rollback would delete the binary its first
+                // attempt had just put back. (Pre-verified above; re-checked
+                // here so this branch can never accept an unverified object.)
+                if Self.entryKind(parked.originalPath) != nil {
+                    if let problem = parkedContentProblem(parked, at: parked.originalPath,
+                                                          label: "already-restored") {
+                        throw EngineError(outcome: .failed(
+                            "park-restoring rollback held: \(problem) — the journal is preserved"))
+                    }
+                    restoredPaths.insert(parked.originalPath)
+                }
                 continue
             }
             try? fm.removeItem(atPath: parked.originalPath)

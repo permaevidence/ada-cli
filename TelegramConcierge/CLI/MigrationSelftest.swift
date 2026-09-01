@@ -1463,6 +1463,138 @@ struct MigrationSelftest: AsyncParsableCommand {
         }
 
         // ============================================================
+        print("\n— round 4: parked assets verified at whichever location holds them —")
+
+        /// Parked entries (id, originalPath, kind) recorded in a live journal.
+        func parkedEntries(_ fixture: Fixture) -> [(id: String, path: String, kind: String)] {
+            guard let data = fm.contents(atPath: fixture.stateDir + "/journal.json"),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let parked = object["parked"] as? [[String: Any]] else { return [] }
+            return parked.compactMap { entry in
+                guard let id = entry["id"] as? String, let path = entry["originalPath"] as? String,
+                      let kind = entry["kind"] as? String else { return nil }
+                return (id, path, kind)
+            }
+        }
+        func entryExists(_ path: String) -> Bool {
+            var st = stat(); return lstat(path, &st) == 0
+        }
+
+        restoredCorrupt: do {
+            // An asset already put back by an interrupted park-restoring
+            // rollback (parked/ copy gone) must be verified AT ITS ORIGINAL
+            // PATH; a damaged object there is refused with zero mutations —
+            // never accepted as "restored byte-identically".
+            let fixture = try makeFixture("restored-corrupt")
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-symlink"])
+            check("restored-corrupt: crash injected after the compat symlink",
+                  crashed.code == 137, crashed.output)
+            try fm.removeItem(atPath: fixture.newBinary)
+            // Interrupt the park-restoring rollback after its FIRST asset is
+            // back at its original path (the parked/ barrier fault).
+            let interrupted = runEngine(fixture,
+                                        env: ["ADA_MIGRATE_FAULT": "fsync=" + fixture.stateDir + "/parked"])
+            check("restored-corrupt: first restore attempt interrupted after one asset",
+                  interrupted.code == 1 && interrupted.output.contains("not durable"),
+                  interrupted.output)
+            guard let restored = parkedEntries(fixture).first(where: {
+                !entryExists(fixture.stateDir + "/parked/" + $0.id) && entryExists($0.path)
+            }) else {
+                check("restored-corrupt: exactly one asset sits at its original path", false)
+                break restoredCorrupt
+            }
+            note("already-restored asset: \(restored.id) (\(restored.kind))")
+            // Damage the already-restored object in a way that changes its
+            // recorded hash, remembering how to undo it exactly.
+            var undo: () throws -> Void
+            if restored.kind == "directory" {
+                let extra = restored.path + "/planted.txt"
+                try writeFile(extra, "planted")
+                undo = { try fm.removeItem(atPath: extra) }
+            } else {
+                let original = fm.contents(atPath: restored.path) ?? Data()
+                let mode = MigrationEngine.fileMode(restored.path) ?? 0o644
+                try (original + Data("tampered".utf8)).write(to: URL(fileURLWithPath: restored.path))
+                undo = {
+                    try original.write(to: URL(fileURLWithPath: restored.path))
+                    _ = chmod(restored.path, mode_t(mode))
+                }
+            }
+            let liveRoots = fixture.restoreRoots + [fixture.newConfig, fixture.newData,
+                                                   fixture.newLanding, fixture.stateDir + "/parked"]
+            let held = snapshot(liveRoots)
+            let refused = runEngine(fixture)
+            check("restored-corrupt: recovery refuses — damaged already-restored asset named",
+                  refused.code == 1 && refused.output.contains("already-restored \(restored.id)")
+                  && !refused.output.contains("byte-identically"), refused.output)
+            let diffs = snapshotDiff(held, snapshot(liveRoots))
+            check("restored-corrupt: zero mutations (roots, parked/, new roots)",
+                  diffs.isEmpty, diffs.prefix(5).joined(separator: "; "))
+            try undo()
+            let retried = runEngine(fixture)
+            check("restored-corrupt: undamaged again ⇒ park-restoring rollback completes",
+                  retried.code == 1 && retried.output.contains("restored byte-identically"),
+                  retried.output)
+            try writeScript(fixture.newBinary, "#!/bin/sh\necho new-briglia\n")
+            let finalDiffs = snapshotDiff(before, snapshot(fixture.restoreRoots))
+            check("restored-corrupt: byte-identical in the end", finalDiffs.isEmpty,
+                  finalDiffs.prefix(5).joined(separator: "; "))
+        }
+
+        do {
+            // Both copies present without the expected compat-symlink state:
+            // an unrelated object at the original path while the parked copy
+            // exists is refused — never overwritten, never accepted.
+            let fixture = try makeFixture("dual-copies")
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-binary-park"])
+            check("dual-copies: crash injected after binary parking", crashed.code == 137,
+                  crashed.output)
+            try fm.removeItem(atPath: fixture.newBinary)
+            try writeScript(fixture.oldBinary, "#!/bin/sh\necho impostor\n")
+            let liveRoots = fixture.restoreRoots + [fixture.newConfig, fixture.newData,
+                                                   fixture.newLanding, fixture.stateDir + "/parked"]
+            let held = snapshot(liveRoots)
+            let refused = runEngine(fixture)
+            check("dual-copies: recovery refuses an unrelated file beside the parked binary",
+                  refused.code == 1 && refused.output.contains("exists BOTH"), refused.output)
+            check("dual-copies: zero mutations",
+                  snapshotDiff(held, snapshot(liveRoots)).isEmpty
+                  && fm.fileExists(atPath: fixture.stateDir + "/parked/binary"))
+            try fm.removeItem(atPath: fixture.oldBinary)
+            let restored = runEngine(fixture)
+            check("dual-copies: impostor removed ⇒ park-restoring rollback completes",
+                  restored.code == 1 && restored.output.contains("restored byte-identically"),
+                  restored.output)
+            try writeScript(fixture.newBinary, "#!/bin/sh\necho new-briglia\n")
+            check("dual-copies: byte-identical in the end",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty)
+        }
+
+        do {
+            // The compat symlink is the ONE accepted dual state — but only
+            // when it points at the new binary. A symlink elsewhere at the
+            // binary path is refused like any other foreign object.
+            let fixture = try makeFixture("dual-foreign-symlink")
+            defer { killHolders(fixture) }
+            let crashed = runEngine(fixture, env: ["ADA_MIGRATE_CRASH_POINT": "after-symlink"])
+            check("dual-foreign-symlink: crash injected after the compat symlink",
+                  crashed.code == 137, crashed.output)
+            try fm.removeItem(atPath: fixture.newBinary)
+            try fm.removeItem(atPath: fixture.oldBinary)
+            try fm.createSymbolicLink(atPath: fixture.oldBinary, withDestinationPath: "/usr/bin/true")
+            let liveRoots = fixture.restoreRoots + [fixture.stateDir + "/parked"]
+            let held = snapshot(liveRoots)
+            let refused = runEngine(fixture)
+            check("dual-foreign-symlink: refused, zero mutations",
+                  refused.code == 1 && refused.output.contains("exists BOTH")
+                  && snapshotDiff(held, snapshot(liveRoots)).isEmpty, refused.output)
+        }
+
+        // ============================================================
         print("\n— preferences persistence path (resolved concretely, both platforms) —")
 
         do {
