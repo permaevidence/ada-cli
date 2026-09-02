@@ -9401,9 +9401,8 @@ class ConversationManager: ObservableObject {
                                        label: "reminder scripts directory") {
             failures.append(f)
         }
-        try? FileManager.default.createDirectory(
-            at: appFolder.appendingPathComponent("reminder-scripts/state", isDirectory: true),
-            withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(
+            appFolder.appendingPathComponent("reminder-scripts/state", isDirectory: true))
 
         // 13. Straggler sweep: if a watcher check outlived its 10s wait
         //     (reported above), its fire may have landed after step 3 —
