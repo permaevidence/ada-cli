@@ -190,6 +190,26 @@ def main():
         check("doctor: a data root that is a regular file is reported as an error",
               "not a directory" in result.stdout and "✖ entries under the roots" in result.stdout,
               result.stdout[-800:])
+        # Every mutating entry point goes through the shared gate: with the
+        # data root as a regular file, then as a FIFO, `trigger` must refuse
+        # on the storage root (exit 2) before looking at its arguments, and
+        # `__migrate-gate` must refuse too.
+        for kind in ("file", "fifo"):
+            if kind == "fifo":
+                os.remove(link_root)
+                os.mkfifo(link_root)
+            result = subprocess.run([ADA, "trigger", "not-a-uuid", "x"], capture_output=True,
+                                    text=True, timeout=60, env=env)
+            check(f"gate: `trigger` refuses a data root that is a {kind} (exit 2, names the storage root)",
+                  result.returncode == 2 and "Storage root cannot be used" in (result.stdout + result.stderr)
+                  and "not-a-uuid" not in (result.stdout + result.stderr),
+                  f"rc={result.returncode} out={(result.stdout + result.stderr)[-500:]!r}")
+            result = subprocess.run([ADA, "__migrate-gate"], capture_output=True,
+                                    text=True, timeout=60, env=env)
+            check(f"gate: `__migrate-gate` refuses a data root that is a {kind}",
+                  result.returncode != 0 and "Storage root cannot be used" in (result.stdout + result.stderr),
+                  f"rc={result.returncode} out={(result.stdout + result.stderr)[-500:]!r}")
+        os.remove(link_root)
 
     # 3. media pipeline
     result = subprocess.run([ADA, "media-selftest"], capture_output=True, text=True, timeout=300)

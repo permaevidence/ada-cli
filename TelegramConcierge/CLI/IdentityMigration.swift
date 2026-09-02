@@ -416,7 +416,18 @@ enum IdentityMigration {
             print(pendingMessage(current))
             throw ExitCode(2)
         }
-        StoragePaths.ensureRoots()
+        // A root that exists as something other than a directory (a regular
+        // file, a FIFO, a link to nowhere) cannot be written: refuse here,
+        // for every mutating entry point, instead of letting the command
+        // proceed and fail somewhere inside.
+        do {
+            try StoragePaths.ensureRootsChecked()
+        } catch {
+            print("✖ Storage root cannot be used: \(error)\n"
+                  + "  Both `\(StoragePaths.configRootDisplay)` and `\(StoragePaths.dataRootDisplay)` must be directories owned by you "
+                  + "— move the offending object aside and retry. Diagnostics (`briglia doctor`) work meanwhile.")
+            throw ExitCode(2)
+        }
     }
 
     // MARK: - Persona bridge (plan §4.4)
