@@ -179,6 +179,10 @@ struct MigrationSelftest: AsyncParsableCommand {
             try writeFile(oldData + "/instance.lock", "")
             let prefixTool = oldData + "/toolchain/prefix/usr/bin/faketool"
             try writeScript(prefixTool, "#!/bin/sh\necho faketool 1.0\n")
+            // A setgid file the engine only ever MOVES (never rewrites): its
+            // special bit must ride through migration and rollback exactly.
+            try writeFile(oldData + "/toolchain/prefix/usr/bin/sgid-tool",
+                          "#!/bin/sh\necho sgid\n", mode: 0o2755)
             try writeFile(oldData + "/toolchain/prefix/usr/lib/libreoffice/program/fundamentalrc",
                           "URE_BOOTSTRAP=\(oldData)/toolchain/prefix/usr/lib/libreoffice/program/fundamentalrc\n")
 
@@ -227,6 +231,13 @@ struct MigrationSelftest: AsyncParsableCommand {
             #!/bin/sh
             SD="\(sysd)"
             echo "$@" >> "$SD/log"
+            if [ "${FAKE_SYSTEMCTL_LOG_OUTPATH:-0}" = "1" ]; then
+                # Where does fd 1 point? (Linux: /proc; macOS: F_GETPATH.)
+                exec 5>&1
+                p=$(python3 -c 'import fcntl,os; p=os.path.exists("/proc/self/fd/5") and os.readlink("/proc/self/fd/5") or fcntl.fcntl(5, fcntl.F_GETPATH, b"\\0"*1024).split(b"\\0",1)[0].decode(); print(p)' 2>/dev/null)
+                exec 5>&-
+                echo "$p" >> "$SD/outpaths"
+            fi
             if [ "$1" = "--user" ]; then shift; fi
             verb="$1"; unit="$2"
             # Broken-query seam: systemd/dbus itself failing must never read
@@ -423,6 +434,10 @@ struct MigrationSelftest: AsyncParsableCommand {
             check("\(label): toolchain wrapper rebased and executable",
                   toolWrapper.contains(f.newData) && !toolWrapper.contains(f.oldData)
                   && MigrationEngine.fileMode(f.binDir + "/faketool") == 0o755)
+            check("\(label): setgid bit on a moved file survives bit-for-bit (0o2755)",
+                  MigrationEngine.fileMode(f.newData + "/toolchain/prefix/usr/bin/sgid-tool") == 0o2755,
+                  MigrationEngine.fileMode(f.newData + "/toolchain/prefix/usr/bin/sgid-tool")
+                      .map { String($0, radix: 8) } ?? "missing")
             check("\(label): LibreOffice rc rebased",
                   readText(f.newData + "/toolchain/prefix/usr/lib/libreoffice/program/fundamentalrc")
                       .contains(f.newData))
@@ -2261,6 +2276,273 @@ struct MigrationSelftest: AsyncParsableCommand {
         }
 
         // ============================================================
+        print("\n— hardening bundle (H7): rollback preflight, exclusive temps, capture-kind checks, special modes, lock probe —")
+
+        // H7.1 — a directory planted at a recorded preimage path holds the
+        // WHOLE rollback before its first mutation.
+        do {
+            let fixture = try makeFixture("h7-planted-dir", wakelock: true)
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-fixups"])
+            check("H7.1: crash injected after fixups", crashed.code == 137, crashed.output)
+            let journalData = fm.contents(atPath: fixture.stateDir + "/journal.json") ?? Data()
+            let journal = try? JSONDecoder().decode(MigrationJournal.self, from: journalData)
+            // Rollback walks preimages in REVERSE: the FIRST-recorded entry
+            // is restored LAST, so a per-entry check would only trip after
+            // every later entry had already been restored or deleted.
+            let firstFile = journal?.preimages.first { $0.type == "file" }
+            check("H7.1: journal records a file preimage", firstFile != nil)
+            if let firstFile {
+                let victim = firstFile.path   // roots are moved at this point: the new-root location
+                let originalBytes = fm.contents(atPath: victim)
+                try fm.removeItem(atPath: victim)
+                try fm.createDirectory(atPath: victim, withIntermediateDirectories: false)
+                try writeFile(victim + "/inner.txt", "planted")
+                let watched = fixture.restoreRoots + [fixture.newConfig, fixture.newData, fixture.stateDir]
+                let held = snapshot(watched)
+                let refused = runEngine(fixture, args: ["--rollback"])
+                check("H7.1: rollback refuses BEFORE modifying anything, naming the planted directory",
+                      refused.code == 1 && refused.output.contains("refused BEFORE modifying anything")
+                      && refused.output.contains("DIRECTORY") && refused.output.contains(victim), refused.output)
+                let diffs = snapshotDiff(held, snapshot(watched))
+                check("H7.1: zero mutations — every other entry untouched, journal kept (tree hash before == after)",
+                      diffs.isEmpty && fm.fileExists(atPath: fixture.stateDir + "/journal.json"),
+                      diffs.prefix(5).joined(separator: "; "))
+                try fm.removeItem(atPath: victim)
+                if let originalBytes { _ = fm.createFile(atPath: victim, contents: originalBytes) }
+                let rolled = runEngine(fixture, args: ["--rollback"])
+                check("H7.1: with the planted directory gone the rollback completes", rolled.code == 0, rolled.output)
+                let finalDiffs = snapshotDiff(before, snapshot(fixture.restoreRoots))
+                check("H7.1: byte-identical restore", finalDiffs.isEmpty, finalDiffs.prefix(5).joined(separator: "; "))
+            }
+        }
+
+        // H7.2 — exclusive staging temps; orphans swept at engine start.
+        do {
+            let fixture = try makeFixture("h7-orphans", units: false)
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-moved"])
+            check("H7.2: crash injected after the root moves", crashed.code == 137, crashed.output)
+            let orphan1 = fixture.stateDir + "/" + MigrationEngine.stagingTempPrefix + "orphan-1"
+            let orphan2 = fixture.stateDir + "/preimages/" + MigrationEngine.stagingTempPrefix + "orphan-2"
+            let keep = fixture.stateDir + "/preimages/keep-me"
+            try writeFile(orphan1, "half-written")
+            try writeFile(orphan2, "half-written")
+            try writeFile(keep, "not a staging temp")
+            let reentered = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "mid-fixups"])
+            check("H7.2: recovery re-entered (and crashed at the next seam, keeping the journal area)",
+                  reentered.code == 137, reentered.output)
+            check("H7.2: orphan staging temps swept at engine start, other files untouched",
+                  !fm.fileExists(atPath: orphan1) && !fm.fileExists(atPath: orphan2)
+                  && fm.fileExists(atPath: keep))
+            let done = runEngine(fixture)
+            check("H7.2: migration then completes forward", done.code == 0, done.output)
+
+            let wdDir = tempRoot.appendingPathComponent("h7-writedurable").path
+            try fm.createDirectory(atPath: wdDir, withIntermediateDirectories: true)
+            let target = wdDir + "/out.txt"
+            let why = MigrationEngine.writeDurable(Data("x".utf8), to: URL(fileURLWithPath: target))
+            let prior = umask(0o022); umask(prior)
+            let expectedDefault = Int(0o666 & ~prior)
+            check("H7.2: writeDurable without a mode yields the plain-create (umask) mode",
+                  why == nil && MigrationEngine.fileMode(target) == expectedDefault,
+                  "\(why ?? "") mode=\(MigrationEngine.fileMode(target).map { String($0, radix: 8) } ?? "?") expected=\(String(expectedDefault, radix: 8))")
+            let why2 = MigrationEngine.writeDurable(Data("y".utf8), to: URL(fileURLWithPath: target), mode: 0o600)
+            check("H7.2: writeDurable applies the requested mode", why2 == nil
+                  && MigrationEngine.fileMode(target) == 0o600 && readText(target) == "y", why2 ?? "")
+            let empty = MigrationEngine.writeDurable(Data(), to: URL(fileURLWithPath: wdDir + "/empty"), mode: 0o600)
+            check("H7.2: writeDurable handles empty content", empty == nil
+                  && fm.contents(atPath: wdDir + "/empty")?.isEmpty == true, empty ?? "")
+            let dirTarget = wdDir + "/adir"
+            try fm.createDirectory(atPath: dirTarget, withIntermediateDirectories: true)
+            let why3 = MigrationEngine.writeDurable(Data("z".utf8), to: URL(fileURLWithPath: dirTarget))
+            let leftovers = ((try? fm.contentsOfDirectory(atPath: wdDir)) ?? [])
+                .filter { $0.hasPrefix(MigrationEngine.stagingTempPrefix) }
+            check("H7.2: writeDurable over a directory fails cleanly and leaves no staging temp",
+                  why3 != nil && leftovers.isEmpty && fm.fileExists(atPath: dirTarget), why3 ?? "nil")
+        }
+
+        // H7.3 — check-then-act on recorded paths: a staged write refuses a
+        // target whose kind changed since capture; a park refuses an asset
+        // whose kind changed since it was recorded.
+        do {
+            let fixture = try makeFixture("h7-kind-fixup", wakelock: true)
+            defer { killHolders(fixture) }
+            let before = snapshot(fixture.restoreRoots)
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-preimage-record"])
+            check("H7.3: crash injected right after the first preimage record", crashed.code == 137, crashed.output)
+            let secrets = fixture.newConfig + "/secrets.json"
+            let copy = fixture.root + "/secrets-copy.json"
+            check("H7.3: the recorded file is still a regular file at the crash", MigrationEngine.entryKind(secrets) == "file")
+            try fm.copyItem(atPath: secrets, toPath: copy)
+            try fm.removeItem(atPath: secrets)
+            try fm.createSymbolicLink(atPath: secrets, withDestinationPath: copy)
+            let result = runEngine(fixture)
+            check("H7.3: staged write refuses a target whose kind changed since capture (file → symlink) and rolls back",
+                  result.code == 1 && result.output.contains("changed kind since it was captured")
+                  && result.output.contains("rolled back"), result.output)
+            let diffs = snapshotDiff(before, snapshot(fixture.restoreRoots))
+            check("H7.3: byte-identical restore after the refusal (symlink replaced by the recorded file)",
+                  diffs.isEmpty, diffs.prefix(5).joined(separator: "; "))
+        }
+        do {
+            let fixture = try makeFixture("h7-kind-park", wakelock: true)
+            defer { killHolders(fixture) }
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-park-record-bundle"])
+            check("H7.3: crash injected right after the bundle's park record", crashed.code == 137, crashed.output)
+            let skill = fixture.oldBundle + "/BundledSkills/pdf/SKILL.md"
+            let skillText = readText(skill)
+            check("H7.3: the recorded asset (old bundle directory) is still at its original path, not yet parked",
+                  MigrationEngine.entryKind(fixture.oldBundle) == "directory"
+                  && !fm.fileExists(atPath: fixture.stateDir + "/parked/bundle"))
+            try fm.removeItem(atPath: fixture.oldBundle)
+            try writeFile(fixture.oldBundle, "now a regular file")
+            let held = runEngine(fixture)
+            check("H7.3: park refuses an asset whose kind changed since it was recorded (directory → file), journal kept",
+                  held.code == 1 && held.output.contains("changed kind since it was recorded for parking")
+                  && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), held.output)
+            check("H7.3: the planted file was neither parked nor removed",
+                  !fm.fileExists(atPath: fixture.stateDir + "/parked/bundle")
+                  && MigrationEngine.entryKind(fixture.oldBundle) == "file")
+            try fm.removeItem(atPath: fixture.oldBundle)
+            try writeFile(skill, skillText)
+            let done = runEngine(fixture)
+            check("H7.3: with the original file back, recovery completes forward", done.code == 0, done.output)
+            assertMigratedState(fixture, label: "H7.3-park")
+        }
+
+        // H7.4 — journal-area subdirectories are owner-only.
+        do {
+            let fixture = try makeFixture("h7-modes", units: false)
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-prepared"])
+            check("H7.4: crash injected after prepare", crashed.code == 137, crashed.output)
+            let modes = [fixture.stateDir, fixture.stateDir + "/preimages", fixture.stateDir + "/parked"]
+                .map { MigrationEngine.fileMode($0) }
+            check("H7.4: state dir, preimages/ and parked/ are 0700", modes.allSatisfy { $0 == 0o700 },
+                  modes.map { $0.map { String($0, radix: 8) } ?? "missing" }.joined(separator: ","))
+            _ = runEngine(fixture)
+        }
+
+        // H7.5 — subprocess output files live under the journal area.
+        do {
+            let fixture = try makeFixture("h7-outpaths")
+            defer { killHolders(fixture) }
+            let result = runEngine(fixture, env: ["FAKE_SYSTEMCTL_LOG_OUTPATH": "1"])
+            check("H7.5: migration succeeds while systemctl records where its output goes", result.code == 0, result.output)
+            let lines = readText(fixture.sysd + "/outpaths").split(separator: "\n").map(String.init)
+                .filter { !$0.isEmpty }
+            let stateReal = MigrationEngine.canonicalize(fixture.stateDir, dereferenceLeaf: true) ?? fixture.stateDir
+            let bad = lines.filter {
+                !($0.hasPrefix(fixture.stateDir + "/migrate-out-") || $0.hasPrefix(stateReal + "/migrate-out-"))
+            }
+            check("H7.5: every subprocess output file was created under the 0700 journal area (\(lines.count) calls)",
+                  !lines.isEmpty && bad.isEmpty, bad.prefix(3).joined(separator: ", "))
+        }
+
+        // H7.6 — systemctl by absolute path only; journal unit captures must
+        // be the spec's.
+        do {
+            let fixture = try makeFixture("h7-units")
+            defer { killHolders(fixture) }
+            var relative = fixture.spec
+            relative.systemctl = "systemctl"
+            check("H7.6: a spec naming systemctl by a relative name is refused",
+                  MigrationEngine.validateSpec(relative)?.contains("absolute path") == true,
+                  MigrationEngine.validateSpec(relative) ?? "accepted")
+            var badUnit = fixture.spec
+            badUnit.oldUnitName = "../evil.service"
+            check("H7.6: a spec naming a unit with a path separator is refused",
+                  MigrationEngine.validateSpec(badUnit)?.contains("invalid systemd unit") == true,
+                  MigrationEngine.validateSpec(badUnit) ?? "accepted")
+            let fixed = IdentityMigration.systemctlFixedPath()
+            check("H7.6: production systemctl resolves only to a fixed location (or none)",
+                  fixed == nil || IdentityMigration.systemctlCandidates.contains(fixed!), fixed ?? "nil")
+
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "between-root-moves"])
+            check("H7.6: crash injected with a unit capture in the journal", crashed.code == 137, crashed.output)
+            let journalPath = fixture.stateDir + "/journal.json"
+            let original = readText(journalPath)
+            var object = try JSONSerialization.jsonObject(with: Data(original.utf8)) as! [String: Any]
+            var service = object["oldService"] as! [String: Any]
+            service["name"] = "evil.service"
+            object["oldService"] = service
+            try JSONSerialization.data(withJSONObject: object).write(to: URL(fileURLWithPath: journalPath))
+            let watched = fixture.restoreRoots + [fixture.newConfig, fixture.newData]
+            let held = snapshot(watched)
+            let refused = runEngine(fixture)
+            check("H7.6: a journal whose unit capture is not the spec's unit is refused as corrupt, zero mutations",
+                  refused.code == 3 && refused.output.contains("not the spec's old unit")
+                  && snapshotDiff(held, snapshot(watched)).isEmpty, refused.output)
+            try original.write(toFile: journalPath, atomically: true, encoding: .utf8)
+            _ = runEngine(fixture)
+        }
+
+        // H7.7 — lock probe distinguishes free / held / unknown.
+        do {
+            let lockDir = tempRoot.appendingPathComponent("h7-lock").path
+            try fm.createDirectory(atPath: lockDir, withIntermediateDirectories: true)
+            check("H7.7: a missing lock file probes as free",
+                  MigrationEngine.lockProbe(lockDir + "/none.lock") == .free)
+            let probe = MigrationEngine.lockProbe(lockDir)   // a directory: open(O_RDWR) fails, not ENOENT
+            var unknown = false
+            if case .unknown = probe { unknown = true }
+            check("H7.7: an unprobeable lock path is unknown with its errno — never free, never held",
+                  unknown && probe.problem != nil && !MigrationEngine.lockHeld(lockDir), "\(probe)")
+            let path = lockDir + "/held.lock"
+            let fd = open(path, O_WRONLY | O_CREAT, 0o600)
+            check("H7.7: a held lock probes as held",
+                  fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0 && MigrationEngine.lockProbe(path) == .held)
+            flock(fd, LOCK_UN); close(fd)
+            check("H7.7: a released lock probes as free", MigrationEngine.lockProbe(path) == .free)
+
+            let fixture = try makeFixture("h7-lock-unknown", units: false)
+            try fm.removeItem(atPath: fixture.oldData + "/instance.lock")
+            try fm.createDirectory(atPath: fixture.oldData + "/instance.lock", withIntermediateDirectories: false)
+            let before = snapshot(fixture.restoreRoots)
+            let refused = runEngine(fixture)
+            check("H7.7: an unprobeable instance lock refuses the migration instead of guessing",
+                  refused.code == 2 && refused.output.contains("refusing to proceed on a guess"), refused.output)
+            check("H7.7: refusal left the fixture untouched, no journal",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty
+                  && !fm.fileExists(atPath: fixture.stateDir))
+        }
+
+        // H7.8 — special permission bits: preserved exactly on moved files
+        // (asserted in every migrated-state check), refused by name on an
+        // asset the engine would have to rewrite.
+        do {
+            let fixture = try makeFixture("h7-special-rewrite", units: false)
+            let wrapper = fixture.binDir + "/agentmail"
+            try fm.setAttributes([.posixPermissions: 0o2755], ofItemAtPath: wrapper)
+            check("H7.8: fixture wrapper carries setgid", MigrationEngine.fileMode(wrapper) == 0o2755)
+            let before = snapshot(fixture.restoreRoots)
+            let refused = runEngine(fixture)
+            check("H7.8: an engine-rewritten asset carrying setgid is refused BEFORE anything moves, by name",
+                  refused.code == 2 && refused.output.contains("setgid") && refused.output.contains(wrapper)
+                  && refused.output.contains("nothing was changed"), refused.output)
+            check("H7.8: refusal left everything untouched, no journal",
+                  snapshotDiff(before, snapshot(fixture.restoreRoots)).isEmpty
+                  && !fm.fileExists(atPath: fixture.stateDir))
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper)
+            let ok = runEngine(fixture)
+            check("H7.8: with the bit cleared the migration proceeds", ok.code == 0, ok.output)
+            assertMigratedState(fixture, label: "H7.8")
+        }
+
+        // H3 — the raw engine runner is a development-build command.
+        do {
+            check("H3: bare release versions are not development builds",
+                  !MigrationRunCommand.isDevelopmentBuild(version: "0.2.4")
+                  && !MigrationRunCommand.isDevelopmentBuild(version: "0.2.4-rc1")
+                  && !MigrationRunCommand.isDevelopmentBuild(version: "1.0.0"))
+            check("H3: -dev versions are development builds",
+                  MigrationRunCommand.isDevelopmentBuild(version: "0.1.0-dev")
+                  && MigrationRunCommand.isDevelopmentBuild(version: "0.2.4-dev"))
+            check("H3: this test binary is a development build (the battery drives __migrate-run through it)",
+                  MigrationRunCommand.isDevelopmentBuild())
+        }
+
+        // ============================================================
         print("\n— startup gate vs a LIVE migration journal (the 0.2.0 systemd rollback) —")
         do {
             let g = tempRoot.appendingPathComponent("gate").path
@@ -2281,15 +2563,24 @@ struct MigrationSelftest: AsyncParsableCommand {
             check("gate: IdentityMigration.migrationLockPath equals the engine's lock derived from the production spec",
                   engineLock == lockPath && lockPath == gState + "/briglia-migrate.lock", lockPath)
             let journalPath = stateDir + "/journal.json"
-            func writeJournal(state: String, ready: Bool?, dropKey: Bool = false) throws {
+            func writeJournal(state: String, ready: Bool?, dropKey: Bool = false,
+                              tamper: ((inout [String: Any]) -> Void)? = nil) throws {
                 var j = MigrationEngine.freshJournal(spec: spec)
                 j.state = state
                 j.newInstallReady = ready
+                // The gate validates the journal with the engine's own loader
+                // (H7.9): a real in-flight journal records every root pair.
+                j.roots = spec.rootPairs.map {
+                    MigrationJournal.RootMove(old: $0.old, new: $0.new, existed: true, moved: true)
+                }
                 try fm.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
                 var data = try JSONEncoder().encode(j)
-                if dropKey {   // a journal written by 0.2.0 — no such key at all
+                if dropKey || tamper != nil {
                     var obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-                    obj.removeValue(forKey: "newInstallReady")
+                    if dropKey {   // a journal written by 0.2.0 — no such key at all
+                        obj.removeValue(forKey: "newInstallReady")
+                    }
+                    tamper?(&obj)
                     data = try JSONSerialization.data(withJSONObject: obj)
                 }
                 try data.write(to: URL(fileURLWithPath: journalPath))

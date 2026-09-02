@@ -145,6 +145,20 @@ enum IdentityMigration {
         return value
     }
 
+    /// The standard systemctl locations, in order; nil when neither is an
+    /// executable regular file.
+    static let systemctlCandidates = ["/usr/bin/systemctl", "/bin/systemctl"]
+
+    static func systemctlFixedPath() -> String? {
+        for path in systemctlCandidates {
+            var st = stat()
+            guard stat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG,
+                  access(path, X_OK) == 0 else { continue }
+            return path
+        }
+        return nil
+    }
+
     /// The production spec: everything the engine needs to move an old
     /// install onto this binary's identity.
     static func productionSpec(
@@ -168,8 +182,12 @@ enum IdentityMigration {
             systemctl = fake
         } else {
             #if os(Linux)
+            // Fixed locations only — the engine never resolves systemctl
+            // through PATH (a PATH entry the user or a script controls must
+            // not choose the binary that stops and starts services during
+            // the transaction). The -dev seam above is the only other way in.
             if AgentServiceSupport.systemdUserSessionAvailable(),
-               let real = PlatformBinary.find("systemctl") {
+               let real = systemctlFixedPath() {
                 systemctl = real
             }
             #endif
@@ -316,19 +334,28 @@ enum IdentityMigration {
         var state: String? = nil
         var ready = false
         if fm.fileExists(atPath: journalPath.path) {
-            if let data = try? Data(contentsOf: journalPath),
-               let parsed = try? JSONDecoder().decode(MigrationJournal.self, from: data) {
+            // The gate trusts `newInstallReady` only from a journal that
+            // passes the engine's own load validation (schema, spec
+            // equality with THIS binary's production spec, path
+            // confinement, unit names). A journal that merely decodes is
+            // not enough: an invalid one counts as unreadable and keeps
+            // the gate closed — recovery, not the daemon, gets to look at
+            // it.
+            switch MigrationEngine.loadJournal(spec: productionSpec(environment: environment)) {
+            case .success(let parsed):
                 state = parsed.state
                 ready = parsed.newInstallReady == true
-            } else {
+            case .failure:
                 state = "unreadable"
             }
         }
         // Same lock the engine holds for its whole transaction (a SIBLING
         // of the state dir; see MigrationEngine.run). Probed with LOCK_NB
-        // and released at once — never kept.
+        // and released at once — never kept. A probe that fails for any
+        // reason other than "no lock file" is NOT a live holder: the
+        // journal then reads as interrupted, which refuses.
         let lockHeld = state != nil
-            && MigrationEngine.lockHeld(migrationLockPath(environment: environment))
+            && MigrationEngine.lockProbe(migrationLockPath(environment: environment)).isHeld
         return Status(oldConfigPresent: present(roots.oldConfig),
                       oldDataPresent: present(roots.oldData),
                       newConfigPresent: present(roots.newConfig),

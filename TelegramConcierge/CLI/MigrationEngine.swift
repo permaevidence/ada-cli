@@ -285,6 +285,7 @@ final class MigrationEngine {
         // lesson).
         _ = fcntl(lockFD, F_SETFD, FD_CLOEXEC)
         defer { flock(lockFD, LOCK_UN); close(lockFD) }
+        sweepOrphanTemps(stateDir: spec.stateDir)
         let journalPath = URL(fileURLWithPath: spec.stateDir)
             .appendingPathComponent("journal.json")
         if FileManager.default.fileExists(atPath: journalPath.path) {
@@ -298,6 +299,37 @@ final class MigrationEngine {
         let engine = MigrationEngine(spec: spec, mode: mode,
                                      journal: freshJournal(spec: spec), log: log)
         return engine.fresh()
+    }
+
+    /// Staging temps of a `writeDurable` interrupted before its rename are
+    /// swept from the journal area (state dir and its immediate
+    /// subdirectories) under the transaction lock, at every engine start.
+    /// Only our own `.migrate-tmp-*` names are touched, and only regular
+    /// files — never a directory, never a symlink's target.
+    static let stagingTempPrefix = ".migrate-tmp-"
+
+    static func sweepOrphanTemps(stateDir: String) {
+        let fm = FileManager.default
+        var dirs = [stateDir]
+        if let children = try? fm.contentsOfDirectory(atPath: stateDir) {
+            for child in children {
+                let path = stateDir + "/" + child
+                var st = stat()
+                if lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR {
+                    dirs.append(path)
+                }
+            }
+        }
+        for dir in dirs {
+            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for name in entries where name.hasPrefix(stagingTempPrefix) {
+                let path = dir + "/" + name
+                var st = stat()
+                guard lstat(path, &st) == 0 else { continue }
+                let kind = st.st_mode & S_IFMT
+                if kind == S_IFREG || kind == S_IFLNK { unlink(path) }
+            }
+        }
     }
 
     private init(spec: MigrationSpec, mode: MigrationMode,
@@ -381,6 +413,20 @@ final class MigrationEngine {
         if spec.healthProbe.isEmpty {
             return "spec has no health probe command"
         }
+        // systemctl is executed by absolute path only — never resolved
+        // through PATH at run time (the production spec pins the standard
+        // locations; the -dev seam supplies an explicit path).
+        for tool in [spec.systemctl, spec.wakelockSystemctl].compactMap({ $0 }) {
+            guard tool.hasPrefix("/"), !tool.split(separator: "/").contains("..") else {
+                return "spec names a systemctl that is not an absolute path: \(tool)"
+            }
+        }
+        for name in [spec.oldUnitName, spec.newUnitName,
+                     spec.oldWakelockUnitName, spec.newWakelockUnitName].compactMap({ $0 }) {
+            guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {
+                return "spec names an invalid systemd unit: \"\(name)\""
+            }
+        }
         return nil
     }
 
@@ -409,6 +455,21 @@ final class MigrationEngine {
         let states = ["prepared", "moved", "fixups", "committing", "committed", "done"]
         guard states.contains(journal.state) else {
             return .failure(LoadFailure(message: "the migration journal has unknown state \"\(journal.state)\" — refusing to act on it"))
+        }
+        // Recorded unit captures name exactly the spec's units — the
+        // journal never gets to pick which unit rollback restarts or
+        // recovery retires.
+        if let service = journal.oldService {
+            guard let dir = spec.unitDir, let name = spec.oldUnitName,
+                  service.name == name, service.unitPath == dir + "/" + name else {
+                return .failure(LoadFailure(message: "the migration journal records a service (\(service.name) at \(service.unitPath)) that is not the spec's old unit — refusing to act on it"))
+            }
+        }
+        if let wakelock = journal.wakelockService {
+            guard let name = spec.oldWakelockUnitName, let path = spec.oldWakelockUnitPath,
+                  wakelock.name == name, wakelock.unitPath == path else {
+                return .failure(LoadFailure(message: "the migration journal records a keep-awake unit (\(wakelock.name) at \(wakelock.unitPath)) that is not the spec's — refusing to act on it"))
+            }
         }
         // Every recorded path must resolve — symlinks canonicalized through
         // the deepest existing ancestor — to a location STRICTLY INSIDE one
@@ -645,21 +706,63 @@ final class MigrationEngine {
         } catch {
             return "could not create \(dir.path): \(error.localizedDescription)"
         }
-        let tmp = dir.appendingPathComponent(".migrate-tmp-\(UUID().uuidString)")
-        do { try data.write(to: tmp) } catch {
-            return "could not write \(tmp.path): \(error.localizedDescription)"
+        // The temp is created EXCLUSIVELY (O_EXCL, 0600) and written through
+        // its own descriptor: a name planted at the temp path beforehand —
+        // a symlink pointing anywhere — makes the create fail instead of
+        // being followed.
+        let tmp = dir.appendingPathComponent(stagingTempPrefix + UUID().uuidString)
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            return "could not create \(tmp.path) exclusively: \(String(cString: strerror(errno)))"
         }
-        if let mode {
-            guard chmod(tmp.path, mode_t(mode)) == 0 else {
-                let why = String(cString: strerror(errno))
-                try? fm.removeItem(at: tmp)
-                return "could not set mode \(String(mode, radix: 8)) on \(url.path): \(why)"
+        var writeError: String? = nil
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            var offset = 0
+            while offset < raw.count, raw.baseAddress != nil {
+                let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    writeError = String(cString: strerror(errno))
+                    return
+                }
+                offset += n
             }
         }
-        if let why = fsyncPath(tmp) {
-            try? fm.removeItem(at: tmp)
-            return why
+        if let writeError {
+            close(fd)
+            unlink(tmp.path)
+            return "could not write \(tmp.path): \(writeError)"
         }
+        // Mode: the requested one, else what a plain create would have
+        // produced under the process umask (the temp starts at 0600 so the
+        // final file is never wider than the caller asked for, even
+        // transiently).
+        let finalMode: mode_t
+        if let mode {
+            finalMode = mode_t(mode)
+        } else {
+            let current = umask(0o022)
+            umask(current)
+            finalMode = 0o666 & ~current
+        }
+        guard fchmod(fd, finalMode) == 0 else {
+            let why = String(cString: strerror(errno))
+            close(fd)
+            unlink(tmp.path)
+            return "could not set mode \(String(finalMode, radix: 8)) on \(url.path): \(why)"
+        }
+        if let faultPath = fsyncFaultPath, faultPath == tmp.path {
+            close(fd)
+            unlink(tmp.path)
+            return "fsync failed for \(tmp.path): injected fault (no barrier was issued)"
+        }
+        guard fsync(fd) == 0 else {
+            let why = String(cString: strerror(errno))
+            close(fd)
+            unlink(tmp.path)
+            return "fsync failed for \(tmp.path): \(why)"
+        }
+        close(fd)
         guard rename(tmp.path, url.path) == 0 else {
             let why = String(cString: strerror(errno))
             try? fm.removeItem(at: tmp)
@@ -755,14 +858,28 @@ final class MigrationEngine {
     /// file-backed output likewise cannot be held hostage the way pipe EOF
     /// can.
     static func runBounded(_ argv: [String], timeout: Double,
-                           extraEnv: [String: String] = [:]) -> RunResult {
+                           extraEnv: [String: String] = [:],
+                           outputDir: URL? = nil) -> RunResult {
         guard let exe = argv.first, exe.hasPrefix("/") else {
             return RunResult(exitCode: 127, output: "argv[0] must be an absolute path")
         }
         let fm = FileManager.default
-        let outURL = fm.temporaryDirectory
-            .appendingPathComponent("migrate-out-\(UUID().uuidString)")
-        defer { try? fm.removeItem(at: outURL) }
+        // The output file is created EXCLUSIVELY (O_EXCL, 0600) by this
+        // process and handed to the child as fds 1/2. The engine passes
+        // its 0700 state dir; callers without one fall back to the
+        // process temp dir (still exclusive).
+        let outDir = outputDir ?? fm.temporaryDirectory
+        if let outputDir {
+            try? fm.createDirectory(at: outputDir, withIntermediateDirectories: true,
+                                    attributes: [.posixPermissions: 0o700])
+        }
+        let outURL = outDir.appendingPathComponent("migrate-out-\(UUID().uuidString)")
+        let outFD = open(outURL.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard outFD >= 0 else {
+            return RunResult(exitCode: 127, output: "could not create the output file "
+                + "\(outURL.path) exclusively: \(String(cString: strerror(errno)))")
+        }
+        defer { close(outFD); unlink(outURL.path) }
 
         var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
         cargs.append(nil)
@@ -781,9 +898,8 @@ final class MigrationEngine {
         posix_spawn_file_actions_init(&fileActions)
         defer { posix_spawn_file_actions_destroy(&fileActions) }
         posix_spawn_file_actions_addopen(&fileActions, 0, "/dev/null", O_RDONLY, 0)
-        posix_spawn_file_actions_addopen(&fileActions, 1, outURL.path,
-                                         O_WRONLY | O_CREAT | O_TRUNC, 0o600)
-        posix_spawn_file_actions_adddup2(&fileActions, 1, 2)
+        posix_spawn_file_actions_adddup2(&fileActions, outFD, 1)
+        posix_spawn_file_actions_adddup2(&fileActions, outFD, 2)
 
         // SETSIGDEF + empty SETSIGMASK: give the child clean signal state,
         // exactly as Foundation Process does when it spawns. Raw posix_spawn
@@ -827,7 +943,10 @@ final class MigrationEngine {
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        let text = (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
+        var text = ""
+        if let data = fm.contents(atPath: outURL.path) {
+            text = String(decoding: data, as: UTF8.self)
+        }
         if timedOut {
             return RunResult(exitCode: 124, output: text + "\n(timed out after \(Int(timeout))s)")
         }
@@ -840,7 +959,7 @@ final class MigrationEngine {
         guard let path = spec.systemctl else {
             return RunResult(exitCode: 0, output: "")
         }
-        return Self.runBounded([path, "--user"] + args, timeout: 60)
+        return Self.runBounded([path, "--user"] + args, timeout: 60, outputDir: stateDirURL)
     }
 
     /// System-bus systemctl for the wakelock unit (no --user).
@@ -848,7 +967,7 @@ final class MigrationEngine {
         guard let path = spec.wakelockSystemctl ?? spec.systemctl else {
             return RunResult(exitCode: 0, output: "")
         }
-        return Self.runBounded([path] + args, timeout: 60)
+        return Self.runBounded([path] + args, timeout: 60, outputDir: stateDirURL)
     }
 
     /// A service operation whose failure must surface, never be shrugged
@@ -942,17 +1061,45 @@ final class MigrationEngine {
 
     // ---------------------------------------------------------- locking
 
-    /// Is the flock at `path` held by someone else? Probes with LOCK_NB and
-    /// releases immediately when it succeeds — never keeps the lock.
-    static func lockHeld(_ path: String) -> Bool {
-        let fd = open(path, O_RDWR)
-        guard fd >= 0 else { return false }   // no lock file ⇒ not held
+    /// Result of probing a flock: definitely free, definitely held, or
+    /// the probe itself failed (anything but "no such file") — callers
+    /// must treat `unknown` as a refusal, never as free.
+    enum LockProbe: Equatable {
+        case free
+        case held
+        case unknown(errno: Int32)
+
+        var isHeld: Bool { self == .held }
+        var problem: String? {
+            if case let .unknown(code) = self {
+                return "cannot probe the lock: \(String(cString: strerror(code))) (errno \(code))"
+            }
+            return nil
+        }
+    }
+
+    /// Probe the flock at `path` with LOCK_NB and release immediately when
+    /// it succeeds — never keeps the lock. ENOENT is the one open failure
+    /// that means "not held"; every other failure is reported as unknown
+    /// with its errno.
+    static func lockProbe(_ path: String) -> LockProbe {
+        let fd = open(path, O_RDWR | O_CLOEXEC)
+        guard fd >= 0 else {
+            return errno == ENOENT ? .free : .unknown(errno: errno)
+        }
         defer { close(fd) }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 {
             flock(fd, LOCK_UN)
-            return false
+            return .free
         }
-        return true
+        return errno == EWOULDBLOCK || errno == EAGAIN ? .held : .unknown(errno: errno)
+    }
+
+    /// Strictly "definitely held". Unknown probes are NOT held here —
+    /// call sites that must fail closed on an unknown probe use
+    /// `lockProbe` directly.
+    static func lockHeld(_ path: String) -> Bool {
+        lockProbe(path).isHeld
     }
 
     // ============================================================ fresh
@@ -989,12 +1136,17 @@ final class MigrationEngine {
             guard fm.fileExists(atPath: spec.newBinary) else {
                 return .refused("the new binary \(spec.newBinary) is not installed — install it first")
             }
+            if let refusal = rewriteTargetSpecialModeProblem() {
+                return .refused(refusal)
+            }
 
             // 1. Capture (plan §4.3 step 1).
             try fm.createDirectory(at: stateDirURL, withIntermediateDirectories: true,
                                    attributes: [.posixPermissions: 0o700])
-            try fm.createDirectory(at: preimagesDir, withIntermediateDirectories: true)
-            try fm.createDirectory(at: parkedDir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: preimagesDir, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            try fm.createDirectory(at: parkedDir, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
             try capture(existingRoots: existing)
             Self.crashPoint("after-prepared")
 
@@ -1021,6 +1173,74 @@ final class MigrationEngine {
             // can do; roll back now when we are still before committing.
             return handleMidTransactionFailure("unexpected error: \(error.localizedDescription)")
         }
+    }
+
+    /// Assets the fixups REWRITE through a staged replacement (persona
+    /// secrets, the agentmail wrapper, reminder/watcher records, toolchain
+    /// wrappers and LibreOffice rc files) cannot carry setuid, setgid or
+    /// sticky bits into the replacement meaningfully — the kernel may clear
+    /// them on the staged file and rollback would then not be exact. Such
+    /// an asset is refused BEFORE anything moves, by name; everything the
+    /// engine merely renames keeps every bit untouched and is not checked.
+    /// Evaluated against the OLD roots (pre-move), with the same predicates
+    /// the fixups apply, so an asset the fixups would leave alone does not
+    /// block the migration.
+    func rewriteTargetSpecialModeProblem() -> String? {
+        var candidates: [String] = []
+        let secrets = spec.oldConfigRoot + "/secrets.json"
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: secrets)),
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           object["assistant_name"] as? String == spec.personaOldName {
+            candidates.append(secrets)
+        }
+        let agentmail = spec.wrapperBinDir + "/" + spec.agentmailName
+        if let text = try? String(contentsOfFile: agentmail, encoding: .utf8),
+           text.contains("__agentmail-key"), text.contains(spec.oldBinary) {
+            candidates.append(agentmail)
+        }
+        var records = [spec.oldDataRoot + "/reminders.json"]
+        let stateDir = spec.oldDataRoot + "/reminder-scripts/state"
+        if let entries = try? fm.contentsOfDirectory(atPath: stateDir) {
+            records += entries.sorted().filter { $0.hasSuffix(".json") }.map { stateDir + "/" + $0 }
+        }
+        var prefixes = [spec.oldDataRoot, spec.oldConfigRoot]
+        if let landing = spec.oldLandingZone { prefixes.append(landing) }
+        for path in records {
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            if prefixes.contains(where: { text.contains($0) }) { candidates.append(path) }
+        }
+        if let entries = try? fm.contentsOfDirectory(atPath: spec.wrapperBinDir) {
+            for name in entries.sorted() {
+                let path = spec.wrapperBinDir + "/" + name
+                guard path != agentmail,
+                      let text = try? String(contentsOfFile: path, encoding: .utf8),
+                      text.contains(spec.toolchainMarker), text.contains(spec.oldDataRoot) else { continue }
+                candidates.append(path)
+            }
+        }
+        let loProgram = spec.oldDataRoot + "/toolchain/prefix/usr/lib/libreoffice/program"
+        if let entries = try? fm.contentsOfDirectory(atPath: loProgram) {
+            for name in entries.sorted() where name.hasSuffix("rc") {
+                let path = loProgram + "/" + name
+                guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+                      text.contains(spec.oldDataRoot) else { continue }
+                candidates.append(path)
+            }
+        }
+        for path in candidates {
+            var st = stat()
+            guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
+            let special = Int(st.st_mode) & 0o7000
+            if special != 0 {
+                let bits = [(0o4000, "setuid"), (0o2000, "setgid"), (0o1000, "sticky")]
+                    .filter { special & $0.0 != 0 }.map { $0.1 }.joined(separator: "+")
+                return "\(path) carries the \(bits) permission bit(s) and the migration would have to "
+                    + "rewrite it (mode \(String(st.st_mode & 0o7777, radix: 8))) — a staged rewrite "
+                    + "cannot preserve those bits exactly. Clear them (chmod \(bits.contains("setuid") ? "u-s" : bits.contains("setgid") ? "g-s" : "-t") "
+                    + "\(path)) or move the file aside, then retry; nothing was changed"
+            }
+        }
+        return nil
     }
 
     func capture(existingRoots: [(old: String, new: String)]) throws {
@@ -1091,12 +1311,18 @@ final class MigrationEngine {
             log("stopped \(service.name)")
         }
         let lockPath = spec.oldDataRoot + "/instance.lock"
-        if Self.lockHeld(lockPath) {
+        switch Self.lockProbe(lockPath) {
+        case .held:
             return "an unmanaged process is still running against \(spec.oldDataRoot) "
                 + "(instance.lock is held). Quit it (a terminal chat session, or a manually "
                 + "started daemon), then retry"
+        case .unknown:
+            return "cannot tell whether a process is running against \(spec.oldDataRoot): "
+                + "\(Self.lockProbe(lockPath).problem ?? "lock probe failed") at \(lockPath) — "
+                + "refusing to proceed on a guess"
+        case .free:
+            return nil
         }
-        return nil
     }
 
     /// Restart the managed service we stopped, VERIFIED. Returns nil on
@@ -1214,6 +1440,7 @@ final class MigrationEngine {
                 gid: Int(st.st_gid), target: nil))
         }
         try persistJournal()
+        Self.crashPoint("after-preimage-record")
     }
 
     /// Record a path the migration is ABOUT to create: rollback deletes it.
@@ -1227,8 +1454,35 @@ final class MigrationEngine {
 
     /// Fixup modification: staged copy with the target mode applied to the
     /// temp file BEFORE the atomic rename — content and permissions become
-    /// visible together, durably.
+    /// visible together, durably. The target is re-`lstat`ed immediately
+    /// before the staged rename and compared with what the journal
+    /// recorded for it at capture: a recorded file must still be a regular
+    /// file, a recorded symlink a symlink (or the regular file a previous
+    /// attempt of this same write left), a recorded `absent` path absent
+    /// (or that regular file). Anything else — a directory, a device, a
+    /// planted symlink at a path we are about to create — refuses. Same-uid
+    /// check-then-act only; the window between this lstat and rename(2)
+    /// is not closed (no O_NOFOLLOW rework), and rename over a directory
+    /// fails on its own.
     func stagedWrite(_ data: Data, to path: String, mode: Int?) throws {
+        let recorded = journal.preimages.first { $0.path == path && $0.type != "absent" }
+            ?? journal.preimages.first { $0.path == path }
+        guard let recorded else {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "internal: staged write to \(path) without a recorded preimage"))
+        }
+        let now = Self.entryKind(path)
+        let allowed: Set<String?>
+        switch recorded.type {
+        case "file": allowed = ["file"]
+        case "symlink": allowed = ["symlink", "file"]
+        default: allowed = [nil, "file"]
+        }
+        guard allowed.contains(now) else {
+            throw EngineError(outcome: handleMidTransactionFailure(
+                "\(path) changed kind since it was captured (recorded \(recorded.type), "
+                + "now \(now ?? "absent")) — refusing to write over it"))
+        }
         if let why = Self.writeDurable(data, to: URL(fileURLWithPath: path), mode: mode) {
             throw EngineError(outcome: handleMidTransactionFailure(
                 "could not write \(path): \(why)"))
@@ -1557,7 +1811,8 @@ final class MigrationEngine {
         // 5b. Verify the new install actually works BEFORE retiring
         // anything: bounded health probe, plus the new instance lock when a
         // daemon was started.
-        let probe = Self.runBounded(spec.healthProbe, timeout: spec.probeTimeout)
+        let probe = Self.runBounded(spec.healthProbe, timeout: spec.probeTimeout,
+                                    outputDir: stateDirURL)
         guard probe.exitCode == 0 else {
             throw EngineError(outcome: handleMidTransactionFailure(
                 "the new install failed its health probe (exit \(probe.exitCode)): \(probe.tail)"))
@@ -1565,12 +1820,16 @@ final class MigrationEngine {
         if journal.startedNewUnit {
             let lockPath = spec.newDataRoot + "/instance.lock"
             let deadline = Date().addingTimeInterval(spec.probeTimeout)
-            var held = Self.lockHeld(lockPath)
-            while !held && Date() < deadline {
+            var probe = Self.lockProbe(lockPath)
+            while probe == .free && Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.2)
-                held = Self.lockHeld(lockPath)
+                probe = Self.lockProbe(lockPath)
             }
-            guard held else {
+            if let problem = probe.problem {
+                throw EngineError(outcome: handleMidTransactionFailure(
+                    "cannot verify that the started daemon holds \(lockPath): \(problem)"))
+            }
+            guard probe.isHeld else {
                 throw EngineError(outcome: handleMidTransactionFailure(
                     "the started daemon never acquired \(lockPath) — it is not actually running"))
             }
@@ -1620,6 +1879,18 @@ final class MigrationEngine {
                 mode: Int(st.st_mode & 0o7777), uid: Int(st.st_uid),
                 gid: Int(st.st_gid), target: target))
             try persistJournal()
+            Self.crashPoint("after-park-record")
+            Self.crashPoint("after-park-record-\(id)")
+        }
+        // Immediately before the move: the object at the original path must
+        // still be the kind the record describes (a retried park after a
+        // crash sees the record first, then the disk).
+        if let record = journal.parked.first(where: { $0.id == id }),
+           let now = Self.entryKind(originalPath), now != record.kind {
+            throw EngineError(outcome: .failed(
+                "\(originalPath) changed kind since it was recorded for parking (recorded "
+                + "\(record.kind), now \(now)) — refusing to park it; the journal at "
+                + "\(journalURL.path) is preserved for inspection"))
         }
         let dest = parkedDir.appendingPathComponent(id)
         try? fm.removeItem(at: dest)
@@ -1755,13 +2026,18 @@ final class MigrationEngine {
                 problems.append("moved root missing: \(root.new)")
             }
         }
-        let probe = Self.runBounded(spec.healthProbe, timeout: spec.probeTimeout)
+        let probe = Self.runBounded(spec.healthProbe, timeout: spec.probeTimeout,
+                                    outputDir: stateDirURL)
         if probe.exitCode != 0 {
             problems.append("health probe failed (exit \(probe.exitCode)): \(probe.tail)")
         }
-        if journal.startedNewUnit,
-           !Self.lockHeld(spec.newDataRoot + "/instance.lock") {
-            problems.append("the new daemon no longer holds the instance lock")
+        if journal.startedNewUnit {
+            let probe = Self.lockProbe(spec.newDataRoot + "/instance.lock")
+            if let problem = probe.problem {
+                problems.append("the new daemon's instance lock could not be probed: \(problem)")
+            } else if !probe.isHeld {
+                problems.append("the new daemon no longer holds the instance lock")
+            }
         }
         if journal.symlinkCreated {
             let target = try? fm.destinationOfSymbolicLink(atPath: spec.oldBinary)
@@ -1861,11 +2137,18 @@ final class MigrationEngine {
             // as a fresh run, but the journal stays (the transaction is
             // real and still needs recovering).
             if ["prepared", "moved", "fixups"].contains(journal.state),
-               fm.fileExists(atPath: spec.oldDataRoot),
-               Self.lockHeld(spec.oldDataRoot + "/instance.lock") {
-                return .refused("an unmanaged process is running against \(spec.oldDataRoot) "
-                    + "(instance.lock is held) — quit it, then re-run `\(spec.recoveryHint)`. "
-                    + "The migration journal is preserved")
+               fm.fileExists(atPath: spec.oldDataRoot) {
+                let probe = Self.lockProbe(spec.oldDataRoot + "/instance.lock")
+                if probe.isHeld {
+                    return .refused("an unmanaged process is running against \(spec.oldDataRoot) "
+                        + "(instance.lock is held) — quit it, then re-run `\(spec.recoveryHint)`. "
+                        + "The migration journal is preserved")
+                }
+                if let problem = probe.problem {
+                    return .refused("cannot tell whether a process is running against "
+                        + "\(spec.oldDataRoot): \(problem) — refusing to recover on a guess. "
+                        + "The migration journal is preserved")
+                }
             }
             switch journal.state {
             case "prepared", "moved", "fixups":
@@ -2115,6 +2398,52 @@ final class MigrationEngine {
         return nil
     }
 
+    /// Kind preflight over EVERY path a rollback will delete, overwrite or
+    /// re-link — all recorded preimage paths at their current locations
+    /// and every parked asset's original path — before the first mutation.
+    /// The engine only ever creates or rewrites regular files and
+    /// symlinks, so each target must be absent, a symlink or a regular
+    /// file; a directory (or a device, FIFO, socket) at any of them means
+    /// the record or the world is wrong, and the whole rollback holds with
+    /// zero mutations rather than restoring the entries before it and
+    /// stopping mid-way. Reads only.
+    func rollbackTargetKindProblem() -> String? {
+        func acceptable(_ path: String, label: String) -> String? {
+            var st = stat()
+            guard lstat(path, &st) == 0 else { return nil }   // absent is fine
+            switch st.st_mode & S_IFMT {
+            case S_IFREG, S_IFLNK: return nil
+            case S_IFDIR:
+                return "\(label) \(path) is a DIRECTORY where a file, a symlink or nothing was recorded"
+            default:
+                return "\(label) \(path) is neither a regular file nor a symlink"
+            }
+        }
+        for pre in journal.preimages where ["absent", "file", "symlink"].contains(pre.type) {
+            // An inconsistent root (both or neither side present) is not a
+            // kind problem: the restore loop holds on it exactly as before,
+            // after the new-identity units are stopped. Only resolvable
+            // entries are kind-checked here.
+            guard let location = currentLocation(of: pre.path) else { continue }
+            if let problem = acceptable(location, label: "recorded \(pre.type) path") {
+                return problem
+            }
+        }
+        for parked in journal.parked {
+            // A restored parked asset may legitimately be back at its
+            // original path (verified by parkedAssetProblem); anything else
+            // there must be removable: absent or a symlink (the compat
+            // link), never a directory that is not the verified asset.
+            let stored = parkedDir.appendingPathComponent(parked.id).path
+            guard Self.entryKind(stored) != nil else { continue }
+            if let now = Self.entryKind(parked.originalPath), now != "symlink" {
+                return "parked \(parked.id)'s original path \(parked.originalPath) holds a \(now) "
+                    + "while the parked copy exists"
+            }
+        }
+        return nil
+    }
+
     /// Refuse-and-hold when the rollback assets do not verify: nothing has
     /// been modified yet, and nothing will be.
     func requireVerifiedRollbackAssets(context: String) throws {
@@ -2128,6 +2457,12 @@ final class MigrationEngine {
             throw EngineError(outcome: .failed(
                 "\(context) refused BEFORE modifying anything: \(problem) — everything was held "
                 + "for inspection at \(spec.stateDir)"))
+        }
+        if let problem = rollbackTargetKindProblem() {
+            throw EngineError(outcome: .failed(
+                "\(context) refused BEFORE modifying anything: \(problem) — refusing to delete or "
+                + "overwrite it; every entry was left as it is and the journal at "
+                + "\(journalURL.path) is preserved for inspection"))
         }
     }
 
@@ -2162,6 +2497,20 @@ final class MigrationEngine {
             default:
                 location = pre.path
             }
+            // Re-lstat immediately before each destructive step: the
+            // preflight above ran over the whole set, this catches a kind
+            // change since then (same-uid check-then-act; narrow by design).
+            func requireRemovableKind(_ step: String) throws {
+                var st = stat()
+                guard lstat(location, &st) == 0 else { return }
+                let kind = st.st_mode & S_IFMT
+                guard kind == S_IFREG || kind == S_IFLNK else {
+                    throw EngineError(outcome: .failed(
+                        "rollback found \(kind == S_IFDIR ? "a DIRECTORY" : "an unexpected object") at "
+                        + "\(location) while \(step) — refusing to touch it; the journal is preserved "
+                        + "for inspection"))
+                }
+            }
             switch pre.type {
             case "absent":
                 var st = stat()
@@ -2171,11 +2520,7 @@ final class MigrationEngine {
                     // deleting a directory recursively on a corrupted
                     // record is exactly the disaster validation exists to
                     // prevent. Refuse and hold.
-                    guard (st.st_mode & S_IFMT) != S_IFDIR else {
-                        throw EngineError(outcome: .failed(
-                            "rollback found a DIRECTORY at the absent-recorded path \(location) "
-                            + "— refusing to delete it; the journal is preserved for inspection"))
-                    }
+                    try requireRemovableKind("removing a path the migration created")
                     do { try fm.removeItem(atPath: location) } catch {
                         throw EngineError(outcome: .failed(
                             "rollback could not remove the created path \(location): "
@@ -2189,6 +2534,7 @@ final class MigrationEngine {
                         "rollback could not read the preimage of \(pre.path) — everything was "
                         + "left in place at \(spec.stateDir); nothing more was restored"))
                 }
+                try requireRemovableKind("restoring a file preimage")
                 if let why = Self.writeDurable(data, to: URL(fileURLWithPath: location),
                                                mode: pre.mode) {
                     throw EngineError(outcome: .failed(
@@ -2207,6 +2553,7 @@ final class MigrationEngine {
                     }
                 }
             case "symlink":
+                try requireRemovableKind("restoring a symlink preimage")
                 try? fm.removeItem(atPath: location)
                 if let target = pre.target {
                     try fm.createSymbolicLink(atPath: location, withDestinationPath: target)
@@ -2418,6 +2765,11 @@ final class MigrationEngine {
                     restoredPaths.insert(parked.originalPath)
                 }
                 continue
+            }
+            if let now = Self.entryKind(parked.originalPath), now != "symlink" {
+                throw EngineError(outcome: .failed(
+                    "park-restoring rollback found a \(now) at \(parked.originalPath) while "
+                    + "restoring parked \(parked.id) — refusing to remove it; the journal is preserved"))
             }
             try? fm.removeItem(atPath: parked.originalPath)
             guard rename(stored.path, parked.originalPath) == 0 else {
