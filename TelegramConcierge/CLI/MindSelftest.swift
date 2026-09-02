@@ -1,5 +1,10 @@
 import ArgumentParser
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 #if canImport(CryptoKit)
 import CryptoKit
 #else
@@ -228,6 +233,114 @@ struct MindSelftest: AsyncParsableCommand {
             // the manager-bound sections construct against a clean root
             // instead of logging decode noise.
             try? FileManager.default.removeItem(at: conversationFile)
+
+            // 3b. Untrusted archives (Codex, Release B round 1): restore is
+            // policy-aware — an old backup's 0644 files land 0600, harness
+            // directories 0700, a reminder script keeps owner exec, projects/
+            // keeps its archived modes; a symlink at a harness-owned path
+            // (conversation.json, archive/) is refused at staging with the
+            // current state untouched; a symlink inside user content is
+            // restored as a link.
+            do {
+                let fm = FileManager.default
+                func lmode(_ path: String) -> Int {
+                    var st = stat()
+                    guard lstat(path, &st) == 0 else { return -1 }
+                    return Int(st.st_mode & 0o7777)
+                }
+                func isLink(_ path: String) -> Bool {
+                    var st = stat()
+                    return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK
+                }
+                func runTool(_ tool: String, _ args: [String], cwd: URL? = nil) throws -> Int32 {
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: tool)
+                    p.arguments = args
+                    p.currentDirectoryURL = cwd
+                    p.standardOutput = FileHandle.nullDevice
+                    p.standardError = FileHandle.nullDevice
+                    try p.run(); p.waitUntilExit()
+                    return p.terminationStatus
+                }
+                func makeArchive(_ name: String, _ build: (URL) throws -> Void) throws -> URL {
+                    let stage = tempRoot.appendingPathComponent("stage-\(name)", isDirectory: true)
+                    try fm.createDirectory(at: stage, withIntermediateDirectories: true)
+                    _ = try runTool(archiveTool("unzip")!, ["-q", backup.path, "-d", stage.path])
+                    try build(stage)
+                    let out = tempRoot.appendingPathComponent("\(name).mind")
+                    _ = try runTool(archiveTool("zip")!, ["-r", "-q", "-y", out.path, "."], cwd: stage)
+                    return out
+                }
+                let external = tempRoot.appendingPathComponent("external-target", isDirectory: true)
+                try fm.createDirectory(at: external, withIntermediateDirectories: true)
+                try "EXTERNAL".write(to: external.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
+
+                // (a) old backup with wide modes
+                let old = try makeArchive("old-modes") { stage in
+                    _ = chmod(stage.appendingPathComponent("conversation.json").path, 0o644)
+                    let archiveDir = stage.appendingPathComponent("archive", isDirectory: true)
+                    try fm.createDirectory(at: archiveDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+                    try "{}".write(to: archiveDir.appendingPathComponent("2026-01.json"), atomically: true, encoding: .utf8)
+                    _ = chmod(archiveDir.appendingPathComponent("2026-01.json").path, 0o644)
+                    _ = chmod(stage.appendingPathComponent("documents/doc.txt").path, 0o644)
+                    _ = chmod(stage.appendingPathComponent("reminder-scripts/\(watcherId.uuidString).sh").path, 0o755)
+                    let proj = stage.appendingPathComponent("projects/p", isDirectory: true)
+                    try fm.createDirectory(at: proj, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+                    try "#!/bin/sh\n".write(to: proj.appendingPathComponent("build.sh"), atomically: true, encoding: .utf8)
+                    _ = chmod(proj.appendingPathComponent("build.sh").path, 0o755)
+                    let link = stage.appendingPathComponent("documents/linked.txt")
+                    symlink(external.appendingPathComponent("secret.txt").path, link.path)
+                }
+                let stagedOld = try await MindExportService.shared.stageMind(from: old)
+                try await MindExportService.shared.applyStagedMind(stagedOld)
+                check("3b.1 old backup: conversation.json restored 0600 (was 0644 in the archive)",
+                      lmode(conversationFile.path) == 0o600, String(lmode(conversationFile.path), radix: 8))
+                let archiveDirDest = dataRoot.appendingPathComponent("archive")
+                check("3b.2 old backup: archive/ 0700 and its file 0600",
+                      lmode(archiveDirDest.path) == 0o700 && lmode(archiveDirDest.appendingPathComponent("2026-01.json").path) == 0o600,
+                      "\(String(lmode(archiveDirDest.path), radix: 8)) \(String(lmode(archiveDirDest.appendingPathComponent("2026-01.json").path), radix: 8))")
+                check("3b.3 old backup: reminder script 0700 (owner exec kept, group/other dropped)",
+                      lmode(scriptFile.path) == 0o700, String(lmode(scriptFile.path), radix: 8))
+                let projFile = dataRoot.appendingPathComponent("projects/p/build.sh")
+                check("3b.4 old backup: projects/ file keeps its archived 0755",
+                      lmode(projFile.path) == 0o755, String(lmode(projFile.path), radix: 8))
+                let docLink = documentsDir.appendingPathComponent("linked.txt")
+                check("3b.5 old backup: a symlink inside documents/ is restored as a link",
+                      isLink(docLink.path) && lmode(external.appendingPathComponent("secret.txt").path) == 0o644)
+                try? fm.removeItem(at: conversationFile)
+
+                // (b) symlinked conversation.json → refused, current state untouched
+                try "CURRENT".write(to: conversationFile, atomically: true, encoding: .utf8)
+                let hostileConv = try makeArchive("hostile-conv") { stage in
+                    let conv = stage.appendingPathComponent("conversation.json")
+                    try fm.removeItem(at: conv)
+                    symlink(external.appendingPathComponent("secret.txt").path, conv.path)
+                }
+                var refusedConv = false
+                var refusalText = ""
+                do { _ = try await MindExportService.shared.stageMind(from: hostileConv) }
+                catch let error as MindExportError {
+                    if case .unsafeArchive(let what) = error { refusedConv = true; refusalText = what }
+                }
+                check("3b.6 archive with a symlinked conversation.json is refused at staging",
+                      refusedConv && refusalText.contains("conversation.json"), refusalText)
+                check("3b.7 current conversation untouched by the refused import",
+                      (try? String(contentsOf: conversationFile, encoding: .utf8)) == "CURRENT" && !isLink(conversationFile.path))
+
+                // (c) symlinked archive/ directory → refused
+                let hostileDir = try makeArchive("hostile-archive-dir") { stage in
+                    let archiveDir = stage.appendingPathComponent("archive")
+                    try? fm.removeItem(at: archiveDir)
+                    symlink(external.path, archiveDir.path)
+                }
+                var refusedDir = false
+                do { _ = try await MindExportService.shared.stageMind(from: hostileDir) }
+                catch let error as MindExportError { if case .unsafeArchive = error { refusedDir = true } }
+                check("3b.8 archive with a symlinked archive/ directory is refused at staging", refusedDir)
+                check("3b.9 no staged temp directory left behind by the refusals",
+                      ((try? fm.contentsOfDirectory(atPath: tempRoot.path)) ?? []).filter { UUID(uuidString: $0) != nil }.isEmpty)
+                try? fm.removeItem(at: conversationFile)
+            }
 
             // 3a-bis. A failed export must never destroy an existing backup
             // (Codex, 2026-08-27): the destination is untouched until a

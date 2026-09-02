@@ -159,10 +159,16 @@ final class WhatsAppChannelService: ObservableObject {
         }
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: nodePath)
-        proc.arguments = [bridgeDirectory.appendingPathComponent("index.js").path]
+        // Through the setsid trampoline with umask 077: the bridge writes
+        // auth/media/session files under the data root and must create
+        // them owner-only (the startup sweep only runs at start).
+        let launch = BashTools.detachedInvocation(
+            executable: nodePath, arguments: [bridgeDirectory.appendingPathComponent("index.js").path])
+        proc.executableURL = URL(fileURLWithPath: launch.executable)
+        proc.arguments = launch.arguments
         proc.currentDirectoryURL = bridgeDirectory
         var env = ProcessInfo.processInfo.environment
+        env["BRIGLIA_CHILD_UMASK"] = "077"
         env["WA_AUTH_DIR"] = authDirectory.path
         env["WA_MEDIA_DIR"] = mediaDirectory.path
         env["WA_OWNER_PHONE"] = ownerPhone
@@ -316,17 +322,22 @@ final class WhatsAppChannelService: ObservableObject {
             packageChanged = true
         }
 
-        for file in ["index.js", "package.json"] {
-            let src = bundled.appendingPathComponent(file)
-            let dst = bridgeDirectory.appendingPathComponent(file)
-            if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
-            try fm.copyItem(at: src, to: dst)
-        }
+        try Self.installBundledFiles(from: bundled, into: bridgeDirectory)
 
         let nodeModules = bridgeDirectory.appendingPathComponent("node_modules")
         if packageChanged || !fm.fileExists(atPath: nodeModules.path) {
             state = .installing
             try await runNpmInstall(nodePath: nodePath)
+        }
+    }
+
+    /// Copy the bridge's bundled sources into the deployed directory as
+    /// owner-only regular files (the bundle's copies are 0644 and a plain
+    /// copyItem would carry that mode into the data root).
+    nonisolated static func installBundledFiles(from bundled: URL, into directory: URL) throws {
+        for file in ["index.js", "package.json"] {
+            let data = try Data(contentsOf: bundled.appendingPathComponent(file))
+            try PrivateStorage.writeAtomically(data, to: directory.appendingPathComponent(file))
         }
     }
 
@@ -339,10 +350,17 @@ final class WhatsAppChannelService: ObservableObject {
         }
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: npmPath)
-        proc.arguments = ["install", "--omit=dev", "--no-audit", "--no-fund"]
+        // umask 077 via the trampoline: node_modules/ lands under the data
+        // root and stays in the sweep's scope (owner-only like everything
+        // else there; npm's own 0755 on .bin scripts becomes 0700 — owner
+        // exec is all the bridge needs).
+        let launch = BashTools.detachedInvocation(
+            executable: npmPath, arguments: ["install", "--omit=dev", "--no-audit", "--no-fund"])
+        proc.executableURL = URL(fileURLWithPath: launch.executable)
+        proc.arguments = launch.arguments
         proc.currentDirectoryURL = bridgeDirectory
         var env = ProcessInfo.processInfo.environment
+        env["BRIGLIA_CHILD_UMASK"] = "077"
         let nodeDir = URL(fileURLWithPath: nodePath).deletingLastPathComponent().path
         env["PATH"] = "\(nodeDir):" + (env["PATH"] ?? "/usr/bin:/bin")
         proc.environment = env

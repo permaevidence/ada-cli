@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Repository scan for the private-by-default storage invariant.
 
-Every file-creating call in `TelegramConcierge/**` must either go through
-`PrivateStorage` or be listed — with a reason — in
-`scripts/private-storage-allowlist.txt`. The allowlist keys on the file path
+Every file-creating call in `TelegramConcierge/**` — writes, directory
+creation, copies/moves/renames/links (they carry the SOURCE's mode), and
+child-process launches (a child creates files under its own umask) — must
+either go through `PrivateStorage` or be listed — with a reason — in
+`scripts/private-storage-allowlist.txt`. For a child process the reason
+states where it writes and which umask it gets. The allowlist keys on the file path
 plus the trimmed source line, so it survives line moves but not edits to the
 call itself (an edited call is a new call and gets reviewed again).
 
@@ -25,7 +28,9 @@ ALLOWLIST = os.path.join(ROOT, "scripts", "private-storage-allowlist.txt")
 PATTERN = re.compile(
     r"\.write\(to:|\.write\(toFile:|createFile\(|createDirectory\(|"
     r"FileHandle\(forWritingTo|FileHandle\(forUpdating|"
-    r"\bfopen\(|O_CREAT\b|\bmkdir\(|\bmkdirat\(|\bopenat\("
+    r"\bfopen\(|O_CREAT\b|\bmkdir\(|\bmkdirat\(|\bopenat\(|"
+    r"\bcopyItem\(|\bmoveItem\(|\breplaceItemAt\(|\brename\(|\blinkItem\(|\bcreateSymbolicLink\(|"
+    r"\bsymlink\(|\bProcess\(\)|\bposix_spawn\("
 )
 SKIP_FILE = re.compile(r"Selftest|PrivateStorage\.swift$|selftest", re.IGNORECASE)
 UNREVIEWED = "unreviewed"

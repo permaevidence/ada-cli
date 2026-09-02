@@ -306,6 +306,80 @@ struct StorageSelftest: AsyncParsableCommand {
         let out2 = String(data: pipe2.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         check("5.16 swept skill helper executes directly (exec bit kept)", run2.terminationStatus == 0 && out2 == "ok\n", out2)
 
+        // MARK: 7. Symlinked roots, child umask, bundled copies
+        print("\n[7] symlinked roots, child umask, bundled copies")
+        // A root that is a symlink to a directory elsewhere (data moved to
+        // another disk): ensureDirectory tightens the TARGET and the sweep
+        // walks the target tree.
+        let realData = tempRoot.appendingPathComponent("moved/briglia")
+        try fm.createDirectory(at: realData, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        try plant(realData.appendingPathComponent("conversation.json").path, "[]", 0o644)
+        let linkRoot = tempRoot.appendingPathComponent("linkroot/briglia")
+        try fm.createDirectory(at: linkRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
+        symlink(realData.path, linkRoot.path)
+        let dryLinked = PrivateStorage.sweep(configRoot: configRoot, dataRoot: linkRoot, apply: false)
+        check("7.1 doctor view sees the wide entries behind a symlinked root",
+              dryLinked.tightened >= 2 && dryLinked.errors.isEmpty, "tightened=\(dryLinked.tightened) errors=\(dryLinked.errors)")
+        try PrivateStorage.ensureDirectory(linkRoot)
+        check("7.2 ensureDirectory on a symlinked root tightens the target directory",
+              mode(realData.path) == 0o700 && isLink(linkRoot.path), octal(mode(realData.path)))
+        let sweptLinked = PrivateStorage.sweep(configRoot: configRoot, dataRoot: linkRoot)
+        check("7.3 sweep through a symlinked root tightens the target tree",
+              mode(realData.appendingPathComponent("conversation.json").path) == 0o600 && sweptLinked.errors.isEmpty,
+              octal(mode(realData.appendingPathComponent("conversation.json").path)))
+        check("7.4 the root link itself is untouched (still a link)", isLink(linkRoot.path))
+        let brokenRoot = tempRoot.appendingPathComponent("linkroot/broken")
+        symlink(tempRoot.appendingPathComponent("nowhere").path, brokenRoot.path)
+        let brokenSweep = PrivateStorage.sweep(configRoot: configRoot, dataRoot: brokenRoot, apply: false)
+        check("7.5 a root symlink that resolves to nothing is reported, not silently skipped",
+              !brokenSweep.errors.isEmpty, "\(brokenSweep.errors)")
+
+        // Child umask through the setsid trampoline (WhatsApp bridge / npm).
+        if let ada = BashTools.selfExecutablePath {
+            let umaskDir = dataRoot.appendingPathComponent("umask-probe")
+            try PrivateStorage.ensureDirectory(umaskDir)
+            let probeFile = umaskDir.appendingPathComponent("child.txt").path
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: ada)
+            child.arguments = ["__setsid-exec", "--", "/bin/sh", "-c", "umask > \"\(probeFile)\"; env | grep -c BRIGLIA_CHILD_UMASK >> \"\(probeFile)\" || true"]
+            var env = ProcessInfo.processInfo.environment
+            env["BRIGLIA_CHILD_UMASK"] = "077"
+            child.environment = env
+            child.standardOutput = FileHandle.nullDevice
+            child.standardError = FileHandle.nullDevice
+            try child.run()
+            child.waitUntilExit()
+            let probe = contents(probeFile).split(separator: "\n").map(String.init)
+            check("7.6 trampoline applies BRIGLIA_CHILD_UMASK=077 (child umask 077, file created 0600)",
+                  probe.first == "0077" && mode(probeFile) == 0o600, "\(probe) mode=\(octal(mode(probeFile)))")
+            check("7.7 the umask variable is consumed, not passed on to the child",
+                  probe.count >= 2 && probe[1] == "0", "\(probe)")
+            let plainFile = umaskDir.appendingPathComponent("plain.txt").path
+            let plain = Process()
+            plain.executableURL = URL(fileURLWithPath: ada)
+            plain.arguments = ["__setsid-exec", "--", "/bin/sh", "-c", "umask 022; : > \"\(plainFile)\""]
+            plain.standardOutput = FileHandle.nullDevice
+            plain.standardError = FileHandle.nullDevice
+            try plain.run()
+            plain.waitUntilExit()
+            check("7.8 without the variable the trampoline leaves the umask alone (control: 0644)",
+                  mode(plainFile) == 0o644, octal(mode(plainFile)))
+        } else {
+            check("7.6 trampoline umask (skipped: executable path unresolved)", true)
+        }
+
+        // WhatsApp bundled sources land owner-only.
+        let bundledSrc = tempRoot.appendingPathComponent("bundled")
+        try plant(bundledSrc.appendingPathComponent("index.js").path, "console.log(1)", 0o644)
+        try plant(bundledSrc.appendingPathComponent("package.json").path, "{}", 0o644)
+        let bridgeDir = dataRoot.appendingPathComponent("whatsapp-bridge")
+        try PrivateStorage.ensureDirectory(bridgeDir)
+        try WhatsAppChannelService.installBundledFiles(from: bundledSrc, into: bridgeDir)
+        check("7.9 WhatsApp bundled index.js / package.json copied 0600 (source was 0644)",
+              mode(bridgeDir.appendingPathComponent("index.js").path) == 0o600
+              && mode(bridgeDir.appendingPathComponent("package.json").path) == 0o600
+              && contents(bridgeDir.appendingPathComponent("index.js").path) == "console.log(1)")
+
         // MARK: 6. Writer-level checks (routing work adds them here)
         print("\n[6] state writers")
         await StorageWritersSelftest.run(tempRoot: tempRoot, check: check)

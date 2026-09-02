@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 // MARK: - Mind Export Service
 
@@ -186,6 +191,13 @@ actor MindExportService {
             } catch {
                 throw MindExportError.notAMindBackup
             }
+            // The archive is untrusted input: a symlink (or a socket, FIFO,
+            // device) at a harness-owned destination — conversation.json,
+            // archive/, subagent_sessions/ … — would redirect the harness's
+            // own state. Refused here, before anything current is touched.
+            if let offender = try Self.unsafeStagedEntry(in: tempDir, restoredInto: appFolder) {
+                throw MindExportError.unsafeArchive(offender)
+            }
             return StagedMind(tempDir: tempDir, config: config)
         } catch {
             try? fm.removeItem(at: tempDir)
@@ -243,7 +255,62 @@ actor MindExportService {
         // 5. Apply the config decoded during validation (persona + file descriptions).
         try restoreMindConfig(config)
 
+        // 6. Everything restored in scope is owner-only, checked.
+        try validateRestoredPermissions()
+
         print("[MindExportService] Applied staged mind from: \(tempDir.path)")
+    }
+
+    // MARK: - Staged-tree validation and policy-aware restore
+
+    /// Payload the restore touches, as it appears in the archive root.
+    static let restoredFileNames = [
+        "conversation.json", "context_usage.json", "contacts.json", "reminders.json",
+        "calendar.json", "files_ledger.json", "documents_last_opened.json", "todos.json",
+    ]
+    static let restoredFolderNames = [
+        "archive", "images", "documents", "tool_attachments", "projects", "reminder-scripts",
+        "subagent_sessions",
+    ]
+
+    /// First entry of the staged payload that must not be restored: a
+    /// symlink whose destination classifies as harness-owned state, or any
+    /// object that is neither a regular file, a directory nor a symlink.
+    /// Symlinks inside user content (documents/, skills-like areas,
+    /// projects/) are allowed and recreated as links.
+    static func unsafeStagedEntry(in tempDir: URL, restoredInto dataRoot: URL) throws -> String? {
+        let fm = FileManager.default
+        func visit(_ source: URL, _ destination: URL, depth: Int) throws -> String? {
+            guard depth < 64 else { return "\(source.path): tree too deep" }
+            var st = stat()
+            guard lstat(source.path, &st) == 0 else { return nil }
+            let fmt = st.st_mode & S_IFMT
+            switch fmt {
+            case S_IFREG:
+                return nil
+            case S_IFLNK:
+                if PrivateStorage.classify(destination.path, configRoot: StoragePaths.configRoot, dataRoot: dataRoot) == .harnessState {
+                    return "symlink at harness-owned path \(destination.lastPathComponent)"
+                }
+                return nil
+            case S_IFDIR:
+                for name in (try fm.contentsOfDirectory(atPath: source.path)).sorted() {
+                    if let bad = try visit(source.appendingPathComponent(name),
+                                           destination.appendingPathComponent(name), depth: depth + 1) {
+                        return bad
+                    }
+                }
+                return nil
+            default:
+                return "\(destination.lastPathComponent) is not a regular file, directory or symlink"
+            }
+        }
+        for name in restoredFileNames + restoredFolderNames {
+            let source = tempDir.appendingPathComponent(name)
+            guard fm.fileExists(atPath: source.path) || (try? fm.attributesOfItem(atPath: source.path)) != nil else { continue }
+            if let bad = try visit(source, dataRoot.appendingPathComponent(name), depth: 0) { return bad }
+        }
+        return nil
     }
 
     // MARK: - File Copy Helpers
@@ -259,7 +326,8 @@ actor MindExportService {
         try? FileManager.default.removeItem(at: destination)
         guard FileManager.default.fileExists(atPath: source.path) else { return }
         try PrivateStorage.ensureDirectory(destinationDir)
-        try FileManager.default.copyItem(at: source, to: destination)
+        // Policy-aware: an older backup carries 0644 files; they land 0600.
+        try PrivateStorage.copyTree(from: source, to: destination)
     }
 
     private func restoreDirectory(named folderName: String, from tempDir: URL, to destinationDir: URL) throws {
@@ -268,9 +336,34 @@ actor MindExportService {
         try? FileManager.default.removeItem(at: destination)
         try PrivateStorage.ensureDirectory(destinationDir)
         if FileManager.default.fileExists(atPath: source.path) {
-            try FileManager.default.copyItem(at: source, to: destination)
+            if folderName == "projects" {
+                // The user's work product is outside the policy: restored
+                // as archived, modes included.
+                try FileManager.default.copyItem(at: source, to: destination)
+            } else {
+                try PrivateStorage.copyTree(from: source, to: destination)
+            }
         } else {
             try PrivateStorage.ensureDirectoryScoped(destination)
+        }
+    }
+
+    /// Post-restore check: nothing restored in scope may carry group/other
+    /// bits. A miss is repaired by the sweep and re-checked; a second miss
+    /// is an error (the data is in place, but the promise is not met).
+    private func validateRestoredPermissions() throws {
+        func wide() -> [String] {
+            var out: [String] = []
+            for name in Self.restoredFileNames + Self.restoredFolderNames where name != "projects" {
+                out += PrivateStorage.wideEntries(under: appFolder.appendingPathComponent(name))
+            }
+            return out
+        }
+        if wide().isEmpty { return }
+        PrivateStorage.sweep()
+        let remaining = wide()
+        if !remaining.isEmpty {
+            throw MindExportError.permissionsNotApplied(remaining.prefix(5).joined(separator: ", "))
         }
     }
     
@@ -427,6 +520,8 @@ enum MindExportError: LocalizedError {
     case unzipFailed(String)
     case notAMindBackup
     case toolMissing(String)
+    case unsafeArchive(String)
+    case permissionsNotApplied(String)
 
     var errorDescription: String? {
         switch self {
@@ -436,6 +531,10 @@ enum MindExportError: LocalizedError {
             return "Failed to extract archive: \(message)"
         case .notAMindBackup:
             return "The selected file is not an Briglia memory backup (mind_config.json missing). No data was changed."
+        case .unsafeArchive(let what):
+            return "The backup contains an entry that must not be restored (\(what)). No data was changed."
+        case .permissionsNotApplied(let what):
+            return "The backup was restored but some entries could not be made owner-only: \(what)"
         case .toolMissing(let name):
             return "`\(name)` is not installed on this machine — install it (Linux: `sudo apt install zip unzip`) and retry. No data was changed."
         }

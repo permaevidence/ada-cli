@@ -279,15 +279,23 @@ enum PrivateStorage {
             unlink(tmp.path)
             throw StorageError(description: "could not move \(tmp.lastPathComponent) into place at \(target): \(why)")
         }
-        fsyncDirectory(dir.path)
+        try fsyncDirectory(dir.path)
     }
 
-    /// Best-effort directory barrier (durability of the rename's entry).
-    static func fsyncDirectory(_ path: String) {
+    /// Directory barrier: durability of the rename's entry. Part of the
+    /// write's contract, so a failure is reported (the file is in place,
+    /// but the caller was promised a durable entry and did not get one).
+    static func fsyncDirectory(_ path: String) throws {
         let fd = open(path, O_RDONLY | O_CLOEXEC)
-        guard fd >= 0 else { return }
-        fsync(fd)
+        guard fd >= 0 else {
+            throw StorageError(description: "could not open \(path) for fsync: \(String(cString: strerror(errno)))")
+        }
+        let rc = fsync(fd)
+        let code = errno
         close(fd)
+        guard rc == 0 else {
+            throw StorageError(description: "fsync of \(path) failed: \(String(cString: strerror(code)))")
+        }
     }
 
     // MARK: - Directories and handle-based files
@@ -324,9 +332,22 @@ enum PrivateStorage {
         for dir in missing {
             _ = chmod(dir, mode)
         }
-        let (leafKind, leafMode) = lstatKind(path)
+        // Tighten a wider leaf. A leaf that is a symlink to a directory (a
+        // root moved to another disk and linked back) is tightened at its
+        // TARGET: the sweep, the roots and every child live there.
+        var leafPath = path
+        var (leafKind, leafMode) = lstatKind(path)
+        if leafKind == .symlink {
+            let resolved = try resolveChain(path)
+            let target = lstatKind(resolved)
+            guard target.kind == .directory else {
+                throw StorageError(description: "\(path) is a symlink that does not resolve to a directory (\(resolved))")
+            }
+            leafPath = resolved
+            (leafKind, leafMode) = target
+        }
         if leafKind == .directory, leafMode & groupOtherBits != 0 {
-            _ = chmod(path, leafMode & ~groupOtherBits)
+            _ = chmod(leafPath, leafMode & ~groupOtherBits)
         }
     }
 
@@ -373,8 +394,24 @@ enum PrivateStorage {
                       budget: Int = 250_000) -> SweepReport {
         var report = SweepReport()
         for root in [configRoot, dataRoot] {
-            let rootPath = root.standardizedFileURL.path
-            let (kind, mode) = lstatKind(rootPath)
+            var rootPath = root.standardizedFileURL.path
+            var (kind, mode) = lstatKind(rootPath)
+            if kind == .symlink {
+                // A root that is itself a symlink (data moved to another
+                // disk) is swept at its target; the link is not a
+                // directory to lstat, so without this the whole tree was
+                // skipped (Codex, Release B round 1).
+                guard let resolved = try? resolveChain(rootPath) else {
+                    report.errors.append("\(rootPath): symlink cannot be resolved")
+                    continue
+                }
+                rootPath = resolved
+                (kind, mode) = lstatKind(rootPath)
+                if kind != .directory {
+                    report.errors.append("\(root.path): symlink resolves to a non-directory (\(resolved))")
+                    continue
+                }
+            }
             guard kind == .directory else { continue }
             report.scanned += 1
             if mode & groupOtherBits != 0 {

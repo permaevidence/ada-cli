@@ -87,17 +87,18 @@ enum StorageWritersSelftest {
             check("6.3 reminder-scripts/ and state/ are 0700",
                   mode(scriptsDir.path) == 0o700 && mode(stateDir.path) == 0o700,
                   "\(octal(mode(scriptsDir.path))) \(octal(mode(stateDir.path)))")
-            // The script created its state file under the process umask
-            // (0644): exactly the residue the startup sweep exists for.
-            check("6.4 state file exists (created by the script under the umask)",
-                  mode(state) == 0o644, octal(mode(state)))
+            // The watcher command runs under `umask 077`, so the state file
+            // the script creates is owner-only from the start (no wait for
+            // the next startup sweep).
+            check("6.4 state file created by the script is 0600 (watcher umask 077)",
+                  mode(state) == 0o600, octal(mode(state)))
             let remindersFile = dataRoot.appendingPathComponent("reminders.json").path
             let noticesFile = dataRoot.appendingPathComponent("reminder-notices.json").path
             check("6.5 reminders.json written 0600", mode(remindersFile) == 0o600, octal(mode(remindersFile)))
             check("6.6 reminder-notices.json written 0600", mode(noticesFile) == 0o600, octal(mode(noticesFile)))
 
             let sweep = PrivateStorage.sweep()
-            check("6.7 sweep tightens the script's state file 0644 → 0600",
+            check("6.7 sweep finds nothing to tighten for the watcher's files",
                   mode(state) == 0o600 && sweep.errors.isEmpty, "\(octal(mode(state))) errors=\(sweep.errors)")
             check("6.8 script still 0700 after the sweep", mode(script) == 0o700, octal(mode(script)))
             let before = contents(state)

@@ -104,6 +104,16 @@ struct SetsidExec: ParsableCommand {
         var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
         cargs.append(nil)
 
+        // Optional file-creation mask for the target (and everything it
+        // spawns): children that write under Briglia's storage roots — the
+        // WhatsApp bridge and its npm install — run with 077 so their files
+        // are owner-only from creation. The variable is consumed here and
+        // not passed on. Malformed values are ignored (umask unchanged).
+        if let raw = ProcessInfo.processInfo.environment["BRIGLIA_CHILD_UMASK"] {
+            if let value = mode_t(raw, radix: 8), value <= 0o777 { umask(value) }
+            unsetenv("BRIGLIA_CHILD_UMASK")
+        }
+
         // Start a new session, dropping the controlling terminal. The happy
         // path execs in place, so the PID the parent tracks IS the target.
         if setsid() != -1 {
@@ -140,7 +150,9 @@ struct SetsidExec: ParsableCommand {
         posix_spawnattr_setsigmask(&attr, &emptyMask)
         posix_spawnattr_setflags(
             &attr, setsidFlag | Int16(POSIX_SPAWN_SETSIGDEF) | Int16(POSIX_SPAWN_SETSIGMASK))
-        let envStrings = ProcessInfo.processInfo.environment.map { "\($0.key)=\($0.value)" }
+        let envStrings = ProcessInfo.processInfo.environment
+            .filter { $0.key != "BRIGLIA_CHILD_UMASK" }
+            .map { "\($0.key)=\($0.value)" }
         var cenv: [UnsafeMutablePointer<CChar>?] = envStrings.map { strdup($0) }
         cenv.append(nil)
         var pid: pid_t = 0

@@ -838,7 +838,10 @@ actor ReminderService {
             "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }
         let statePath = stateFileURL(forReminderId: reminderId).path
-        let command = "WATCHER_STATE=\(shellQuote(statePath)) \(PlatformShell.path) \(shellQuote(scriptPath))"
+        // umask 077: whatever the script creates under the data root (its
+        // state file, scratch files) is owner-only from the start instead
+        // of waiting for the next startup sweep.
+        let command = "umask 077; WATCHER_STATE=\(shellQuote(statePath)) \(PlatformShell.path) \(shellQuote(scriptPath))"
         let result = await BashTools.runAttached(command: command, killAfterSeconds: Self.scriptTimeoutSeconds)
 
         func tail(_ text: String) -> String {

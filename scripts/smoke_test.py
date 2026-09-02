@@ -165,6 +165,22 @@ def main():
         check("doctor: prints all sections", sections_ok, result.stdout[-500:])
         check("doctor: unconfigured exits 1", result.returncode == 1,
               f"rc={result.returncode}")
+        # A data root that is a symlink to a directory elsewhere: doctor
+        # must report the wide entries behind the link, not "healthy".
+        moved = os.path.join(home, "moved-data", "briglia")
+        os.makedirs(moved, exist_ok=True)
+        os.chmod(moved, 0o755)
+        with open(os.path.join(moved, "conversation.json"), "w") as f:
+            f.write("[]")
+        os.chmod(os.path.join(moved, "conversation.json"), 0o644)
+        link_root = os.path.join(home, ".local", "share", "briglia")
+        os.makedirs(os.path.dirname(link_root), exist_ok=True)
+        os.symlink(moved, link_root)
+        result = subprocess.run([ADA, "doctor"], capture_output=True, text=True,
+                                timeout=180, env=env)
+        check("doctor: reports wide entries behind a symlinked data root",
+              "with group/other bits" in result.stdout and "conversation.json" in result.stdout,
+              result.stdout[-800:])
 
     # 3. media pipeline
     result = subprocess.run([ADA, "media-selftest"], capture_output=True, text=True, timeout=300)
@@ -1266,6 +1282,14 @@ def main():
         # skill helper must still execute.
         data_root = os.path.join(home, ".local", "share", "briglia")
         config_root = os.path.join(home, ".config", "briglia")
+        # The data root is a SYMLINK to a directory elsewhere for the whole
+        # poller run (data moved to another disk): every phase runs through
+        # it, and the first start must tighten the target tree.
+        moved_data = os.path.join(home, "moved-data", "briglia")
+        os.makedirs(moved_data, exist_ok=True)
+        os.makedirs(os.path.dirname(data_root), exist_ok=True)
+        if not os.path.lexists(data_root):
+            os.symlink(moved_data, data_root)
         planted_file = os.path.join(data_root, "smoke_wide.json")
         planted_dir = os.path.join(data_root, "subagent_sessions")
         planted_helper = os.path.join(config_root, "skills", "smoke", "helper.sh")
@@ -1288,6 +1312,9 @@ def main():
         def mode_of(path):
             return stat.S_IMODE(os.lstat(path).st_mode)
 
+        def dir_mode(path):
+            return stat.S_IMODE(os.stat(path).st_mode)   # follows a root symlink
+
         tg_mark("phase1-start")
         out1, rc1 = run_poller_phase({}, phase1)
         helper_run = subprocess.run([planted_helper], capture_output=True, text=True)
@@ -1295,12 +1322,13 @@ def main():
               "projects/ untouched, swept helper still runs",
               mode_of(planted_file) == 0o600 and mode_of(planted_dir) == 0o700
               and mode_of(planted_helper) == 0o700 and mode_of(planted_project) == 0o644
-              and mode_of(data_root) == 0o700 and mode_of(config_root) == 0o700
+              and dir_mode(data_root) == 0o700 and dir_mode(config_root) == 0o700
+              and os.path.islink(data_root) and dir_mode(moved_data) == 0o700
               and helper_run.stdout.strip() == "helper-ok"
               and ("tightened to owner-only" in out1),
               f"file={oct(mode_of(planted_file))} dir={oct(mode_of(planted_dir))} "
               f"helper={oct(mode_of(planted_helper))} project={oct(mode_of(planted_project))} "
-              f"data={oct(mode_of(data_root))} config={oct(mode_of(config_root))} "
+              f"data={oct(dir_mode(data_root))} config={oct(dir_mode(config_root))} link={os.path.islink(data_root)} "
               f"helper_out={helper_run.stdout!r}\n" + out1[-1500:])
         # Other-uid isolation (Linux CI runs as root in the container): with
         # the scratch home made traversable, another uid must still be unable
@@ -2005,8 +2033,8 @@ def main():
         for root in (data_root, config_root):
             if not os.path.isdir(root):
                 continue
-            if mode_of(root) & 0o077:
-                wide_entries.append(f"{root} {oct(mode_of(root))}")
+            if dir_mode(root) & 0o077:
+                wide_entries.append(f"{root} {oct(dir_mode(root))}")
             for dirpath, dirnames, filenames in os.walk(root):
                 if dirpath == root:
                     dirnames[:] = [d for d in dirnames if d not in ("projects", "toolchain")]
