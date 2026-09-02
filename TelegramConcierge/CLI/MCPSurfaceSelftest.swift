@@ -294,6 +294,28 @@ struct MCPSurfaceSelftest: AsyncParsableCommand {
         }
         check("3.5 direct dispatch by alias reaches the unmodified original tool name", dispatchOK, dispatchDetail)
 
+        // 3.5b Textual MCP results are a second tool-output entry path: the
+        //      redaction set (Telegram bot token) is scrubbed at ToolExecutor's
+        //      MCP result boundary. The fake server echoes its arguments back,
+        //      so passing the stored token as an argument makes the server
+        //      "return" it. Store is the isolated XDG root set above.
+        do {
+            let token = "5551234567:AAGoldenTokenValue_0123456789abcdef"
+            try KeychainHelper.save(key: KeychainHelper.telegramBotTokenKey, value: token)
+            defer { try? KeychainHelper.delete(key: KeychainHelper.telegramBotTokenKey) }
+            let alias = MCPNaming.toolAlias(handle: "std", toolName: "a_b")
+            let call = ToolCall(id: "redact-1", type: "function",
+                                function: FunctionCall(name: alias, arguments: "{\"q\":\"\(token)\"}"))
+            let executor = ToolExecutor()
+            let message = try await executor.execute(call)
+            check("3.5b MCP result text through ToolExecutor has the bot token redacted",
+                  message.content.contains("[REDACTED:\(KeychainHelper.telegramBotTokenKey)]")
+                  && !message.content.contains(token) && message.content.contains("received"),
+                  String(message.content.prefix(300)))
+        } catch {
+            check("3.5b MCP result text through ToolExecutor has the bot token redacted", false, "\(error)")
+        }
+
         // Isolation (c2): each server's `list` dispatches to itself; wildcard scoping is exact.
         let abList = MCPNaming.toolAlias(handle: hAB, toolName: "list")
         let a_bList = MCPNaming.toolAlias(handle: hA_B, toolName: "list")
