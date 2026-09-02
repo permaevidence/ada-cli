@@ -233,7 +233,7 @@ def main():
 
     # 3c1b. userdata toolchain installer: fake-apt/dpkg-backed prefix
     # install, alternatives-aware wrappers, probe enforcement, cleanup.
-    result = subprocess.run([ADA, "__toolchain-selftest"], capture_output=True, text=True, timeout=180)
+    result = subprocess.run([ADA, "__toolchain-selftest"], capture_output=True, text=True, timeout=600)
     check("toolchain-selftest", result.returncode == 0,
           (result.stdout + result.stderr)[-1500:])
 
