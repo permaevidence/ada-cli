@@ -68,6 +68,17 @@ final class TerminalSession {
             throw ExitCode(1)
         }
         installSignalHandlers()
+        // Private-by-default storage: every start strips group/other bits
+        // from everything under the roots (projects/ and toolchain/
+        // excluded), so files created by older versions or by hand end up
+        // owner-only without a migration step.
+        let sweep = PrivateStorage.sweep()
+        if sweep.tightened > 0 || !sweep.errors.isEmpty || sweep.truncated {
+            var line = "storage: \(sweep.tightened) entr\(sweep.tightened == 1 ? "y" : "ies") tightened to owner-only (\(sweep.scanned) scanned)"
+            if sweep.truncated { line += " — scan budget hit, rerun at next start" }
+            if !sweep.errors.isEmpty { line += " — \(sweep.errors.count) could not be changed: \(sweep.errors.prefix(3).joined(separator: "; "))" }
+            print(line)
+        }
         LandingZone.bootstrap()
         ProjectsZipAutoExtractor.shared.start()
 

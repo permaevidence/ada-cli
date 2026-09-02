@@ -83,6 +83,18 @@ struct Doctor: AsyncParsableCommand {
             }
         }
 
+        // Storage permissions: everything under the roots (projects/ and
+        // toolchain/ excluded) is expected owner-only; the daemon's startup
+        // sweep tightens stragglers, doctor only reports them.
+        let storage = PrivateStorage.sweep(apply: false)
+        print("\nStorage permissions")
+        check("entries under the roots are owner-only (\(storage.scanned) scanned; projects/ and toolchain/ excluded)",
+              ok: storage.tightened == 0 && storage.errors.isEmpty,
+              hint: storage.tightened > 0
+                ? "\(storage.tightened) with group/other bits, e.g. \(storage.samples.prefix(3).joined(separator: ", ")) — start briglia once, the startup sweep fixes them"
+                : "unreadable: \(storage.errors.prefix(3).joined(separator: "; "))")
+        if storage.truncated { note("storage scan stopped at its entry budget") }
+
         print("\nPermissions")
         #if os(macOS)
         check("Full Disk Access", ok: PermissionsService.fullDiskAccessGranted(),

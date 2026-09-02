@@ -54,7 +54,9 @@ enum StoragePaths {
     /// allowed to write state; never by diagnostics.
     static func ensureRoots() {
         for root in [configRoot, dataRoot] {
-            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            // Both roots are owner-only (0700): with a 0700 parent no mode
+            // inside can make a child reachable by another account.
+            try? PrivateStorage.ensureDirectory(root, mode: 0o700)
         }
     }
 

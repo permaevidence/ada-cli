@@ -299,6 +299,18 @@ def main():
     # for direct calls / tool_search / mcp_call, legacy-name grace via the
     # validated reverse map, and mcp-routing.json / mcp_tools migration.
     # Spawns fake stdio MCP servers (python3) under an isolated XDG root.
+    result = subprocess.run([ADA, "__storage-selftest"], capture_output=True, text=True, timeout=120)
+    check("storage selftest (private-by-default modes, symlink policy, sweep)",
+          result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # Repository invariant: every write under the storage roots goes through
+    # PrivateStorage, or is listed with a reason in the reviewable allowlist.
+    scan = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "private_storage_scan.py")],
+                          capture_output=True, text=True, timeout=60)
+    check("private-storage repository scan (writes under the roots are routed or allowlisted)",
+          scan.returncode == 0, (scan.stdout + scan.stderr)[-1500:])
+
     result = subprocess.run([os.path.abspath(ADA), "__mcp-surface-selftest"], capture_output=True,
                             text=True, timeout=300)
     check("mcp-surface-selftest", result.returncode == 0,

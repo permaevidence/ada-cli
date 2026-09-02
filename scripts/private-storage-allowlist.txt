@@ -1,0 +1,175 @@
+# Private-storage allowlist — file-creating calls under TelegramConcierge/ that do
+# NOT go through PrivateStorage. Format: <path> :: <trimmed source line> :: <reason>.
+# A reason of 'unreviewed' fails the scan: replace it (or route the call) before release.
+# Regenerate missing entries with scripts/private_storage_scan.py --regen; prune stale
+# ones with --prune. Sorted by path so merges are trivial.
+TelegramConcierge/CLI/AdaMain.swift :: try? "\(pid)".write(toFile: path, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/CLI/InstanceLock.swift :: let fd = open(url.path, O_CREAT | O_RDWR, 0o600) :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600) :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: let lockFD = open(lockPath, O_WRONLY | O_CREAT, 0o600) :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: let outFD = open(outURL.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600) :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: try fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: try fm.createDirectory(at: parkedDir, withIntermediateDirectories: true, :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: try fm.createDirectory(at: preimagesDir, withIntermediateDirectories: true, :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: try fm.createDirectory(at: stateDirURL, withIntermediateDirectories: true, :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: try fm.createDirectory(atPath: parent, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/MigrationEngine.swift :: try? fm.createDirectory(at: outputDir, withIntermediateDirectories: true, :: unreviewed
+TelegramConcierge/CLI/ReleaseSigning.swift :: FileManager.default.createFile(atPath: file.path, contents: nil) :: unreviewed
+TelegramConcierge/CLI/ReleaseSigning.swift :: let fd = open(lockURL.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600) :: unreviewed
+TelegramConcierge/CLI/ReleaseSigning.swift :: try data.write(to: URL(fileURLWithPath: outputPath)) :: unreviewed
+TelegramConcierge/CLI/ReleaseSigning.swift :: try data.write(to: fileURL, options: .atomic) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: .write(toFile: unitPath, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: fm.createFile(atPath: root + "/sys/power/wake_lock", contents: Data()) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: fm.createFile(atPath: root + "/sys/power/wake_unlock", contents: Data()) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: try fm.createDirectory(atPath: root + "/android", withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: try fm.createDirectory(atPath: root + "/etc", withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: try fm.createDirectory(atPath: root + "/etc/system-image", withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: try fm.createDirectory(atPath: root + "/sys/power", withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/ServiceCommand.swift :: try wakelockUnitText().write(to: temp, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/CLI/TriggerCommand.swift :: try Data("this is not a fire record".utf8).write(to: corruptURL) :: unreviewed
+TelegramConcierge/CLI/TriggerCommand.swift :: try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/UpgradeService.swift :: try fm.createDirectory(at: tmp, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/CLI/UpgradeService.swift :: try? data.write(to: restartMarkerURL, options: .atomic) :: unreviewed
+TelegramConcierge/Models/ToolModels.swift :: try data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Models/ToolModels.swift :: try fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/AgentMailService.swift :: try archiveData.write(to: archivePath) :: unreviewed
+TelegramConcierge/Services/AgentMailService.swift :: try data.write(to: Self.pollStateURL, options: [.atomic]) :: unreviewed
+TelegramConcierge/Services/AgentMailService.swift :: try fm.createDirectory(at: destDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/AgentMailService.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/AgentMailService.swift :: try script.data(using: .utf8)?.write(to: wrapper, options: [.atomic]) :: unreviewed
+TelegramConcierge/Services/AgentTurnOverrides.swift :: try data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ApplyPatch.swift :: try MCPAgentRouting.withLockIfRoutingFile(path) { try content.write(to: URL(fileURLWithPath: path), options: .atomic) } :: unreviewed
+TelegramConcierge/Services/ApplyPatch.swift :: try MCPAgentRouting.withLockIfRoutingFile(path) { try newContent.write(to: targetURL, options: .atomic) } :: unreviewed
+TelegramConcierge/Services/ApplyPatch.swift :: try MCPAgentRouting.withLockIfRoutingFile(toPath) { try newContent.write(to: URL(fileURLWithPath: toPath), options: .atomic) } :: unreviewed
+TelegramConcierge/Services/ApplyPatch.swift :: try fm.createDirectory(at: URL(fileURLWithPath: path).deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ApplyPatch.swift :: try fm.createDirectory(at: URL(fileURLWithPath: toPath).deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ApplyPatch.swift :: try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ApplyPatch.swift :: try preImage.write(to: URL(fileURLWithPath: step.path).resolvingSymlinksInPath(), options: .atomic) :: unreviewed
+TelegramConcierge/Services/BalanceMonitor.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/BalanceMonitor.swift :: try? data.write(to: storeURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/CalendarService.swift :: try data.write(to: calendarFileURL, options: [.atomic]) :: unreviewed
+TelegramConcierge/Services/CalendarService.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try data.write(to: fileURL) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try data.write(to: indexFileURL) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try data.write(to: pendingExtractionsFileURL) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try data.write(to: pendingIndexFileURL) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try data.write(to: pendingMetaIndexFileURL) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try sanitizedData.write(to: fileURL) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try text.data(using: .utf8)?.write(to: sidecarURL(forRawFileName: fileName)) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ConversationArchiveService.swift :: try? data.write(to: storeURL) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: let destFD = open(destination.path, O_WRONLY | O_CREAT | O_EXCL, 0o600) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: activeTurnMarkerFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: contextUsageFileURL) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: conversationFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: documentsDirectory.appendingPathComponent(safeName)) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: imagesDirectory.appendingPathComponent(fileName)) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: pendingAmbientFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: pendingAttachmentsFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: pendingMidTurnFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try data.write(to: turnSalvageFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try documentData.write(to: documentsDirectory.appendingPathComponent(fileName)) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try documentData.write(to: fileURL) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try imageData.write(to: documentsFileURL) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try imageData.write(to: fileURL) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try imageData.write(to: imagesDirectory.appendingPathComponent(fileName)) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try videoData.write(to: fileURL) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try? Data(text.utf8).write(to: pendingContinuationFileURL) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try? FileManager.default.createDirectory(at: imagesDirectory, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try? FileManager.default.createDirectory(at: toolAttachmentsDirectory, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ConversationManager.swift :: try? imageData.write(to: documentsDirectory.appendingPathComponent(fileName)) :: unreviewed
+TelegramConcierge/Services/DebugTelemetry.swift :: try? data.write(to: fileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/DiffUtil.swift :: try (new.data(using: .utf8) ?? Data()).write(to: newURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/DiffUtil.swift :: try (old.data(using: .utf8) ?? Data()).write(to: oldURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/FileDescriptionService.swift :: try data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/FilesLedger.swift :: try data.write(to: tmp, options: .atomic) :: unreviewed
+TelegramConcierge/Services/FilesLedger.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/FilesystemTools.swift :: try MCPAgentRouting.withLockIfRoutingFile(path) { try finalData.write(to: targetURL, options: .atomic) } :: unreviewed
+TelegramConcierge/Services/FilesystemTools.swift :: try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/FireOutbox.swift :: try data.write(to: url(for: record.id), options: .atomic) :: unreviewed
+TelegramConcierge/Services/GitCheckpoint.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/GitCheckpoint.swift :: try? data.write(to: ledgerURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try data.write(to: clientSecretFileURL, options: [.atomic]) :: unreviewed
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: destDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: gwsConfigDirectory, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try tarData.write(to: tarPath) :: unreviewed
+TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: directory(for: kind), withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: root, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: scratchReposRoot, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MCPAgentRouting.swift :: let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600) :: unreviewed
+TelegramConcierge/Services/MCPAgentRouting.swift :: try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MCPAgentRouting.swift :: try data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/MCPAgentRouting.swift :: try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MCPAgentRouting.swift :: try? data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/MCPRegistry.swift :: try data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/MCPRegistry.swift :: try fm.createDirectory(at: binDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MCPRegistry.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MCPRegistry.swift :: try tarData.write(to: tarPath) :: unreviewed
+TelegramConcierge/Services/MindExportService.swift :: try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MindExportService.swift :: try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MindExportService.swift :: try configData.write(to: tempDir.appendingPathComponent("mind_config.json")) :: unreviewed
+TelegramConcierge/Services/MindExportService.swift :: try fm.createDirectory(at: tempDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/MindExportService.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ProfileBundle.swift :: try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ProfileBundle.swift :: try content.data(using: .utf8)?.write(to: dest, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ProjectsZipAutoExtractor.swift :: try? fileManager.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ReminderService.swift :: try (try encoder.encode(rows)).write(to: file, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ReminderService.swift :: try data.write(to: remindersFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ReminderService.swift :: try scriptSource.write(to: fileURL, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/ReminderService.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ReminderService.swift :: try? data.write(to: noticesFileURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/StreamingOutput.swift :: try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/SubagentSerializer.swift :: try content.data(using: .utf8)?.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/SubagentSessionRegistry.swift :: try data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/SubagentSessionRegistry.swift :: try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/TelegramBotService.swift :: try data.write(to: localURL) :: unreviewed
+TelegramConcierge/Services/TelegramBotService.swift :: try? data.write(to: offsetStateURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/TodoStore.swift :: try? data.write(to: tmp, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try data.write(to: fileURL) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try imageData.write(to: documentsURL) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try imageData.write(to: imagesURL) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try input.write(to: inputFile!, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try output.write(to: saveURL, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try srt.write(to: outputURL, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try? data.write(to: documentsLastOpenedIndexURL, options: .atomic) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try? finalOutputData.write(to: imagePath) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try? finalOutputData.write(to: savedPath) :: unreviewed
+TelegramConcierge/Services/TriggerSpool.swift :: O_WRONLY | O_CREAT, 0o600) :: unreviewed
+TelegramConcierge/Services/TriggerSpool.swift :: try data.write(to: tempURL) :: unreviewed
+TelegramConcierge/Services/TriggerSpool.swift :: try? Data("\(next)".utf8).write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/TruncationService.swift :: try fm.createDirectory(atPath: truncationDir, withIntermediateDirectories: true, :: unreviewed
+TelegramConcierge/Services/TruncationService.swift :: try text.write(toFile: path, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: .write(to: baseStatus, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: .write(to: txTmp.appendingPathComponent("manifest.json"), :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: .write(to: url, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: .write(to: wrapper, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: do { try text.write(to: url, atomically: true, encoding: .utf8) } :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: let fd = open(path, O_WRONLY | O_CREAT, 0o600) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: try "briglia toolchain conversion probe".write(to: txt, atomically: true, :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: try data.write(to: tmp) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: try fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: try fm.createDirectory(at: txTmp.appendingPathComponent("wrappers"), :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: try text.write(to: wrapper, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: try? FileManager.default.createDirectory(at: root.deletingLastPathComponent(), :: unreviewed
+TelegramConcierge/Services/UserdataToolchain.swift :: try? fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/WebOrchestrator+Helpers.swift :: if let handle = try? FileHandle(forWritingTo: current) { :: unreviewed
+TelegramConcierge/Services/WebOrchestrator+Helpers.swift :: try? Data(line.utf8).write(to: current) :: unreviewed
+TelegramConcierge/Services/WebOrchestrator+Helpers.swift :: try? fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/WhatsAppChannelService.swift :: try data.write(to: url) :: unreviewed
+TelegramConcierge/Services/WhatsAppChannelService.swift :: try fm.createDirectory(at: authDirectory, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/WhatsAppChannelService.swift :: try fm.createDirectory(at: bridgeDirectory, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/WhatsAppChannelService.swift :: try fm.createDirectory(at: mediaDirectory, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Utilities/KeychainHelper.swift :: let fd = open(lockURL.path, O_CREAT | O_WRONLY, 0o600) :: unreviewed
+TelegramConcierge/Utilities/KeychainHelper.swift :: try data.write(to: storeURL, options: .atomic) :: unreviewed
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) } catch { return nil } :: unreviewed
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: fileURL) } catch { :: unreviewed
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: src) } catch { return nil } :: unreviewed
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: tmp) } catch { return nil } :: unreviewed
+TelegramConcierge/Utilities/PlatformMedia.swift :: try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Utilities/PlatformMedia.swift :: try? FileManager.default.createDirectory(at: rasterDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Utilities/PlatformMedia.swift :: try? FileManager.default.createDirectory(at: sliceDir, withIntermediateDirectories: true) :: unreviewed
