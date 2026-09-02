@@ -639,8 +639,7 @@ enum ManagedPlaywright {
             if kill(-pid, sig) != 0 { kill(pid, sig) }
         }
         func groupGone() -> Bool {
-            let target = leaderPid() ?? pid
-            return kill(-target, 0) == -1 && errno == ESRCH
+            !processGroupHasLiveMembers(leaderPid() ?? pid)
         }
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline {
@@ -696,6 +695,30 @@ enum ManagedPlaywright {
                              processGroupVerifiedGone: groupGone())
         }
         return RunResult(exitCode: process.terminationStatus, output: text, processGroupVerifiedGone: nil)
+    }
+
+    /// True while any NON-zombie process belongs to `pgid`. `kill(-pgid, 0)`
+    /// alone also counts zombies: in a container whose PID 1 does not reap
+    /// (GitHub's Swift container), a killed grandchild of npm stays a zombie
+    /// forever and the group would never read as gone. On Linux `/proc` gives
+    /// the state; elsewhere launchd reaps orphans and the kill probe suffices.
+    static func processGroupHasLiveMembers(_ pgid: Int32) -> Bool {
+        #if os(Linux)
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: "/proc") {
+            var scanned = false
+            for name in names where Int32(name) != nil {
+                guard let stat = try? String(contentsOfFile: "/proc/\(name)/stat", encoding: .utf8),
+                      let close = stat.range(of: ")", options: .backwards) else { continue }
+                scanned = true
+                // After the parenthesised comm: state ppid pgrp …
+                let fields = stat[close.upperBound...].split(separator: " ")
+                guard fields.count > 2, fields[0] != "Z" else { continue }
+                if Int32(fields[2]) == pgid { return true }
+            }
+            if scanned { return false }
+        }
+        #endif
+        return !(kill(-pgid, 0) == -1 && errno == ESRCH)
     }
 
     // MARK: - Bootstrap status (doctor)
