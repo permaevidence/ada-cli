@@ -93,6 +93,9 @@ enum KeychainHelper {
     // save/load/delete surface are kept so the ported Ada.app services are
     // untouched.
     private static let storeURL = StoragePaths.configRoot.appendingPathComponent("secrets.json")
+    /// Absolute path of the secret store, for the file-tool rules in
+    /// `HarnessSecretStore` (read masking, edit/write refusals).
+    static var secretStorePath: String { storeURL.path }
     // Cross-process write lock. The store file itself is replaced atomically
     // on every write (new inode), so a lock must live on a stable sidecar.
     private static let lockURL = StoragePaths.configRoot.appendingPathComponent("secrets.lock")
@@ -437,8 +440,12 @@ struct ServiceKey: Identifiable, Equatable, Codable {
 extension KeychainHelper {
     static let serviceKeyEnvironmentPrefix = "BRIGLIA_KEY_"
 
-    private static let serviceKeysMetadataDefaultsKey = "ada.service_keys_metadata"
-    private static let serviceKeyPrefix = "servicekey_"
+    // The legacy "ada." UserDefaults name is deliberate: the key is internal,
+    // never user-visible, and survived the Ada→Briglia migration untouched.
+    // Renaming it would need a two-process verification protocol for no
+    // user-visible gain (hardening plan 2026-09, §H8.3).
+    static let serviceKeysMetadataDefaultsKey = "ada.service_keys_metadata"
+    static let serviceKeyPrefix = "servicekey_"
 
     static func serviceKeyEnvironmentName(for name: String) -> String {
         serviceKeyEnvironmentPrefix + name
@@ -514,14 +521,29 @@ extension KeychainHelper {
         return (resolved, missing)
     }
 
-    /// Seed environment for SecretRedactor: every stored secret that could
-    /// plausibly appear in tool output. Service keys plus first-class keys the
-    /// agent's bash surface can see (today: the ambient AGENTMAIL_API_KEY).
-    /// NOT an injection map — redaction only.
+    /// Seed environment for SecretRedactor: label → secret value for every
+    /// stored credential tagged `.redact` in `CredentialCatalog` — the service
+    /// keys (as BRIGLIA_KEY_<NAME>) and the Telegram bot token. Values shorter
+    /// than `HarnessSecretStore.minimumSecretLength` are skipped (they would
+    /// match ordinary text) and a value stored under two labels is emitted
+    /// once. The provider, search, image, transcription and AgentMail keys are
+    /// deliberately NOT here (owner decision, 2026-09-02): the redactor is
+    /// hygiene against accidental echo of the token, not a boundary against
+    /// the model. NOT an injection map — redaction only.
     static func redactionEnvironment() -> [String: String] {
-        var env = serviceKeyEnvironment()
-        if let agentMailKey = load(key: agentMailApiKeyKey), !agentMailKey.isEmpty {
-            env["AGENTMAIL_API_KEY"] = agentMailKey
+        var candidates = serviceKeyEnvironment()
+        for key in CredentialCatalog.redactedKeys {
+            if let value = load(key: key), !value.isEmpty {
+                candidates[key] = value
+            }
+        }
+        var seen = Set<String>()
+        var env: [String: String] = [:]
+        for (label, value) in candidates.sorted(by: { $0.key < $1.key }) {
+            guard value.count >= HarnessSecretStore.minimumSecretLength,
+                  !seen.contains(value) else { continue }
+            seen.insert(value)
+            env[label] = value
         }
         return env
     }
@@ -540,9 +562,9 @@ extension KeychainHelper {
 
 // MARK: - OpenRouter Spend Ledger (UserDefaults-backed)
 extension KeychainHelper {
-    private static let openRouterSpendLedgerDefaultsKey = "openrouter_spend_ledger_v1"
+    static let openRouterSpendLedgerDefaultsKey = "openrouter_spend_ledger_v1"
     private static let openRouterSpendLedgerRetentionDays = 500
-    private static let openRouterSpendLimitBoostDefaultsKey = "openrouter_spend_limit_boost_v1"
+    static let openRouterSpendLimitBoostDefaultsKey = "openrouter_spend_limit_boost_v1"
     private static let openRouterSpendLimitBoostRetentionMonths = 24
 
     private struct OpenRouterSpendLedger: Codable {

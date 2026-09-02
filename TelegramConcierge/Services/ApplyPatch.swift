@@ -258,6 +258,9 @@ enum ApplyPatch {
     private static func planOperation(_ op: Operation) async throws -> Plan {
         switch op {
         case .add(let path, let content):
+            if HarnessSecretStore.isSecretStore(path) {
+                throw PatchError(message: HarnessSecretStore.wholeFileRewriteRefusal)
+            }
             if FileManager.default.fileExists(atPath: path) {
                 throw PatchError(message: "cannot Add File: \(path) already exists")
             }
@@ -267,6 +270,9 @@ enum ApplyPatch {
             return Plan(kind: .add(path: path, content: data))
 
         case .delete(let path):
+            if HarnessSecretStore.isSecretStore(path) {
+                throw PatchError(message: HarnessSecretStore.deleteOrMoveRefusal)
+            }
             guard FileManager.default.fileExists(atPath: path) else {
                 throw PatchError(message: "cannot Delete File: \(path) does not exist")
             }
@@ -276,6 +282,16 @@ enum ApplyPatch {
         case .update(let path, let hunks, let moveTo):
             guard FileManager.default.fileExists(atPath: path) else {
                 throw PatchError(message: "cannot Update File: \(path) does not exist")
+            }
+            if HarnessSecretStore.isSecretStore(path) {
+                if moveTo != nil {
+                    throw PatchError(message: HarnessSecretStore.deleteOrMoveRefusal)
+                }
+                if let refusal = HarnessSecretStore.patchRefusal(hunks: hunks) {
+                    throw PatchError(message: refusal)
+                }
+            } else if let moveTo, HarnessSecretStore.isSecretStore(moveTo) {
+                throw PatchError(message: HarnessSecretStore.wholeFileRewriteRefusal)
             }
             try await FileTimeTracker.shared.assertFresh(path: path)
             guard let original = try? String(contentsOfFile: path, encoding: .utf8) else {

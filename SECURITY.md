@@ -30,6 +30,20 @@ who installs it, by design. Reports we consider in scope include:
 Out of scope: the fact that the agent itself can run shell commands or
 modify files when its operator asks it to — that is the product.
 
+## Installation directory
+
+The binary is installed under `~/.local/bin`, which is writable by the
+installing user by design: `/upgrade` replaces the binary without `sudo`
+and without a privileged helper. Physical or account-level access to that
+directory therefore equals update trust — the same trust the signed release
+channel protects against network attackers, not against someone already
+running as you.
+
+The very first install on a machine without `python3` or `openssl` can only
+rely on TLS to fetch the release; every later update verifies the embedded
+Ed25519 signature with the key pinned inside the binary. The installer says
+so when it runs in that mode.
+
 ## Supported versions
 
 Only the latest released version is supported. Fixes ship as a new

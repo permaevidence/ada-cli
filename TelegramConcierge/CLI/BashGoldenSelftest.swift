@@ -551,6 +551,39 @@ struct BashGoldenSelftest: AsyncParsableCommand {
         }
         try await section17()
 
+        // MARK: 18. Redaction scope goldens (CredentialCatalog, owner decision 2026-09-02)
+        print("\nRedaction scope goldens")
+        func section18() async throws {
+            let token = "5551234567:AAGoldenTokenValue_0123456789abcdef"
+            let opencodeKey = "sk-opencode-golden-visible-0123456789"
+            try KeychainHelper.save(key: KeychainHelper.telegramBotTokenKey, value: token)
+            try KeychainHelper.save(key: ProviderProfiles.opencodeApiKeyKey, value: opencodeKey)
+            defer {
+                try? KeychainHelper.delete(key: KeychainHelper.telegramBotTokenKey)
+                try? KeychainHelper.delete(key: ProviderProfiles.opencodeApiKeyKey)
+            }
+            let echoToken = await BashTools.runAttached(command: "printf '%s' '\(token)'")
+            let tokenOut = payload(echoToken)["stdout"] as? String ?? "<no stdout>"
+            check("bot token echoed through bash comes back redacted",
+                  tokenOut == HarnessSecretStore.tokenPlaceholder, detail: tokenOut)
+            let echoOpenCode = await BashTools.runAttached(command: "printf '%s' '\(opencodeKey)'")
+            let opencodeOut = payload(echoOpenCode)["stdout"] as? String ?? "<no stdout>"
+            check("OpenCode key echoed through bash comes back verbatim (deliberately visible)",
+                  opencodeOut == opencodeKey, detail: opencodeOut)
+            check("MCP result text uses the same set: token redacted",
+                  ToolExecutor.redactedMCPText("t=\(token);") == "t=\(HarnessSecretStore.tokenPlaceholder);")
+            check("MCP result text uses the same set: OpenCode key kept",
+                  ToolExecutor.redactedMCPText(opencodeKey) == opencodeKey)
+            let env = KeychainHelper.redactionEnvironment()
+            check("redaction environment carries the token under its catalogue key",
+                  env[KeychainHelper.telegramBotTokenKey] == token && env[ProviderProfiles.opencodeApiKeyKey] == nil,
+                  detail: "\(env.keys.sorted())")
+            try KeychainHelper.save(key: KeychainHelper.telegramBotTokenKey, value: "short")
+            check("values shorter than 8 chars never enter the redaction set",
+                  KeychainHelper.redactionEnvironment()[KeychainHelper.telegramBotTokenKey] == nil)
+        }
+        try await section18()
+
         if failures > 0 {
             print("\n\(failures) bash golden check(s) FAILED")
             throw ExitCode(1)

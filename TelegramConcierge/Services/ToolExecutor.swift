@@ -2315,8 +2315,13 @@ actor ToolExecutor {
     /// multimodal message after the tool results, and OCR-proxied for text-only
     /// models — instead of being dropped as textual stubs.
     private func mcpToolResultMessage(_ call: ToolCall, _ result: MCPToolCallResult) -> ToolResultMessage {
+        // MCP text is a second entry path for tool output next to bash: scrub
+        // the redaction set (service keys, Telegram bot token) here, before the
+        // marker-neutralizing render, so a server echoing a secret cannot put
+        // it in the transcript either.
+        let text = Self.redactedMCPText(result.text)
         guard !result.images.isEmpty else {
-            return ToolResultMessage(toolCallId: call.id, content: result.text)
+            return ToolResultMessage(toolCallId: call.id, content: text)
         }
 
         let maxAttached = 5
@@ -2350,9 +2355,14 @@ actor ToolExecutor {
         }
         return ToolResultMessage(
             toolCallId: call.id,
-            content: result.text + "\n\n" + note,
+            content: text + "\n\n" + note,
             fileAttachments: attachments
         )
+    }
+
+    /// Redaction applied to every textual MCP tool result (same set as bash output).
+    static func redactedMCPText(_ text: String) -> String {
+        BashTools.SecretRedactor().redact(text)
     }
 
     /// File extension for an image MIME type (used when persisting MCP image blocks).

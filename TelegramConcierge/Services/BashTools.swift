@@ -1349,9 +1349,9 @@ actor BackgroundProcessRegistry {
         // real binary, so the key exists only in the actual AgentMail
         // process — no shell-string heuristic decides credential scope
         // (Codex, 2026-08-22: substring matching is not a boundary). The
-        // redactor is still seeded with the key via
-        // KeychainHelper.redactionEnvironment() so it never survives into
-        // tool output.
+        // redactor is seeded from CredentialCatalog (service keys + the
+        // Telegram bot token); the AgentMail key is deliberately visible
+        // (owner decision, 2026-09-02).
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = BashTools.augmentedPath(env["PATH"])
         BashTools.applyNonInteractiveEnv(&env)

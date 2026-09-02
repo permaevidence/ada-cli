@@ -20,6 +20,10 @@ struct FsToolsSelftest: AsyncParsableCommand {
             .appendingPathComponent("ada-fstools-selftest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempRoot) }
+        // Isolated XDG roots: section 8 exercises the harness secret store
+        // through the file tools and must never touch a real installation.
+        setenv("XDG_CONFIG_HOME", tempRoot.appendingPathComponent("config").path, 1)
+        setenv("XDG_DATA_HOME", tempRoot.appendingPathComponent("data").path, 1)
 
         var failures = 0
         func check(_ label: String, _ ok: Bool, _ detail: String = "") {
@@ -85,6 +89,99 @@ struct FsToolsSelftest: AsyncParsableCommand {
         check("edit of never-read file mentions ledger reset on restart",
               editUnread.content.contains("read_file first")
               && editUnread.content.contains("restart"), String(editUnread.content.prefix(300)))
+
+        // 8. Harness secret store through the file tools (HarnessSecretStore):
+        //    the Telegram bot token is masked on read and its field is
+        //    refused on edit; every other field stays editable; whole-file
+        //    rewrites are refused; files elsewhere are untouched by the rules.
+        let token = "5551234567:AAGoldenTokenValue_0123456789abcdef"
+        let serperV1 = "serper-visible-key-abcdef0123"
+        let opencodeKey = "sk-opencode-visible-0123456789"
+        try KeychainHelper.save(key: KeychainHelper.telegramBotTokenKey, value: token)
+        try KeychainHelper.save(key: KeychainHelper.serperApiKeyKey, value: serperV1)
+        try KeychainHelper.save(key: ProviderProfiles.opencodeApiKeyKey, value: opencodeKey)
+        let storePath = HarnessSecretStore.storePath
+        check("secret store resolved under the isolated config root",
+              StoragePaths.configRoot.path.hasPrefix(tempRoot.path), storePath)
+        func rawStore() -> String { (try? String(contentsOfFile: storePath, encoding: .utf8)) ?? "" }
+        func storedToken() -> String? {
+            (try? Data(contentsOf: URL(fileURLWithPath: storePath)))
+                .flatMap { try? JSONDecoder().decode([String: String].self, from: $0) }?[KeychainHelper.telegramBotTokenKey]
+        }
+        func succeeded(_ r: FilesystemTools.OpResult) -> Bool {
+            ((try? JSONSerialization.jsonObject(with: Data(r.content.utf8))) as? [String: Any])?["success"] as? Bool == true
+        }
+        let storeRead = await FilesystemTools.shared.readFile(path: storePath)
+        check("read_file masks the Telegram bot token",
+              storeRead.content.contains(HarnessSecretStore.tokenPlaceholder) && !storeRead.content.contains(token),
+              String(storeRead.content.prefix(300)))
+        check("read_file returns the other keys verbatim",
+              storeRead.content.contains(serperV1) && storeRead.content.contains(opencodeKey))
+        let serperV2 = "serper-visible-key-ghijkl4567"
+        let editSerper = await FilesystemTools.shared.editFile(path: storePath, oldString: serperV1, newString: serperV2)
+        check("edit_file of the Serper key succeeds", succeeded(editSerper), String(editSerper.content.prefix(300)))
+        check("...and the stored token is byte-identical afterwards",
+              storedToken() == token && rawStore().contains(serperV2))
+        let editPlaceholder = await FilesystemTools.shared.editFile(
+            path: storePath, oldString: serperV2, newString: HarnessSecretStore.tokenPlaceholder)
+        check("edit_file writing a [REDACTED:…] placeholder back is refused",
+              !succeeded(editPlaceholder) && editPlaceholder.content.contains("placeholder"),
+              String(editPlaceholder.content.prefix(300)))
+        let editTokenField = await FilesystemTools.shared.editFile(
+            path: storePath, oldString: "\"\(KeychainHelper.telegramBotTokenKey)\"", newString: "\"telegram_bot_token_old\"")
+        check("edit_file touching the token field is refused",
+              !succeeded(editTokenField) && editTokenField.content.contains("/switchbot"),
+              String(editTokenField.content.prefix(300)))
+        let editTokenValue = await FilesystemTools.shared.editFile(path: storePath, oldString: token, newString: "x")
+        check("edit_file touching the token value is refused", !succeeded(editTokenValue))
+        let writeStore = await FilesystemTools.shared.writeFile(path: storePath, content: "{}\n")
+        check("write_file on the secret store is refused",
+              !succeeded(writeStore) && writeStore.content.contains("whole-file"),
+              String(writeStore.content.prefix(300)))
+        check("...and the store is unchanged", storedToken() == token && rawStore().contains(serperV2))
+        // apply_patch: a hunk on the Serper line applies; hunks on the token
+        // field, deletes and moves are refused.
+        let serperLine = rawStore().components(separatedBy: "\n").first { $0.contains(serperV2) } ?? ""
+        let serperV3 = "serper-visible-key-mnopqr8901"
+        let patchSerper = await ApplyPatch.run(patchText: """
+        *** Begin Patch
+        *** Update File: \(storePath)
+        @@
+        -\(serperLine)
+        +\(serperLine.replacingOccurrences(of: serperV2, with: serperV3))
+        *** End Patch
+        """)
+        check("apply_patch of the Serper key succeeds",
+              !patchSerper.content.contains("\"error\"") && rawStore().contains(serperV3),
+              String(patchSerper.content.prefix(300)))
+        check("...and the stored token is byte-identical after the patch", storedToken() == token)
+        let tokenLine = rawStore().components(separatedBy: "\n").first { $0.contains("\"\(KeychainHelper.telegramBotTokenKey)\"") } ?? ""
+        let patchToken = await ApplyPatch.run(patchText: """
+        *** Begin Patch
+        *** Update File: \(storePath)
+        @@
+        -\(tokenLine)
+        +\(tokenLine.replacingOccurrences(of: token, with: "1:new"))
+        *** End Patch
+        """)
+        check("apply_patch touching the token field is refused",
+              patchToken.content.contains("\"error\"") && patchToken.content.contains("/switchbot") && storedToken() == token,
+              String(patchToken.content.prefix(300)))
+        let patchDelete = await ApplyPatch.run(patchText: "*** Begin Patch\n*** Delete File: \(storePath)\n*** End Patch")
+        check("apply_patch deleting the secret store is refused",
+              patchDelete.content.contains("\"error\"") && FileManager.default.fileExists(atPath: storePath),
+              String(patchDelete.content.prefix(300)))
+        // The rules are scoped to the harness store: a user .env elsewhere is untouched.
+        let envPath = tempRoot.appendingPathComponent("project.env").path
+        let envWrite = await FilesystemTools.shared.writeFile(
+            path: envPath, content: "TOKEN=\(HarnessSecretStore.tokenPlaceholder)\nBOT=\(token)\n")
+        check("write_file on a user .env with the same strings is allowed", succeeded(envWrite),
+              String(envWrite.content.prefix(300)))
+        let envRead = await FilesystemTools.shared.readFile(path: envPath)
+        check("read_file on a user .env is not masked", envRead.content.contains(token))
+        let envEdit = await FilesystemTools.shared.editFile(path: envPath, oldString: "BOT=\(token)", newString: "BOT=other")
+        check("edit_file on a user .env touching the token string is allowed", succeeded(envEdit),
+              String(envEdit.content.prefix(300)))
 
         print(failures == 0 ? "ALL CHECKS PASSED" : "\(failures) CHECK(S) FAILED")
         if failures > 0 { throw ExitCode(1) }

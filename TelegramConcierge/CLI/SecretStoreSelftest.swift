@@ -225,10 +225,63 @@ struct SecretStoreSelftest: ParsableCommand {
                 print("skip unreadable-store checks (running as root — chmod is inert)")
             }
 
+            // CredentialCatalog completeness: every `static let …Key = "…"`
+            // constant in KeychainHelper.swift and ProviderProfiles.swift must
+            // be classified, so a new key cannot be added without deciding
+            // whether the redactor covers it.
+            if let repoRoot = locateRepoRoot() {
+                let sources = [
+                    "TelegramConcierge/Utilities/KeychainHelper.swift",
+                    "TelegramConcierge/Services/ProviderProfiles.swift",
+                ]
+                var scanned = 0
+                var unclassified: [String] = []
+                let pattern = try NSRegularExpression(pattern: #"static let (\w+Key)\s*=\s*"([^"]+)""#)
+                for rel in sources {
+                    let text = (try? String(contentsOf: repoRoot.appendingPathComponent(rel), encoding: .utf8)) ?? ""
+                    let ns = text as NSString
+                    for m in pattern.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+                        let name = ns.substring(with: m.range(at: 1))
+                        let value = ns.substring(with: m.range(at: 2))
+                        scanned += 1
+                        if CredentialCatalog.treatment(forKey: value) == nil { unclassified.append("\(name)=\(value)") }
+                    }
+                }
+                check("credential catalogue scan found the key constants (\(scanned))", scanned >= 60)
+                check("every key constant is classified in CredentialCatalog", unclassified.isEmpty,
+                      unclassified.joined(separator: ", "))
+            } else {
+                print("skip credential catalogue scan (source tree not found; set BRIGLIA_REPO_ROOT)")
+            }
+            check("redaction set is exactly the Telegram bot token (+ service-key family)",
+                  CredentialCatalog.redactedKeys == [KeychainHelper.telegramBotTokenKey]
+                  && CredentialCatalog.families.contains { $0.prefix == KeychainHelper.serviceKeyPrefix && $0.treatment == .redact },
+                  "\(CredentialCatalog.redactedKeys)")
+            check("provider and AgentMail keys are classified visible",
+                  [KeychainHelper.openRouterApiKeyKey, ProviderProfiles.opencodeApiKeyKey,
+                   KeychainHelper.serperApiKeyKey, KeychainHelper.agentMailApiKeyKey]
+                    .allSatisfy { CredentialCatalog.treatment(forKey: $0) == .visible })
+
             print(failures == 0
                   ? "secret-store selftest: all checks passed"
                   : "secret-store selftest: \(failures) FAILURES")
             if failures != 0 { throw ExitCode(1) }
+        }
+
+        private static func locateRepoRoot() -> URL? {
+            var candidates: [URL] = []
+            if let env = ProcessInfo.processInfo.environment["BRIGLIA_REPO_ROOT"] {
+                candidates.append(URL(fileURLWithPath: env))
+            }
+            candidates.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+            // The debug binary lives at <repo>/.build/<config>/briglia.
+            let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+            candidates.append(exe.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent())
+            for candidate in candidates {
+                let hasPackage = FileManager.default.fileExists(atPath: candidate.appendingPathComponent("Package.swift").path)
+                if hasPackage { return candidate }
+            }
+            return nil
         }
 
         private static func filePermissions(_ path: String) -> Int {

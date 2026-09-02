@@ -144,18 +144,23 @@ actor FilesystemTools {
 
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
-            let text: String
+            let decodedText: String
             var decodedAsLatin1 = false
             if let utf8 = String(data: data, encoding: .utf8) {
-                text = utf8
+                decodedText = utf8
             } else if let latin1 = String(data: data, encoding: .isoLatin1) {
                 // Latin-1 decoding never fails, so this is the terminal fallback: the file is
                 // some non-UTF-8 encoding and may render as mojibake. Disclose it in the payload.
-                text = latin1
+                decodedText = latin1
                 decodedAsLatin1 = true
             } else {
                 return ReadResult(content: jsonError("file \(path) is not valid UTF-8 or Latin-1 text"), attachments: [])
             }
+            // Briglia's own secret store is shown with the Telegram bot token masked
+            // (HarnessSecretStore); every other value is returned verbatim.
+            let text = HarnessSecretStore.isSecretStore(resolvedPath)
+                ? HarnessSecretStore.maskedForRead(decodedText)
+                : decodedText
 
             let allLines = text.components(separatedBy: "\n")
             let startLine = max((offset ?? 1) - 1, 0)           // offset is 1-indexed
@@ -265,6 +270,9 @@ actor FilesystemTools {
         let path = Self.normalizePath(rawPath)
         guard Self.isAbsolute(path) else {
             return OpResult(content: jsonError("path must be absolute: \(rawPath)"))
+        }
+        if HarnessSecretStore.isSecretStore(path) {
+            return OpResult(content: jsonError(HarnessSecretStore.wholeFileRewriteRefusal))
         }
         if let suspicion = Self.escapedNewlineSuspicion(content: content, path: path) {
             return OpResult(content: jsonError(suspicion))
@@ -398,6 +406,13 @@ actor FilesystemTools {
         }
         guard FileManager.default.fileExists(atPath: path) else {
             return OpResult(content: jsonError("file not found: \(path). Use write_file to create it."))
+        }
+        if HarnessSecretStore.isSecretStore(path) {
+            for edit in edits {
+                if let refusal = HarnessSecretStore.editRefusal(oldText: edit.oldString, newText: edit.newString) {
+                    return OpResult(content: jsonError(refusal))
+                }
+            }
         }
         do {
             try await FileTimeTracker.shared.assertFresh(path: path)

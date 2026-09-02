@@ -199,8 +199,10 @@ struct TTYHandoffSelftest: ParsableCommand {
 /// AgentMail binary at exec time — no ambient env injection into other bash
 /// subprocesses (Codex, 2026-08-22: a shell-string heuristic is not a
 /// credential boundary). Any same-user process could equally read
-/// ~/.config/briglia/secrets.json (0600), so this exposes nothing new; stdout is
-/// still covered by the SecretRedactor when echoed through Briglia's tools.
+/// ~/.config/briglia/secrets.json (0600), so this exposes nothing new. The
+/// AgentMail key is deliberately visible to the agent (CredentialCatalog:
+/// only the Telegram bot token and the service keys are redacted from tool
+/// output — owner decision, 2026-09-02).
 struct AgentMailKeyCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "__agentmail-key",
