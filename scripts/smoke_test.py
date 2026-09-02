@@ -117,8 +117,26 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
         pass
 
 
+TEST_PREFS_PREFIXES = ("ada-mig-probe-", "ada-mig-st-", "ada-setup-api-selftest-", "briglia-s4-")
+
+
+def _test_prefs_domain_count():
+    """macOS only: throwaway UserDefaults domains the selftests create must
+    not accumulate in ~/Library/Preferences (each leaked one is a 42-byte
+    empty plist cfprefsd leaves behind unless the test purges it)."""
+    if sys.platform != "darwin":
+        return None
+    prefs = os.path.expanduser("~/Library/Preferences")
+    try:
+        names = os.listdir(prefs)
+    except OSError:
+        return None
+    return sum(1 for n in names if n.startswith(TEST_PREFS_PREFIXES))
+
+
 def main():
     print(f"Briglia binary: {ADA}")
+    prefs_domains_before = _test_prefs_domain_count()
 
     # 1. --version
     result = subprocess.run([ADA, "--version"], capture_output=True, text=True, timeout=60)
@@ -1991,6 +2009,14 @@ def main():
     check("setsid-exec: SIGTERM to shim forwarded to detached child",
           reaped and child_dead and len(kids) == 1,
           f"reaped={reaped} child_dead={child_dead} kids={kids}")
+
+    # Selftest hygiene: no throwaway preference domain survives the run.
+    prefs_domains_after = _test_prefs_domain_count()
+    if prefs_domains_before is not None:
+        check("selftests leave no throwaway preference domains behind",
+              prefs_domains_after == prefs_domains_before,
+              f"{prefs_domains_before} before, {prefs_domains_after} after "
+              f"(prefixes {', '.join(TEST_PREFS_PREFIXES)})")
 
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)

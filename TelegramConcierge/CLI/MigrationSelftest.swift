@@ -536,8 +536,8 @@ struct MigrationSelftest: AsyncParsableCommand {
             let oldDomain = fixture.spec.oldPrefsDomain!
             let newDomain = fixture.spec.newPrefsDomain!
             defer {
-                UserDefaults.standard.removePersistentDomain(forName: oldDomain)
-                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                TestPrefsDomains.purge(oldDomain)
+                TestPrefsDomains.purge(newDomain)
                 UserDefaults.standard.synchronize()
             }
             UserDefaults.standard.setPersistentDomain(seededPrefs, forName: oldDomain)
@@ -828,8 +828,8 @@ struct MigrationSelftest: AsyncParsableCommand {
             }
             defer {
                 if !oldDomain.isEmpty {
-                    UserDefaults.standard.removePersistentDomain(forName: oldDomain)
-                    UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                    TestPrefsDomains.purge(oldDomain)
+                    TestPrefsDomains.purge(newDomain)
                     UserDefaults.standard.synchronize()
                 }
             }
@@ -903,8 +903,8 @@ struct MigrationSelftest: AsyncParsableCommand {
             let oldDomain = fixture.spec.oldPrefsDomain!
             let newDomain = fixture.spec.newPrefsDomain!
             defer {
-                UserDefaults.standard.removePersistentDomain(forName: oldDomain)
-                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                TestPrefsDomains.purge(oldDomain)
+                TestPrefsDomains.purge(newDomain)
                 UserDefaults.standard.synchronize()
             }
             UserDefaults.standard.setPersistentDomain(seededPrefs, forName: oldDomain)
@@ -1094,7 +1094,7 @@ struct MigrationSelftest: AsyncParsableCommand {
             let fixture = try makeFixture("refuse-prefs", units: false, prefs: true)
             let newDomain = fixture.spec.newPrefsDomain!
             defer {
-                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                TestPrefsDomains.purge(newDomain)
                 UserDefaults.standard.synchronize()
             }
             UserDefaults.standard.setPersistentDomain(["pre": "existing"], forName: newDomain)
@@ -1215,8 +1215,8 @@ struct MigrationSelftest: AsyncParsableCommand {
             let oldDomain = fixture.spec.oldPrefsDomain!
             let newDomain = fixture.spec.newPrefsDomain!
             defer {
-                UserDefaults.standard.removePersistentDomain(forName: oldDomain)
-                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                TestPrefsDomains.purge(oldDomain)
+                TestPrefsDomains.purge(newDomain)
                 UserDefaults.standard.synchronize()
             }
             UserDefaults.standard.setPersistentDomain(seededPrefs, forName: oldDomain)
@@ -1615,7 +1615,7 @@ struct MigrationSelftest: AsyncParsableCommand {
         do {
             let domain = "ada-mig-probe-\(UUID().uuidString.prefix(8))"
             defer {
-                UserDefaults.standard.removePersistentDomain(forName: domain)
+                TestPrefsDomains.purge(domain)
                 UserDefaults.standard.synchronize()
             }
             UserDefaults.standard.setPersistentDomain(["probe": "sentinel"], forName: domain)
@@ -1801,8 +1801,8 @@ struct MigrationSelftest: AsyncParsableCommand {
             UserDefaults.standard.synchronize()
             #endif
             defer {
-                UserDefaults.standard.removePersistentDomain(forName: oldDomain)
-                UserDefaults.standard.removePersistentDomain(forName: newDomain)
+                TestPrefsDomains.purge(oldDomain)
+                TestPrefsDomains.purge(newDomain)
                 UserDefaults.standard.synchronize()
                 if let pid = Int32((try? String(contentsOfFile: sysd + "/briglia.service.pid", encoding: .utf8)) ?? "") {
                     kill(pid, SIGTERM)
@@ -2663,10 +2663,43 @@ struct MigrationSelftest: AsyncParsableCommand {
             check("gate: pre-flag (0.2.0) journal decodes and is refused even under a live lock",
                   s0.journalState == "fixups" && s0.migrationRunning && !s0.newInstallReady && s0.pending)
             release()
+
+            // H7.9: a journal that DECODES but fails the engine's validation
+            // is unreadable to the gate — never admitted, even ready and
+            // under a live lock. Three shapes: an out-of-bounds preimage, a
+            // truncated roots array, a unit capture that is not the spec's.
+            let tampers: [(String, (inout [String: Any]) -> Void)] = [
+                ("out-of-bounds preimage", { $0["preimages"] = [["id": "evil", "type": "file",
+                                                                  "path": "/etc/passwd", "sha256": "00"]] }),
+                ("truncated roots", { var roots = $0["roots"] as! [[String: Any]]; roots.removeLast(); $0["roots"] = roots }),
+                ("foreign unit capture", { $0["oldService"] = ["name": "evil.service", "unitPath": "/tmp/evil.service",
+                                                                "installed": true, "enabled": true, "active": true] }),
+            ]
+            for (label, tamper) in tampers {
+                try writeJournal(state: "fixups", ready: true, tamper: tamper); hold()
+                s0 = status()
+                check("H7.9 gate: invalid journal (\(label)) reads as unreadable and keeps the gate closed even when ready + live",
+                      s0.journalState == "unreadable" && s0.pending && !s0.servedByLiveMigration,
+                      "state=\(s0.journalState ?? "nil") pending=\(s0.pending)")
+                r = runGate(["__migrate-gate"])
+                check("H7.9 gate: real binary refuses the invalid journal (\(label), exit 2)", r.exitCode == 2, r.tail)
+                release()
+            }
+            try writeJournal(state: "fixups", ready: true); hold()
+            check("H7.9 gate: the untampered ready journal is admitted again (validation is not over-broad)",
+                  !status().pending && status().servedByLiveMigration)
+            release()
             try? fm.removeItem(atPath: journalPath)
         }
 
         // ============================================================
+        // H8.4: every throwaway preferences domain this run created is gone
+        // — including the empty shell cfprefsd writes a few seconds after a
+        // removal (see TestPrefsDomains).
+        let leftoverDomains = TestPrefsDomains.finalSweep()
+        check("hygiene: no throwaway preferences domain survives the run",
+              leftoverDomains.isEmpty, leftoverDomains.joined(separator: ", "))
+
         print(failures == 0 ? "\nmigration selftest: all checks passed"
                             : "\nmigration selftest: \(failures) FAILED")
         if failures > 0 { throw ExitCode(1) }

@@ -37,7 +37,11 @@ struct SetupAPISelftest: AsyncParsableCommand {
             throw ExitCode(1)
         }
         SetupAPICore.defaults = suite
-        defer { suite.removePersistentDomain(forName: suiteName) }
+        defer {
+            suite.removePersistentDomain(forName: suiteName)
+            TestPrefsDomains.purge(suiteName)
+            TestPrefsDomains.finalSweep()   // incl. the empty plist shell cfprefsd writes later
+        }
 
         let watchdog = Task.detached {
             try? await Task.sleep(nanoseconds: 120_000_000_000)
