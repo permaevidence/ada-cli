@@ -166,11 +166,8 @@ actor EditToolStats {
 
     private func save() {
         guard let data = try? JSONEncoder().encode(counts) else { return }
-        try? FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? data.write(to: fileURL, options: .atomic)
+        try? PrivateStorage.ensureDirectory(fileURL.deletingLastPathComponent())
+        try? PrivateStorage.writeAtomically(data, to: fileURL)
     }
 
     /// Fire-and-forget from any isolation context.
@@ -225,11 +222,8 @@ actor BashJobsStats {
 
     private func save() {
         guard let data = try? JSONEncoder().encode(counts) else { return }
-        try? FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? data.write(to: fileURL, options: .atomic)
+        try? PrivateStorage.ensureDirectory(fileURL.deletingLastPathComponent())
+        try? PrivateStorage.writeAtomically(data, to: fileURL)
     }
 
     /// Fire-and-forget from any isolation context.

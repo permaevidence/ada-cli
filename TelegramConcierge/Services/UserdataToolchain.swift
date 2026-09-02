@@ -320,8 +320,7 @@ enum UserdataToolchain {
         // file would let a concurrent process recreate the path as a NEW
         // inode and "acquire" it while removal still runs on the old one
         // (Codex round 3 #3).
-        try? FileManager.default.createDirectory(at: root.deletingLastPathComponent(),
-                                                 withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectoryScoped(root.deletingLastPathComponent())
         let path = root.path + ".lock"
         let fd = open(path, O_WRONLY | O_CREAT, 0o600)
         guard fd >= 0 else {

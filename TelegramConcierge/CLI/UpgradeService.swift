@@ -432,7 +432,7 @@ enum UpgradeService {
     static func writeRestartMarker(version: String, kind: RestartKind = .upgrade) {
         let marker = RestartMarker(version: version, at: Date(), kind: kind)
         if let data = try? JSONEncoder().encode(marker) {
-            try? data.write(to: restartMarkerURL, options: .atomic)
+            try? PrivateStorage.writeAtomically(data, to: restartMarkerURL)
         }
     }
 

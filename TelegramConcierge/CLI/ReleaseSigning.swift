@@ -395,8 +395,7 @@ enum ReleaseTrustStore {
     /// exclusive for writers). flock is advisory and dies with the process,
     /// so a crashed writer can never wedge later checks.
     private static func withLock<T>(exclusive: Bool, _ body: () throws -> T) throws -> T {
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try PrivateStorage.ensureDirectoryScoped(fileURL.deletingLastPathComponent())
         let fd = open(lockURL.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         guard fd >= 0 else {
             throw LockError(message: "cannot open \(lockURL.path): \(String(cString: strerror(errno)))")
@@ -449,7 +448,7 @@ enum ReleaseTrustStore {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             let data = try encoder.encode(state)
-            try data.write(to: fileURL, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: fileURL)
             return merged
         }
     }

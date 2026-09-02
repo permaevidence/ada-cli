@@ -97,7 +97,7 @@ actor MaintenanceAlertCenter {
 
     private let storeURL: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("maintenance_alerts.json")
     }()
 
@@ -240,7 +240,7 @@ actor MaintenanceAlertCenter {
 
     private func save() {
         if let data = try? JSONEncoder().encode(store) {
-            try? data.write(to: storeURL)
+            try? PrivateStorage.writeAtomically(data, to: storeURL)
         }
     }
 
@@ -551,13 +551,13 @@ actor ConversationArchiveService {
     
     private let appFolder: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder
     }()
     
     private var archiveFolder: URL {
         let dir = appFolder.appendingPathComponent("archive", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(dir)
         return dir
     }
 
@@ -659,7 +659,7 @@ actor ConversationArchiveService {
                     let data = try Data(contentsOf: fileURL)
                     let messages = sanitizeMessagesForArchive(try JSONDecoder().decode([Message].self, from: data))
                     let sanitizedData = try JSONEncoder().encode(messages)
-                    try sanitizedData.write(to: fileURL)
+                    try PrivateStorage.writeAtomically(sanitizedData, to: fileURL)
                     await writeSidecar(forRawFileName: pending.rawContentFileName, messages: messages)
                     let tokenCount = messages.reduce(0) { $0 + estimateTokens(for: $1) }
 
@@ -851,7 +851,7 @@ actor ConversationArchiveService {
         let fileName = "\(chunkId.uuidString).json"
         let fileURL = archiveFolder.appendingPathComponent(fileName)
         let data = try JSONEncoder().encode(archivedMessages)
-        try data.write(to: fileURL)
+        try PrivateStorage.writeAtomically(data, to: fileURL)
 
         // Create pending chunk record (so we can recover if app crashes during summarization)
         let pending = PendingChunk(
@@ -1286,7 +1286,7 @@ actor ConversationArchiveService {
         // Save consolidated raw content only after summary generation succeeds.
         // If the model call fails, retries should not leave orphan archive files.
         let data = try JSONEncoder().encode(allMessages)
-        try data.write(to: fileURL)
+        try PrivateStorage.writeAtomically(data, to: fileURL)
 
         // Remove temporary chunks and their files
         for chunk in chunks {
@@ -2417,7 +2417,7 @@ actor ConversationArchiveService {
             }
 
             let sanitizedData = try JSONEncoder().encode(sanitizedMessages)
-            try sanitizedData.write(to: fileURL)
+            try PrivateStorage.writeAtomically(sanitizedData, to: fileURL)
             // Sync context — can't render the async plaintext here, so drop
             // the now-stale sidecar; backfillSidecars() regenerates it.
             removeSidecar(forRawFileName: fileName)
@@ -2546,7 +2546,7 @@ actor ConversationArchiveService {
         header += " ===\n\n"
         let text = header + (await formatMessagesForSearch(messages))
         do {
-            try text.data(using: .utf8)?.write(to: sidecarURL(forRawFileName: fileName))
+            try PrivateStorage.writeAtomically(Data(text.utf8), to: sidecarURL(forRawFileName: fileName))
         } catch {
             print("[ArchiveService] Failed to write sidecar for \(fileName): \(error)")
         }
@@ -2755,7 +2755,7 @@ actor ConversationArchiveService {
     private func saveIndex() {
         do {
             let data = try JSONEncoder().encode(chunkIndex)
-            try data.write(to: indexFileURL)
+            try PrivateStorage.writeAtomically(data, to: indexFileURL)
         } catch {
             print("[ArchiveService] Failed to save index: \(error)")
         }
@@ -2777,7 +2777,7 @@ actor ConversationArchiveService {
     private func savePendingIndex() {
         do {
             let data = try JSONEncoder().encode(pendingIndex)
-            try data.write(to: pendingIndexFileURL)
+            try PrivateStorage.writeAtomically(data, to: pendingIndexFileURL)
         } catch {
             print("[ArchiveService] Failed to save pending index: \(error)")
         }
@@ -2799,7 +2799,7 @@ actor ConversationArchiveService {
     private func savePendingExtractions() {
         do {
             let data = try JSONEncoder().encode(pendingExtractions)
-            try data.write(to: pendingExtractionsFileURL)
+            try PrivateStorage.writeAtomically(data, to: pendingExtractionsFileURL)
         } catch {
             print("[ArchiveService] Failed to save pending extractions: \(error)")
         }
@@ -2821,7 +2821,7 @@ actor ConversationArchiveService {
     private func savePendingMetaIndex() {
         do {
             let data = try JSONEncoder().encode(pendingMetaIndex)
-            try data.write(to: pendingMetaIndexFileURL)
+            try PrivateStorage.writeAtomically(data, to: pendingMetaIndexFileURL)
         } catch {
             print("[ArchiveService] Failed to save pending meta-summary index: \(error)")
         }

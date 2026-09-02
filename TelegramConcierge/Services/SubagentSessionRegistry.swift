@@ -254,7 +254,7 @@ actor SubagentSessionRegistry {
     private static func persistenceDirectory() -> URL {
         let url = StoragePaths.dataRoot
             .appendingPathComponent(Self.persistenceDirName, isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(url)
         return url
     }
 
@@ -274,7 +274,7 @@ actor SubagentSessionRegistry {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
             let data = try encoder.encode(session)
-            try data.write(to: url, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: url)
             return true
         } catch {
             print("[SubagentSessionRegistry] Failed to persist session \(session.id): \(error)")

@@ -64,11 +64,7 @@ enum TriggerSpool {
     }
 
     private static func ensureDirectory() throws {
-        try FileManager.default.createDirectory(
-            at: directoryURL,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        try PrivateStorage.ensureDirectory(directoryURL)
     }
 
     private static func makeEncoder() -> JSONEncoder {
@@ -174,7 +170,7 @@ enum TriggerSpool {
             let millis = Int(Date().timeIntervalSince1970 * 1000)
             let finalURL = directoryURL.appendingPathComponent("\(millis)_\(watcherId.uuidString)_\(UUID().uuidString).json")
             let tempURL = directoryURL.appendingPathComponent(".tmp-\(UUID().uuidString)")
-            try data.write(to: tempURL)
+            try PrivateStorage.writeAtomically(data, to: tempURL)
             try FileManager.default.moveItem(at: tempURL, to: finalURL)
             return .spooled(finalURL)
         }
@@ -192,7 +188,7 @@ enum TriggerSpool {
         if next == 0 {
             try? FileManager.default.removeItem(at: url)
         } else {
-            try? Data("\(next)".utf8).write(to: url, options: .atomic)
+            try? PrivateStorage.writeAtomically(Data("\(next)".utf8), to: url)
         }
     }
 

@@ -727,7 +727,7 @@ class ConversationManager: ObservableObject {
         }
         let fileName = uniqueFileName("ada-\(UUID().uuidString.prefix(8)).\(ext)", in: imagesDirectory)
         do {
-            try data.write(to: imagesDirectory.appendingPathComponent(fileName))
+            try PrivateStorage.writeAtomically(data, to: imagesDirectory.appendingPathComponent(fileName))
         } catch {
             print("[ConversationManager] Failed to persist app-channel photo: \(error)")
             return
@@ -747,7 +747,7 @@ class ConversationManager: ObservableObject {
     private func appendAppChannelDocument(data: Data, filename: String, caption: String?) async {
         let safeName = uniqueFileName(URL(fileURLWithPath: filename).lastPathComponent, in: documentsDirectory)
         do {
-            try data.write(to: documentsDirectory.appendingPathComponent(safeName))
+            try PrivateStorage.writeAtomically(data, to: documentsDirectory.appendingPathComponent(safeName))
         } catch {
             print("[ConversationManager] Failed to persist app-channel document: \(error)")
             return
@@ -980,7 +980,7 @@ class ConversationManager: ObservableObject {
 
     private let appFolder: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder
     }()
     
@@ -1043,19 +1043,19 @@ class ConversationManager: ObservableObject {
     
     private var imagesDirectory: URL {
         let dir = appFolder.appendingPathComponent("images", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(dir)
         return dir
     }
     
     var documentsDirectory: URL {
         let dir = appFolder.appendingPathComponent("documents", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(dir)
         return dir
     }
 
     private var toolAttachmentsDirectory: URL {
         let dir = appFolder.appendingPathComponent("tool_attachments", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(dir)
         return dir
     }
     
@@ -1765,7 +1765,7 @@ class ConversationManager: ObservableObject {
                     let imageData = try await telegramService.downloadPhoto(fileId: largestPhoto.fileId)
                     let fileName = "ref_\(UUID().uuidString.prefix(8)).jpg"
                     let fileURL = imagesDirectory.appendingPathComponent(fileName)
-                    try imageData.write(to: fileURL)
+                    try PrivateStorage.writeAtomically(imageData, to: fileURL)
                     
                     pendingReferencedImages.append((fileName: fileName, fileSize: imageData.count))
                     print("[ConversationManager] Buffered referenced image: \(fileName) (\(imageData.count) bytes)")
@@ -1787,7 +1787,7 @@ class ConversationManager: ObservableObject {
                         let ext = URL(fileURLWithPath: originalName).pathExtension
                         let fileName = "ref_\(UUID().uuidString.prefix(8)).\(ext.isEmpty ? "bin" : ext)"
                         let fileURL = documentsDirectory.appendingPathComponent(fileName)
-                        try documentData.write(to: fileURL)
+                        try PrivateStorage.writeAtomically(documentData, to: fileURL)
 
                         pendingReferencedDocuments.append((fileName: fileName, fileSize: documentData.count))
                         print("[ConversationManager] Buffered referenced document: \(fileName) (\(originalName), \(documentData.count) bytes)")
@@ -1821,7 +1821,7 @@ class ConversationManager: ObservableObject {
                         }
                         let fileName = "ref_\(UUID().uuidString.prefix(8)).\(ext)"
                         let fileURL = documentsDirectory.appendingPathComponent(fileName)
-                        try videoData.write(to: fileURL)
+                        try PrivateStorage.writeAtomically(videoData, to: fileURL)
 
                         pendingReferencedDocuments.append((fileName: fileName, fileSize: videoData.count))
                         print("[ConversationManager] Buffered referenced video: \(fileName) (\(videoData.count) bytes)")
@@ -1850,11 +1850,11 @@ class ConversationManager: ObservableObject {
                 
                 let fileName = "\(UUID().uuidString.prefix(8)).jpg"
                 let fileURL = imagesDirectory.appendingPathComponent(fileName)
-                try imageData.write(to: fileURL)
+                try PrivateStorage.writeAtomically(imageData, to: fileURL)
                 
                 // Also save to documents directory for email attachments
                 let documentsFileURL = documentsDirectory.appendingPathComponent(fileName)
-                try imageData.write(to: documentsFileURL)
+                try PrivateStorage.writeAtomically(imageData, to: documentsFileURL)
                 
                 pendingImages.append((fileName: fileName, fileSize: imageData.count))
                 print("[ConversationManager] Buffered image: \(fileName) (\(imageData.count) bytes)")
@@ -1944,7 +1944,7 @@ class ConversationManager: ObservableObject {
                     let ext = URL(fileURLWithPath: originalName).pathExtension
                     let fileName = "\(UUID().uuidString.prefix(8)).\(ext.isEmpty ? "bin" : ext)"
                     let fileURL = documentsDirectory.appendingPathComponent(fileName)
-                    try documentData.write(to: fileURL)
+                    try PrivateStorage.writeAtomically(documentData, to: fileURL)
 
                     pendingDocuments.append((fileName: fileName, fileSize: documentData.count))
                     print("[ConversationManager] Buffered document: \(fileName) (\(originalName), \(documentData.count) bytes)")
@@ -1989,7 +1989,7 @@ class ConversationManager: ObservableObject {
 
                     let fileName = video.fileName ?? "\(UUID().uuidString.prefix(8)).\(ext)"
                     let fileURL = documentsDirectory.appendingPathComponent(fileName)
-                    try videoData.write(to: fileURL)
+                    try PrivateStorage.writeAtomically(videoData, to: fileURL)
 
                     pendingDocuments.append((fileName: fileName, fileSize: videoData.count))
                     print("[ConversationManager] Buffered video: \(fileName) (\(videoData.count) bytes, \(video.duration)s, \(video.width)x\(video.height))")
@@ -2105,10 +2105,10 @@ class ConversationManager: ObservableObject {
                     let imageData = try Data(contentsOf: spoolURL)
                     let ext = spoolURL.pathExtension.isEmpty ? "jpg" : spoolURL.pathExtension
                     let fileName = "\(UUID().uuidString.prefix(8)).\(ext)"
-                    try imageData.write(to: imagesDirectory.appendingPathComponent(fileName))
+                    try PrivateStorage.writeAtomically(imageData, to: imagesDirectory.appendingPathComponent(fileName))
                     // Mirror the Telegram path: also keep a copy with the documents
                     // so the file can ride along as an email attachment.
-                    try? imageData.write(to: documentsDirectory.appendingPathComponent(fileName))
+                    try? PrivateStorage.writeAtomically(imageData, to: documentsDirectory.appendingPathComponent(fileName))
                     pendingImages.append((fileName: fileName, fileSize: imageData.count))
                     print("[ConversationManager] Buffered WhatsApp image: \(fileName) (\(imageData.count) bytes)")
                 } catch {
@@ -2167,7 +2167,7 @@ class ConversationManager: ObservableObject {
                         ? (spoolURL.pathExtension.isEmpty ? "bin" : spoolURL.pathExtension)
                         : URL(fileURLWithPath: media.filename).pathExtension
                     let fileName = "\(UUID().uuidString.prefix(8)).\(ext)"
-                    try documentData.write(to: documentsDirectory.appendingPathComponent(fileName))
+                    try PrivateStorage.writeAtomically(documentData, to: documentsDirectory.appendingPathComponent(fileName))
                     pendingDocuments.append((fileName: fileName, fileSize: documentData.count))
                     print("[ConversationManager] Buffered WhatsApp \(media.kind): \(fileName) (\(media.filename), \(documentData.count) bytes)")
                 } catch {
@@ -2449,7 +2449,7 @@ class ConversationManager: ObservableObject {
         }
         do {
             let data = try JSONEncoder().encode(pendingMidTurnMessages)
-            try data.write(to: pendingMidTurnFileURL, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: pendingMidTurnFileURL)
             return true
         } catch {
             print("[ConversationManager] FAILED to mirror mid-turn queue to disk: \(error)")
@@ -2466,7 +2466,7 @@ class ConversationManager: ObservableObject {
         }
         do {
             let data = try JSONEncoder().encode(pendingAmbientTriggers)
-            try data.write(to: pendingAmbientFileURL, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: pendingAmbientFileURL)
             return true
         } catch {
             print("[ConversationManager] FAILED to mirror ambient-trigger queue to disk: \(error)")
@@ -2586,7 +2586,7 @@ class ConversationManager: ObservableObject {
         }
         do {
             let data = try JSONEncoder().encode(state)
-            try data.write(to: pendingAttachmentsFileURL, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: pendingAttachmentsFileURL)
             return true
         } catch {
             print("[ConversationManager] FAILED to mirror pending attachment buffers to disk: \(error)")
@@ -2654,7 +2654,7 @@ class ConversationManager: ObservableObject {
         let marker = ActiveTurnMarker(triggerMessageId: message.id, startedAt: Date())
         do {
             let data = try JSONEncoder().encode(marker)
-            try data.write(to: activeTurnMarkerFileURL, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: activeTurnMarkerFileURL)
             return true
         } catch {
             print("[ConversationManager] FAILED to write active-turn marker: \(error)")
@@ -9020,7 +9020,7 @@ class ConversationManager: ObservableObject {
             let data = try JSONEncoder().encode(messages)
             // Atomic so a Mind export copying this file mid-save can never
             // capture a torn JSON.
-            try data.write(to: conversationFileURL, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: conversationFileURL)
             return true
         } catch {
             print("Failed to save conversation: \(error)")
@@ -9039,7 +9039,7 @@ class ConversationManager: ObservableObject {
         }
         do {
             let data = try JSONEncoder().encode(interactions)
-            try data.write(to: turnSalvageFileURL, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: turnSalvageFileURL)
         } catch {
             print("[ConversationManager] Failed to persist turn salvage: \(error)")
         }
@@ -9122,7 +9122,7 @@ class ConversationManager: ObservableObject {
                 updatedAt: Date()
             )
             let data = try JSONEncoder().encode(snapshot)
-            try data.write(to: contextUsageFileURL)
+            try PrivateStorage.writeAtomically(data, to: contextUsageFileURL)
         } catch {
             print("Failed to save context usage snapshot: \(error)")
         }
@@ -9139,9 +9139,9 @@ class ConversationManager: ObservableObject {
         
         // Also clear images
         try? FileManager.default.removeItem(at: imagesDirectory)
-        try? FileManager.default.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(imagesDirectory)
         try? FileManager.default.removeItem(at: toolAttachmentsDirectory)
-        try? FileManager.default.createDirectory(at: toolAttachmentsDirectory, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(toolAttachmentsDirectory)
     }
     
     /// Delete all memory: conversation, chunks, summaries, user context,
@@ -9175,7 +9175,7 @@ class ConversationManager: ObservableObject {
         var failures: [String] = []
         func removeAndRecreate(_ dir: URL, label: String) {
             if let failure = UserDataWipe.remove(dir.path, label: label) { failures.append(failure) }
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? PrivateStorage.ensureDirectory(dir)
         }
         func deleteSecret(_ key: String, label: String) {
             do { try KeychainHelper.delete(key: key) }
@@ -9776,7 +9776,7 @@ class ConversationManager: ObservableObject {
     private func setPendingContinuation(_ text: String?) {
         pendingContinuationText = text
         if let text, !text.isEmpty {
-            try? Data(text.utf8).write(to: pendingContinuationFileURL)
+            try? PrivateStorage.writeAtomically(Data(text.utf8), to: pendingContinuationFileURL)
         } else {
             try? FileManager.default.removeItem(at: pendingContinuationFileURL)
         }

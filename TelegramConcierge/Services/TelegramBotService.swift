@@ -92,7 +92,7 @@ actor TelegramBotService {
         let state = OffsetState(lastUpdateId: lastUpdateId, lastUpdateAt: lastUpdateAt,
                                 tokenHash: currentTokenHash)
         if let data = try? JSONEncoder().encode(state) {
-            try? data.write(to: offsetStateURL, options: .atomic)
+            try? PrivateStorage.writeAtomically(data, to: offsetStateURL)
         }
     }
 

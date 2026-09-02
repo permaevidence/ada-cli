@@ -73,9 +73,7 @@ actor TodoStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(todos) {
-            let tmp = storeURL.appendingPathExtension("tmp")
-            try? data.write(to: tmp, options: .atomic)
-            _ = try? FileManager.default.replaceItemAt(storeURL, withItemAt: tmp)
+            try? PrivateStorage.writeAtomically(data, to: storeURL)
         }
     }
 

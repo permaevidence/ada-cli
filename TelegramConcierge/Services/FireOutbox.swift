@@ -220,13 +220,9 @@ enum FireOutbox {
     @discardableResult
     static func persist(_ record: FireRecord) -> Bool {
         do {
-            try FileManager.default.createDirectory(
-                at: directoryURL,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
+            try PrivateStorage.ensureDirectory(directoryURL)
             let data = try makeEncoder().encode(record)
-            try data.write(to: url(for: record.id), options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: url(for: record.id))
             return true
         } catch {
             print("[FireOutbox] FAILED to persist fire record \(record.id): \(error)")

@@ -43,13 +43,13 @@ actor ReminderService {
 
     private let remindersFileURL: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("reminders.json")
     }()
 
     private let scriptsDirectoryURL: URL = {
         let folder = StoragePaths.dataRoot.appendingPathComponent("reminder-scripts", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder
     }()
 
@@ -57,13 +57,13 @@ actor ReminderService {
     /// seen-state files. Created eagerly so scripts can `touch` files in it.
     private let scriptStateDirectoryURL: URL = {
         let folder = StoragePaths.dataRoot.appendingPathComponent("reminder-scripts/state", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder
     }()
 
     private let noticesFileURL: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("reminder-notices.json")
     }()
 
@@ -110,8 +110,7 @@ actor ReminderService {
         let id = UUID()
         let fileURL = scriptsDirectoryURL.appendingPathComponent("\(id.uuidString).sh")
         do {
-            try scriptSource.write(to: fileURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fileURL.path)
+            try PrivateStorage.writeAtomically(Data(scriptSource.utf8), to: fileURL, mode: 0o700)
         } catch {
             throw ScriptValidationError(message: "Failed to store script: \(error.localizedDescription)")
         }
@@ -1014,7 +1013,7 @@ actor ReminderService {
             return
         }
         if let data = try? JSONEncoder().encode(creationNotices) {
-            try? data.write(to: noticesFileURL, options: .atomic)
+            try? PrivateStorage.writeAtomically(data, to: noticesFileURL)
         }
     }
 
@@ -1069,6 +1068,6 @@ actor ReminderService {
         // to validate watcher ids — a torn in-place write would make it
         // spuriously reject valid triggers (and a crash mid-write could
         // corrupt the whole store).
-        try data.write(to: remindersFileURL, options: .atomic)
+        try PrivateStorage.writeAtomically(data, to: remindersFileURL)
     }
 }

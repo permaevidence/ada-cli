@@ -57,10 +57,7 @@ enum AgentTurnOverrides {
     /// Overwrite the full map on disk. Settings UI calls this after each edit.
     static func save(_ overrides: [String: Int]) throws {
         let url = overridesURL()
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
 
         var clean: [String: Int] = [:]
         for (agent, value) in overrides {
@@ -72,7 +69,7 @@ enum AgentTurnOverrides {
             withJSONObject: clean,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try data.write(to: url, options: .atomic)
+        try PrivateStorage.writeAtomically(data, to: url)
 
         cacheLock.lock()
         cachedOverrides = clean

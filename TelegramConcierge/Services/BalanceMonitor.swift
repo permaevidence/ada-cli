@@ -91,7 +91,7 @@ actor BalanceMonitor {
 
     private let storeURL: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("balance_monitor.json")
     }()
 
@@ -104,7 +104,7 @@ actor BalanceMonitor {
 
     private func save() {
         if let data = try? JSONEncoder().encode(store) {
-            try? data.write(to: storeURL, options: .atomic)
+            try? PrivateStorage.writeAtomically(data, to: storeURL)
         }
     }
 

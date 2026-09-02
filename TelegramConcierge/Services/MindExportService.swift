@@ -17,7 +17,7 @@ actor MindExportService {
     /// Base app folder
     private let appFolder: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder
     }()
 
@@ -31,7 +31,7 @@ actor MindExportService {
     /// path already handles that.
     private let homeFolder: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder
     }()
     
@@ -258,7 +258,7 @@ actor MindExportService {
         let destination = destinationDir.appendingPathComponent(fileName)
         try? FileManager.default.removeItem(at: destination)
         guard FileManager.default.fileExists(atPath: source.path) else { return }
-        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        try PrivateStorage.ensureDirectory(destinationDir)
         try FileManager.default.copyItem(at: source, to: destination)
     }
 
@@ -266,11 +266,11 @@ actor MindExportService {
         let source = tempDir.appendingPathComponent(folderName, isDirectory: true)
         let destination = destinationDir.appendingPathComponent(folderName, isDirectory: true)
         try? FileManager.default.removeItem(at: destination)
-        try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        try PrivateStorage.ensureDirectory(destinationDir)
         if FileManager.default.fileExists(atPath: source.path) {
             try FileManager.default.copyItem(at: source, to: destination)
         } else {
-            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            try PrivateStorage.ensureDirectoryScoped(destination)
         }
     }
     

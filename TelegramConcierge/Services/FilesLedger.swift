@@ -30,7 +30,7 @@ actor FilesLedger {
 
     private static let ledgerURL: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("files_ledger.json")
     }()
 
@@ -141,16 +141,9 @@ actor FilesLedger {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let sorted = entries.values.sorted { $0.last_touched > $1.last_touched }
         guard let data = try? encoder.encode(sorted) else { return }
-        // Atomic write: stage to a tmp file in the same directory then rename.
-        let tmp = Self.ledgerURL.deletingLastPathComponent()
-            .appendingPathComponent("files_ledger.json.tmp")
+        // Atomic write: exclusive temp in the same directory, then rename.
         do {
-            try data.write(to: tmp, options: .atomic)
-            if FileManager.default.fileExists(atPath: Self.ledgerURL.path) {
-                _ = try? FileManager.default.replaceItemAt(Self.ledgerURL, withItemAt: tmp)
-            } else {
-                try FileManager.default.moveItem(at: tmp, to: Self.ledgerURL)
-            }
+            try PrivateStorage.writeAtomically(data, to: Self.ledgerURL)
         } catch {
             print("[FilesLedger] save failed: \(error)")
         }

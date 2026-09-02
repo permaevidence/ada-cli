@@ -79,11 +79,8 @@ enum SubagentSerializer {
             maxTurns: maxTurns
         )
         let url = fileURL(forName: name)
-        try FileManager.default.createDirectory(
-            at: agentsDirectory(),
-            withIntermediateDirectories: true
-        )
-        try content.data(using: .utf8)?.write(to: url, options: .atomic)
+        try PrivateStorage.ensureDirectory(agentsDirectory())
+        try PrivateStorage.writeAtomically(Data(content.utf8), to: url)
     }
 
     /// Delete a user-defined subagent file by its name.

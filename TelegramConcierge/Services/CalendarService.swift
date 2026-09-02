@@ -10,7 +10,7 @@ actor CalendarService {
     
     private let calendarFileURL: URL = {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("calendar.json")
     }()
     
@@ -376,7 +376,7 @@ actor CalendarService {
         encoder.outputFormatting = .prettyPrinted
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(events)
-        try data.write(to: calendarFileURL, options: [.atomic])
+        try PrivateStorage.writeAtomically(data, to: calendarFileURL)
         invalidateCache()
     }
     
