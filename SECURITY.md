@@ -56,6 +56,23 @@ whatever the agent can. Before v0.2.5, two places kept activity metadata at
 weaker-than-data permissions — the migration engine's `preimages/` and
 `parked/` listings and the web-pipeline log; both are owner-only now.
 
+## Browser automation (Playwright)
+
+The `playwright` MCP server that Briglia registers for the Browse subagent is
+installed from a lockfile committed with the source
+(`Resources/MCPBundles/playwright/package-lock.json`: exact versions and
+SHA-512 integrity hashes for every package, no install scripts). Each version
+is installed once, with `npm ci --ignore-scripts`, into an immutable
+`~/.local/share/briglia/mcp/playwright-<lockfile hash>/` directory, verified
+(marker, executable, MCP handshake) before `mcp.json` is switched to it in one
+atomic write, and reused on every later start without contacting the
+registry. Before v0.2.6 the entry was `npx @playwright/mcp@latest`, which
+re-resolved and ran whatever the registry served on every start. Playwright is
+updated only by a release that bumps the lockfile; `briglia doctor` reports the
+referenced version, unreferenced ones (never deleted automatically) and the
+last bootstrap outcome. The browser itself is still downloaded by Playwright's
+own installer on first use. Entries you edit by hand are left alone.
+
 ## Self-tests and release builds
 
 Release binaries refuse the internal migration-run entry point that the
