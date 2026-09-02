@@ -1668,8 +1668,15 @@ class ConversationManager: ObservableObject {
             return
         }
         
-        // Only process messages from the paired chat
-        guard telegramMessage.chat.id == pairedChatId else {
+        // Only process messages from the paired private chat, sent by the
+        // paired user (TelegramPairing.acceptsPolledMessage: chat id, chat
+        // type "private" and sender id must all match; fail closed).
+        guard TelegramPairing.acceptsPolledMessage(
+            chatId: telegramMessage.chat.id,
+            chatType: telegramMessage.chat.type,
+            fromId: telegramMessage.from?.id,
+            pairedChatId: pairedChatId
+        ) else {
             return
         }
         

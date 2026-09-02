@@ -927,8 +927,17 @@ struct SetupWizard {
                 print("  A value is required.")
                 continue
             }
-            if Int64(chatId) != nil { break }
-            print("  ✖ A Telegram chat ID is a number (e.g. 164130…). Letters mean it's a username — use @userinfobot.")
+            switch TelegramPairing.parseChatId(chatId) {
+            case .success:
+                break
+            case .failure(.notNumeric):
+                print("  ✖ A Telegram chat ID is a number (e.g. 164130…). Letters mean it's a username — use @userinfobot.")
+                continue
+            case .failure(.notPrivate):
+                print("  ✖ \(TelegramPairing.privateChatExplanation)")
+                continue
+            }
+            break
         }
         save(KeychainHelper.telegramBotTokenKey, token)
         save(KeychainHelper.telegramChatIdKey, chatId)

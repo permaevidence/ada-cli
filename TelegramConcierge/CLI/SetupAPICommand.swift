@@ -714,10 +714,16 @@ enum SetupAPICore {
         guard let chatId = nonEmptyString(section["chat_id"]) else {
             throw APIError(code: "missing_field", message: "telegram.chat_id is required")
         }
-        guard Int64(chatId) != nil else {
+        switch TelegramPairing.parseChatId(chatId) {
+        case .success:
+            break
+        case .failure(.notNumeric):
             throw APIError(code: "invalid_chat_id",
                            message: "chat_id must be numeric (letters mean it's a username — "
                            + "use @userinfobot to get the numeric ID)")
+        case .failure(.notPrivate):
+            throw APIError(code: "invalid_chat_id",
+                           message: TelegramPairing.privateChatExplanation)
         }
         do {
             try KeychainHelper.saveBatch([

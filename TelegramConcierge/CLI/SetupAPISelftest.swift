@@ -248,6 +248,34 @@ struct SetupAPISelftest: AsyncParsableCommand {
                 ["telegram": ["token": "123:abc", "chat_id": "@sofia"]])
             check("apply telegram: non-numeric chat_id → invalid_chat_id",
                   errorCode(badChat) == "invalid_chat_id")
+            let groupChat = await SetupAPICore.apply(
+                ["telegram": ["token": "123:abc", "chat_id": "-1001234567890"]])
+            check("apply telegram: negative (group) chat_id → invalid_chat_id naming private chats",
+                  errorCode(groupChat) == "invalid_chat_id"
+                  && ((groupChat["error"] as? [String: Any])?["message"] as? String ?? "").contains("private"))
+            let zeroChat = await SetupAPICore.apply(
+                ["telegram": ["token": "123:abc", "chat_id": "0"]])
+            check("apply telegram: zero chat_id → invalid_chat_id", errorCode(zeroChat) == "invalid_chat_id")
+
+            // TelegramPairing units: the parser both setup paths share, and the poll gate.
+            check("pairing: positive id parses (whitespace tolerated)",
+                  TelegramPairing.parseChatId(" 5551234567 ") == .success(5551234567))
+            check("pairing: negative id → notPrivate",
+                  TelegramPairing.parseChatId("-100123") == .failure(.notPrivate))
+            check("pairing: zero → notPrivate", TelegramPairing.parseChatId("0") == .failure(.notPrivate))
+            check("pairing: username → notNumeric", TelegramPairing.parseChatId("@sofia") == .failure(.notNumeric))
+            check("poll gate: private chat from the paired user passes",
+                  TelegramPairing.acceptsPolledMessage(chatId: 5551234567, chatType: "private", fromId: 5551234567, pairedChatId: 5551234567))
+            check("poll gate: supergroup with a forged positive id fails",
+                  !TelegramPairing.acceptsPolledMessage(chatId: 5551234567, chatType: "supergroup", fromId: 5551234567, pairedChatId: 5551234567))
+            check("poll gate: message without a sender fails",
+                  !TelegramPairing.acceptsPolledMessage(chatId: 5551234567, chatType: "private", fromId: nil, pairedChatId: 5551234567))
+            check("poll gate: another sender in the paired chat fails",
+                  !TelegramPairing.acceptsPolledMessage(chatId: 5551234567, chatType: "private", fromId: 5551234568, pairedChatId: 5551234567))
+            check("poll gate: different chat fails",
+                  !TelegramPairing.acceptsPolledMessage(chatId: 5551234568, chatType: "private", fromId: 5551234567, pairedChatId: 5551234567))
+            check("poll gate: unpaired instance accepts nothing",
+                  !TelegramPairing.acceptsPolledMessage(chatId: 5551234567, chatType: "private", fromId: 5551234567, pairedChatId: nil))
             let badBackend = await SetupAPICore.apply(["web_search_backend": "bing"])
             check("apply: unknown web_search_backend → invalid_value",
                   errorCode(badBackend) == "invalid_value")
