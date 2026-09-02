@@ -36,9 +36,8 @@ extension PrivateStorage {
                              to: destination.appendingPathComponent(name), depth: depth + 1)
             }
         case S_IFREG:
-            let data = try Data(contentsOf: source)
             let mode: mode_t = (perm & 0o700) | 0o600
-            try writeAtomically(data, to: destination, mode: mode)
+            try copyFileAtomically(from: source, to: destination, mode: mode)
         case S_IFLNK:
             if classify(destination.path) == .harnessState {
                 throw StorageError(description: "refusing to restore a symlink at harness-owned path \(destination.path)")
@@ -57,6 +56,70 @@ extension PrivateStorage {
         default:
             throw StorageError(description: "refusing to restore \(source.path): not a regular file, directory or symlink")
         }
+    }
+
+    /// Test seam (selftests only): fail the copy after this many bytes have
+    /// been written, to prove the temp is removed and the destination is
+    /// left as it was.
+    nonisolated(unsafe) static var copyFaultAfterBytes: Int? = nil
+
+    /// Streams `source` (a regular file, never followed if a link) into
+    /// `destination` privately and atomically: same-directory exclusive
+    /// `0600` temp, bounded chunks through descriptors (a multi-gigabyte
+    /// attachment never sits in memory), final mode applied to the temp,
+    /// `fsync`, `rename`, parent-directory `fsync`. On any failure the temp
+    /// is unlinked and the destination is untouched.
+    static func copyFileAtomically(from source: URL, to destination: URL, mode: mode_t) throws {
+        let src = open(source.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard src >= 0 else {
+            throw StorageError(description: "cannot open \(source.path): \(String(cString: strerror(errno)))")
+        }
+        defer { close(src) }
+        let destURL = destination.standardizedFileURL
+        let dir = destURL.deletingLastPathComponent()
+        let tmp = dir.appendingPathComponent(".\(destURL.lastPathComponent).tmp-\(UUID().uuidString)")
+        let dst = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard dst >= 0 else {
+            throw StorageError(description: "could not create \(tmp.path) exclusively: \(String(cString: strerror(errno)))")
+        }
+        func fail(_ why: String) -> StorageError {
+            close(dst)
+            unlink(tmp.path)
+            return StorageError(description: "could not copy \(source.path) to \(destURL.path): \(why)")
+        }
+        let chunk = 1 << 20
+        var buffer = [UInt8](repeating: 0, count: chunk)
+        var copied = 0
+        while true {
+            let n = buffer.withUnsafeMutableBytes { read(src, $0.baseAddress, chunk) }
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw fail("read failed: \(String(cString: strerror(errno)))")
+            }
+            if n == 0 { break }
+            var offset = 0
+            while offset < n {
+                let w = buffer.withUnsafeBytes { write(dst, $0.baseAddress! + offset, n - offset) }
+                if w < 0 {
+                    if errno == EINTR { continue }
+                    throw fail("write failed: \(String(cString: strerror(errno)))")
+                }
+                offset += w
+            }
+            copied += n
+            if let limit = copyFaultAfterBytes, copied >= limit {
+                throw fail("injected fault after \(copied) bytes")
+            }
+        }
+        if fchmod(dst, mode) != 0 { throw fail("could not set mode: \(String(cString: strerror(errno)))") }
+        if fsync(dst) != 0 { throw fail("fsync failed: \(String(cString: strerror(errno)))") }
+        close(dst)
+        guard rename(tmp.path, destURL.path) == 0 else {
+            let why = String(cString: strerror(errno))
+            unlink(tmp.path)
+            throw StorageError(description: "could not move \(tmp.lastPathComponent) into place at \(destURL.path): \(why)")
+        }
+        try fsyncDirectory(dir.path)
     }
 
     /// Entries under `root` (never following symlinks) that carry group/other

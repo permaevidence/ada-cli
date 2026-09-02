@@ -274,12 +274,31 @@ actor MindExportService {
     ]
 
     /// First entry of the staged payload that must not be restored: a
-    /// symlink whose destination classifies as harness-owned state, or any
-    /// object that is neither a regular file, a directory nor a symlink.
-    /// Symlinks inside user content (documents/, skills-like areas,
-    /// projects/) are allowed and recreated as links.
+    /// top-level file entry that is not a regular file, a top-level folder
+    /// entry that is not a real directory (a symlink, a dangling link, a
+    /// file where a directory belongs, or the reverse — applying it would
+    /// replace a valid current object with one the harness cannot use), a
+    /// symlink deeper in the tree whose destination classifies as
+    /// harness-owned state, or any object that is neither a regular file,
+    /// a directory nor a symlink. Symlinks inside user content (documents/,
+    /// projects/, …) are allowed and recreated as links. Presence is
+    /// checked with `lstat`, so a dangling link is seen, not treated as
+    /// absent.
     static func unsafeStagedEntry(in tempDir: URL, restoredInto dataRoot: URL) throws -> String? {
         let fm = FileManager.default
+        func kind(_ path: String) -> mode_t? {
+            var st = stat()
+            guard lstat(path, &st) == 0 else { return nil }
+            return st.st_mode & S_IFMT
+        }
+        for name in restoredFileNames {
+            guard let k = kind(tempDir.appendingPathComponent(name).path) else { continue }
+            if k != S_IFREG { return "\(name) must be a regular file" }
+        }
+        for name in restoredFolderNames {
+            guard let k = kind(tempDir.appendingPathComponent(name).path) else { continue }
+            if k != S_IFDIR { return "\(name) must be a directory" }
+        }
         func visit(_ source: URL, _ destination: URL, depth: Int) throws -> String? {
             guard depth < 64 else { return "\(source.path): tree too deep" }
             var st = stat()
@@ -305,9 +324,9 @@ actor MindExportService {
                 return "\(destination.lastPathComponent) is not a regular file, directory or symlink"
             }
         }
-        for name in restoredFileNames + restoredFolderNames {
+        for name in restoredFolderNames {
             let source = tempDir.appendingPathComponent(name)
-            guard fm.fileExists(atPath: source.path) || (try? fm.attributesOfItem(atPath: source.path)) != nil else { continue }
+            guard kind(source.path) != nil else { continue }
             if let bad = try visit(source, dataRoot.appendingPathComponent(name), depth: 0) { return bad }
         }
         return nil

@@ -68,6 +68,14 @@ final class TerminalSession {
             throw ExitCode(1)
         }
         installSignalHandlers()
+        // Both roots must be usable directories before anything writes;
+        // a root that exists as something else is a hard startup error.
+        do {
+            try StoragePaths.ensureRootsChecked()
+        } catch {
+            print("✖ storage roots: \(error)")
+            throw ExitCode(1)
+        }
         // Private-by-default storage: every start strips group/other bits
         // from everything under the roots (projects/ and toolchain/
         // excluded), so files created by older versions or by hand end up

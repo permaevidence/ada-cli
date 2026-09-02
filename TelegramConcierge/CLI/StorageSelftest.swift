@@ -380,6 +380,67 @@ struct StorageSelftest: AsyncParsableCommand {
               && mode(bridgeDir.appendingPathComponent("package.json").path) == 0o600
               && contents(bridgeDir.appendingPathComponent("index.js").path) == "console.log(1)")
 
+        // MARK: 8. Streaming copy, mid-copy failure, non-directory roots
+        print("\n[8] streaming copy, mid-copy failure, non-directory roots")
+        do {
+            // A 64 MB sparse file: copying it must not need 64 MB of memory,
+            // and the copy must be byte-identical (holes read as zeros).
+            let bigSrc = tempRoot.appendingPathComponent("stage/documents/big.bin")
+            try fm.createDirectory(at: bigSrc.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let fd = open(bigSrc.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            let marker = Data("END-MARKER".utf8)
+            let size = 64 * 1024 * 1024
+            _ = lseek(fd, off_t(size - marker.count), SEEK_SET)
+            _ = marker.withUnsafeBytes { write(fd, $0.baseAddress, marker.count) }
+            close(fd)
+            let bigDst = dataRoot.appendingPathComponent("documents/big.bin")
+            let before = mach_or_rss()
+            try PrivateStorage.copyTree(from: bigSrc, to: bigDst)
+            let after = mach_or_rss()
+            var st = stat()
+            let sizeOK = stat(bigDst.path, &st) == 0 && Int(st.st_size) == size
+            let tailFD = open(bigDst.path, O_RDONLY)
+            var tail = [UInt8](repeating: 0, count: marker.count)
+            _ = lseek(tailFD, off_t(size - marker.count), SEEK_SET)
+            let n = tail.withUnsafeMutableBytes { read(tailFD, $0.baseAddress, marker.count) }
+            close(tailFD)
+            check("8.1 64 MB sparse file streamed to a byte-identical 0600 copy",
+                  sizeOK && n == marker.count && Data(tail) == marker && mode(bigDst.path) == 0o600,
+                  "sizeOK=\(sizeOK) n=\(n) mode=\(octal(mode(bigDst.path)))")
+            check("8.2 resident memory did not grow by the file size (streamed, not buffered)",
+                  after - before < 32 * 1024 * 1024, "grew by \(after - before) bytes")
+            // Injected mid-copy failure: temp removed, destination untouched.
+            try plant(bigDst.path, "PREVIOUS", 0o600)
+            PrivateStorage.copyFaultAfterBytes = 1 << 20
+            var failed = false
+            var message = ""
+            do { try PrivateStorage.copyTree(from: bigSrc, to: bigDst) } catch { failed = true; message = "\(error)" }
+            PrivateStorage.copyFaultAfterBytes = nil
+            let temps = (try? fm.contentsOfDirectory(atPath: bigDst.deletingLastPathComponent().path))?.filter { $0.contains(".tmp-") } ?? []
+            check("8.3 mid-copy failure surfaces as an error", failed && message.contains("injected"), message)
+            check("8.4 mid-copy failure leaves the destination as it was and no temp behind",
+                  contents(bigDst.path) == "PREVIOUS" && temps.isEmpty, "temps=\(temps)")
+            try? fm.removeItem(at: bigSrc)
+            try? fm.removeItem(at: bigDst)
+        }
+        // Roots that exist as the wrong kind are errors, absent roots are not.
+        let fileRoot = tempRoot.appendingPathComponent("file-root")
+        try plant(fileRoot.path, "x", 0o600)
+        let fileRootSweep = PrivateStorage.sweep(configRoot: configRoot, dataRoot: fileRoot, apply: false)
+        check("8.5 a data root that is a regular file is reported as an error",
+              fileRootSweep.errors.contains { $0.contains("not a directory") }, "\(fileRootSweep.errors)")
+        let fifoRoot = tempRoot.appendingPathComponent("fifo-root")
+        if mkfifo(fifoRoot.path, 0o600) == 0 {
+            let fifoSweep = PrivateStorage.sweep(configRoot: configRoot, dataRoot: fifoRoot, apply: false)
+            check("8.6 a data root that is a FIFO is reported as an error", !fifoSweep.errors.isEmpty, "\(fifoSweep.errors)")
+            unlink(fifoRoot.path)
+        }
+        let absentSweep = PrivateStorage.sweep(configRoot: configRoot, dataRoot: tempRoot.appendingPathComponent("absent-root"), apply: false)
+        check("8.7 an absent root is not an error (diagnostics never create roots)", absentSweep.errors.isEmpty, "\(absentSweep.errors)")
+        var rootRefused = false
+        do { try PrivateStorage.ensureDirectory(fileRoot, mode: 0o700) } catch { rootRefused = true }
+        check("8.8 ensureDirectory on a root that is a regular file throws (startup refuses)", rootRefused)
+
         // MARK: 6. Writer-level checks (routing work adds them here)
         print("\n[6] state writers")
         await StorageWritersSelftest.run(tempRoot: tempRoot, check: check)
@@ -387,4 +448,22 @@ struct StorageSelftest: AsyncParsableCommand {
         print(failures == 0 ? "\nStorage selftest: all checks passed." : "\nStorage selftest: \(failures) check(s) FAILED.")
         if failures > 0 { throw ExitCode(1) }
     }
+}
+
+/// Resident set size in bytes (best effort; 0 when unavailable).
+private func mach_or_rss() -> Int {
+    #if os(macOS)
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+    let rc = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    return rc == KERN_SUCCESS ? Int(info.resident_size) : 0
+    #else
+    guard let text = try? String(contentsOfFile: "/proc/self/statm", encoding: .utf8),
+          let pages = text.split(separator: " ").dropFirst().first.flatMap({ Int($0) }) else { return 0 }
+    return pages * Int(sysconf(Int32(_SC_PAGESIZE)))
+    #endif
 }

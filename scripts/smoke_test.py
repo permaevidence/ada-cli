@@ -181,6 +181,15 @@ def main():
         check("doctor: reports wide entries behind a symlinked data root",
               "with group/other bits" in result.stdout and "conversation.json" in result.stdout,
               result.stdout[-800:])
+        # A data root that exists as a regular file: an error, not "healthy".
+        os.remove(link_root)
+        with open(link_root, "w") as f:
+            f.write("not a directory")
+        result = subprocess.run([ADA, "doctor"], capture_output=True, text=True,
+                                timeout=180, env=env)
+        check("doctor: a data root that is a regular file is reported as an error",
+              "not a directory" in result.stdout and "✖ entries under the roots" in result.stdout,
+              result.stdout[-800:])
 
     # 3. media pipeline
     result = subprocess.run([ADA, "media-selftest"], capture_output=True, text=True, timeout=300)

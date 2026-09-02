@@ -412,7 +412,11 @@ enum PrivateStorage {
                     continue
                 }
             }
-            guard kind == .directory else { continue }
+            if kind == .absent { continue }            // not created yet (diagnostics never create roots)
+            guard kind == .directory else {
+                report.errors.append("\(root.path): exists but is not a directory")
+                continue
+            }
             report.scanned += 1
             if mode & groupOtherBits != 0 {
                 record(rootPath, mode: mode, apply: apply, into: &report)

@@ -53,10 +53,18 @@ enum StoragePaths {
     /// Create both roots (idempotent). Called by every entry point that is
     /// allowed to write state; never by diagnostics.
     static func ensureRoots() {
+        try? ensureRootsChecked()
+    }
+
+    /// Same, but a root that cannot be created or tightened (it exists as a
+    /// regular file, a FIFO, a link to nowhere, …) is reported: mutating
+    /// entry points that would otherwise run against a broken root call
+    /// this and stop.
+    static func ensureRootsChecked() throws {
         for root in [configRoot, dataRoot] {
             // Both roots are owner-only (0700): with a 0700 parent no mode
             // inside can make a child reachable by another account.
-            try? PrivateStorage.ensureDirectory(root, mode: 0o700)
+            try PrivateStorage.ensureDirectory(root, mode: 0o700)
         }
     }
 

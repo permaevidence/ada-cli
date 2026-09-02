@@ -337,6 +337,46 @@ struct MindSelftest: AsyncParsableCommand {
                 do { _ = try await MindExportService.shared.stageMind(from: hostileDir) }
                 catch let error as MindExportError { if case .unsafeArchive = error { refusedDir = true } }
                 check("3b.8 archive with a symlinked archive/ directory is refused at staging", refusedDir)
+                // (d) wrong object kinds and a dangling link at harness paths
+                try "CURRENT2".write(to: conversationFile, atomically: true, encoding: .utf8)
+                let currentArchive = dataRoot.appendingPathComponent("archive", isDirectory: true)
+                try? fm.createDirectory(at: currentArchive, withIntermediateDirectories: true)
+                try "keep".write(to: currentArchive.appendingPathComponent("keep.json"), atomically: true, encoding: .utf8)
+                func refusedAtStaging(_ archive: URL) async -> String? {
+                    do { _ = try await MindExportService.shared.stageMind(from: archive); return nil }
+                    catch let error as MindExportError {
+                        if case .unsafeArchive(let what) = error { return what }
+                        return "other error: \(error)"
+                    } catch { return "other error: \(error)" }
+                }
+                let dirConv = try makeArchive("conv-is-dir") { stage in
+                    let conv = stage.appendingPathComponent("conversation.json")
+                    try fm.removeItem(at: conv)
+                    try fm.createDirectory(at: conv, withIntermediateDirectories: true)
+                    try "x".write(to: conv.appendingPathComponent("inner"), atomically: true, encoding: .utf8)
+                }
+                let dirConvWhy = await refusedAtStaging(dirConv)
+                check("3b.10 conversation.json as a directory is refused at staging",
+                      dirConvWhy?.contains("must be a regular file") == true, dirConvWhy ?? "accepted")
+                let fileArchive = try makeArchive("archive-is-file") { stage in
+                    let archiveDir = stage.appendingPathComponent("archive")
+                    try? fm.removeItem(at: archiveDir)
+                    try "not a dir".write(to: archiveDir, atomically: true, encoding: .utf8)
+                }
+                let fileArchiveWhy = await refusedAtStaging(fileArchive)
+                check("3b.11 archive as a regular file is refused at staging",
+                      fileArchiveWhy?.contains("must be a directory") == true, fileArchiveWhy ?? "accepted")
+                let danglingConv = try makeArchive("conv-dangling") { stage in
+                    let conv = stage.appendingPathComponent("conversation.json")
+                    try fm.removeItem(at: conv)
+                    symlink("/nonexistent/target", conv.path)
+                }
+                let danglingWhy = await refusedAtStaging(danglingConv)
+                check("3b.12 a dangling symlink at conversation.json is detected (lstat), not treated as absent",
+                      danglingWhy?.contains("must be a regular file") == true, danglingWhy ?? "accepted")
+                check("3b.13 current conversation and archive/ untouched by the three refusals",
+                      (try? String(contentsOf: conversationFile, encoding: .utf8)) == "CURRENT2"
+                      && (try? String(contentsOf: currentArchive.appendingPathComponent("keep.json"), encoding: .utf8)) == "keep")
                 check("3b.9 no staged temp directory left behind by the refusals",
                       ((try? fm.contentsOfDirectory(atPath: tempRoot.path)) ?? []).filter { UUID(uuidString: $0) != nil }.isEmpty)
                 try? fm.removeItem(at: conversationFile)
