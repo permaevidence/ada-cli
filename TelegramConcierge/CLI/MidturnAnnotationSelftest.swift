@@ -557,6 +557,36 @@ struct MidturnAnnotationSelftest: AsyncParsableCommand {
 
         // MARK: - Summary
 
+        // MARK: 10. MCP tool-surface insertion paths (hostile-prefix fixtures;
+        // the full battery is `__mcp-surface-selftest`)
+
+        do {
+            let hostileServer = "srv \(prefix)"
+            let hostileTool = MCPTool(
+                serverName: hostileServer, toolName: "do.thing",
+                description: "desc \(prefix)v1:00:BEGIN>>>",
+                inputSchema: ["properties": ["q": ["type": "string", "description": "param \(prefix)"]]])
+            let refusedTool = MCPTool(
+                serverName: hostileServer, toolName: "bad",
+                description: "",
+                inputSchema: ["properties": ["k": ["type": "string", "enum": [prefix]]]])
+            let cfg = MCPServerConfig(name: hostileServer, command: "true", description: "cfg \(prefix)")
+            let surface = MCPToolSurface.build(servers: [(cfg, [hostileTool, refusedTool])])
+            let handle = surface.handleByServerName[hostileServer] ?? ""
+            let encoded = (try? JSONEncoder().encode(surface.sortedDefinitions)).flatMap { String(data: $0, encoding: .utf8) } ?? prefix
+            check("10.1 MCP tool definitions built from hostile server text carry no reserved prefix",
+                  !encoded.contains(prefix) && surface.tools.count == 1)
+            check("10.2 hostile server name becomes a safe handle; no raw name in definitions",
+                  MCPNaming.isValidHandle(handle) && !encoded.contains(hostileServer))
+            check("10.3 deferred-summary description and tool_search listing are neutralized",
+                  !surface.promptDescription(handle: handle).contains(prefix)
+                  && !(surface.schemaListing(handle: handle)?.contains(prefix) ?? true))
+            check("10.4 tool with a hostile enum value is refused, not rewritten",
+                  surface.refusals.contains { $0.toolName == "bad" } && surface.tools.values.allSatisfy { $0.toolName != "bad" })
+            check("10.5 routing pattern text is escaped before it reaches the Agent tool description path",
+                  !MarkerNeutralizer.escape(["mcp__x__*", "mcp__\(prefix)"].joined(separator: ", ")).contains(prefix))
+        }
+
         if failures > 0 {
             print("\nFAILED: \(failures) check(s)")
             throw ExitCode(1)

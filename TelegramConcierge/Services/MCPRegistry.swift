@@ -38,109 +38,123 @@ actor MCPRegistry {
     private var bootstrapTask: Task<Void, Never>?
     private var didBootstrap: Bool = false
 
+    /// Canonical accepted-tool registry (`MCPToolSurface`), rebuilt from the
+    /// connected clients' tool lists on every `allToolDefinitions()` call
+    /// (once per turn) and after every reload. Every dispatch and every
+    /// prompt-visible string derives from it.
+    private var surface = MCPToolSurface.empty
+    private var surfaceBuilt = false
+    private var loggedRefusalServers: Set<String> = []
+
     private init() {}
 
     // MARK: - Public API
 
-    /// Returns every MCP tool converted to a native `ToolDefinition`, ready
-    /// to append to the LLM tool block. Sorted deterministically by prefixed
-    /// name (`mcp__<server>__<tool>`) so the output is byte-stable across
-    /// turns — critical for prompt-cache hits.
+    /// Returns every accepted MCP tool as a native `ToolDefinition`, ready to
+    /// append to the LLM tool block. Sorted deterministically by alias so the
+    /// output is byte-stable across turns — critical for prompt-cache hits.
     ///
-    /// Triggers bootstrap on first call. Later calls reuse the cached list.
-    /// Per-agent filtering (including always vs deferred) is handled by
-    /// `MCPAgentRouting`, not here.
+    /// Triggers bootstrap on first call and rebuilds the tool surface. Per-agent
+    /// filtering (including always vs deferred) is handled by `MCPAgentRouting`.
     func allToolDefinitions() async -> [ToolDefinition] {
         await ensureBootstrapped()
-        var combined: [MCPTool] = []
-        for entry in entries.values where !entry.failed {
-            let tools = await entry.client.listedTools
-            combined.append(contentsOf: tools)
-        }
-        combined.sort { $0.prefixedName < $1.prefixedName }
-        return combined.map(Self.convertToToolDefinition)
+        await rebuildSurface()
+        return surface.sortedDefinitions
     }
 
-    /// Compact summaries for the specified server names. Each entry includes:
-    /// server name, description (user-provided or auto), and tool count.
-    /// Used to inject lightweight hints into the system prompt for deferred MCPs.
-    /// Which servers are deferred is decided by MCPAgentRouting, not here.
-    func serverSummaries(for serverNames: Set<String>) async -> [(name: String, description: String, toolCount: Int)] {
+    /// The current accepted-tool registry (built if needed). `MCPAgentRouting`
+    /// snapshots it once per turn for its sync consumers.
+    func currentSurface() async -> MCPToolSurface {
         await ensureBootstrapped()
+        if !surfaceBuilt { await rebuildSurface() }
+        return surface
+    }
+
+    private func rebuildSurface() async {
+        var servers: [(config: MCPServerConfig, tools: [MCPTool])] = []
+        for (_, entry) in entries.sorted(by: { $0.key < $1.key }) where !entry.failed {
+            servers.append((entry.config, await entry.client.listedTools))
+        }
+        let built = MCPToolSurface.build(servers: servers)
+        // Log refusals once per server (a hostile server would otherwise spam
+        // the log every turn).
+        var byServer: [String: [MCPToolSurface.Refusal]] = [:]
+        for refusal in built.refusals { byServer[refusal.serverName, default: []].append(refusal) }
+        for (serverName, refusals) in byServer.sorted(by: { $0.key < $1.key })
+        where !loggedRefusalServers.contains(serverName) {
+            loggedRefusalServers.insert(serverName)
+            let detail = refusals.map { "\($0.toolName): \($0.reason)" }.joined(separator: "; ")
+            DebugTelemetry.log(
+                .toolError,
+                summary: "mcp tools refused on \(serverName) (\(refusals.count))",
+                detail: detail,
+                isError: true
+            )
+        }
+        surface = built
+        surfaceBuilt = true
+    }
+
+    /// Compact summaries for the given server **handles**. Each entry carries
+    /// the handle, an escaped description (user-provided or auto-generated
+    /// from tool aliases), and the accepted-tool count. Used for the
+    /// on-demand MCP section of the system prompt. Which servers are
+    /// deferred is decided by MCPAgentRouting, not here.
+    func serverSummaries(for handles: Set<String>) async -> [(name: String, description: String, toolCount: Int)] {
+        let current = await currentSurface()
         var out: [(String, String, Int)] = []
-        for name in serverNames {
-            guard let entry = entries[name], !entry.failed else { continue }
-            let tools = await entry.client.listedTools
-            guard !tools.isEmpty else { continue }
-            let desc = entry.config.description ?? Self.autoDescription(tools: tools)
-            out.append((name, desc, tools.count))
+        for handle in handles {
+            guard let server = current.server(handle: handle), !server.aliases.isEmpty else { continue }
+            out.append((handle, current.promptDescription(handle: handle), server.aliases.count))
         }
         return out.sorted { $0.0 < $1.0 }
     }
 
-    /// Returns a formatted text block describing every tool on `serverName`,
-    /// including parameter schemas. Intended as the result of `tool_search`.
-    func toolSchemasForServer(_ serverName: String) async -> String? {
-        await ensureBootstrapped()
-        guard let entry = entries[serverName], !entry.failed else { return nil }
-        let tools = await entry.client.listedTools
-        guard !tools.isEmpty else { return nil }
-
-        var lines: [String] = []
-        lines.append("MCP server '\(serverName)' — \(tools.count) tools:")
-        lines.append("")
-        for tool in tools.sorted(by: { $0.toolName < $1.toolName }) {
-            lines.append("## \(tool.toolName)")
-            if !tool.description.isEmpty {
-                lines.append(tool.description)
-            }
-            let props = (tool.inputSchema["properties"] as? [String: Any]) ?? [:]
-            let required = Set((tool.inputSchema["required"] as? [String]) ?? [])
-            if !props.isEmpty {
-                lines.append("Parameters:")
-                for key in props.keys.sorted() {
-                    guard let dict = props[key] as? [String: Any] else { continue }
-                    let type = (dict["type"] as? String) ?? "string"
-                    let desc = (dict["description"] as? String) ?? ""
-                    let req = required.contains(key) ? " (required)" : ""
-                    var enumNote = ""
-                    if let vals = dict["enum"] as? [Any] {
-                        enumNote = " — enum: \(vals.map { "\($0)" }.joined(separator: ", "))"
-                    }
-                    lines.append("  - \(key): \(type)\(req)\(enumNote)\(desc.isEmpty ? "" : " — \(desc)")")
-                }
-            } else {
-                lines.append("Parameters: none")
-            }
-            lines.append("")
-        }
-        lines.append("Use mcp_call(server: \"\(serverName)\", tool: \"<tool_name>\", arguments: {...}) to invoke.")
-        return lines.joined(separator: "\n")
+    /// Formatted text block describing every accepted tool on the server with
+    /// this **handle** (raw server names are not accepted). Intended as the
+    /// result of `tool_search`.
+    func toolSchemasForServer(_ handle: String) async -> String? {
+        let current = await currentSurface()
+        return current.schemaListing(handle: handle)
     }
 
-    /// Auto-generate a short description from tool names (fallback when user
-    /// hasn't provided one). Shows up to 5 names, then "and N more".
-    private static func autoDescription(tools: [MCPTool]) -> String {
-        let names = tools.map(\.toolName).sorted()
-        if names.count <= 5 {
-            return "Provides: \(names.joined(separator: ", "))"
-        }
-        let first5 = names.prefix(5).joined(separator: ", ")
-        return "Provides: \(first5), and \(names.count - 5) more"
+    /// Dispatch a tool call from `ToolExecutor` by the wire name the model
+    /// used: a canonical alias, or — during the grace release — a legacy raw
+    /// name that resolves through the validated reverse map to exactly one
+    /// accepted tool. Unknown names never reach a server.
+    func callTool(name: String, argumentsJSON: String) async -> MCPToolCallResult {
+        let current = await currentSurface()
+        return await dispatch(current.resolve(name: name), requested: name, argumentsJSON: argumentsJSON)
     }
 
-    /// Dispatch a tool call from `ToolExecutor`. The argument is the prefixed
-    /// name (`mcp__<server>__<tool>`) surfaced to the LLM. Routes to the
-    /// right client and returns the result (text plus any decoded image
-    /// blocks); errors come back as a text-only JSON error string.
-    func callTool(prefixedName: String, argumentsJSON: String) async -> MCPToolCallResult {
-        await ensureBootstrapped()
-        guard let (serverName, toolName) = Self.splitPrefixedName(prefixedName) else {
-            return MCPToolCallResult(text: jsonError("Malformed MCP tool name '\(prefixedName)'"), images: [])
+    /// `mcp_call` dispatch: `serverHandle` must be a handle from the on-demand
+    /// list; `tool` is the alias or its tool segment (legacy raw pairs resolve
+    /// only through the reverse map while the grace flag is on).
+    func callTool(serverHandle: String, tool: String, argumentsJSON: String) async -> MCPToolCallResult {
+        let current = await currentSurface()
+        let requested = "\(serverHandle)/\(tool)"
+        return await dispatch(current.resolve(serverHandle: serverHandle, tool: tool),
+                              requested: requested, argumentsJSON: argumentsJSON)
+    }
+
+    private func dispatch(_ resolution: MCPToolSurface.Resolution, requested: String, argumentsJSON: String) async -> MCPToolCallResult {
+        let accepted: MCPToolSurface.AcceptedTool
+        // The requested name is model-supplied text; neutralize before it is
+        // echoed back into a tool result.
+        let requested = MarkerNeutralizer.escape(requested)
+        switch resolution {
+        case .tool(let tool):
+            accepted = tool
+        case .unknown:
+            return MCPToolCallResult(text: jsonError("Unknown MCP tool '\(requested)' — use tool_search(server: <handle>) to list the canonical tool names"), images: [])
+        case .ambiguous(let owners):
+            return MCPToolCallResult(text: jsonError("Legacy MCP tool name '\(requested)' is ambiguous (\(owners.joined(separator: ", "))) — use the canonical alias"), images: [])
+        case .legacyRefused:
+            return MCPToolCallResult(text: jsonError("Legacy MCP tool name '\(requested)' is no longer accepted — use the canonical alias from tool_search"), images: [])
         }
-        guard let entry = entries[serverName], !entry.failed else {
-            let reason = entries[serverName]?.failureReason ?? "not installed or not configured"
-            return MCPToolCallResult(text: jsonError("MCP server '\(serverName)' unavailable (\(reason))"), images: [])
+        guard let entry = entries[accepted.serverName], !entry.failed else {
+            let reason = entries[accepted.serverName]?.failureReason ?? "not installed or not configured"
+            return MCPToolCallResult(text: jsonError("MCP server '\(accepted.serverHandle)' unavailable (\(reason))"), images: [])
         }
 
         // Parse arguments. Empty string → empty dict. Anything else must be a
@@ -153,13 +167,13 @@ actor MCPRegistry {
                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             args = parsed
         } else {
-            return MCPToolCallResult(text: jsonError("MCP tool '\(prefixedName)' expected a JSON object for arguments"), images: [])
+            return MCPToolCallResult(text: jsonError("MCP tool '\(accepted.alias)' expected a JSON object for arguments"), images: [])
         }
 
         do {
-            return try await entry.client.callTool(name: toolName, arguments: args)
+            return try await entry.client.callTool(name: accepted.toolName, arguments: args)
         } catch {
-            return MCPToolCallResult(text: jsonError("MCP tool '\(prefixedName)' failed: \(error)"), images: [])
+            return MCPToolCallResult(text: jsonError("MCP tool '\(accepted.alias)' failed: \(error)"), images: [])
         }
     }
 
@@ -184,6 +198,8 @@ actor MCPRegistry {
         entries.removeAll()
         didBootstrap = false
         bootstrapTask = nil
+        surface = .empty
+        surfaceBuilt = false
     }
 
     /// Tear down every running client and re-bootstrap from the current
@@ -196,7 +212,11 @@ actor MCPRegistry {
         entries.removeAll()
         didBootstrap = false
         bootstrapTask = nil
+        surface = .empty
+        surfaceBuilt = false
+        loggedRefusalServers.removeAll()
         await ensureBootstrapped()
+        await rebuildSurface()
     }
 
     // MARK: - Config persistence (for Settings UI)
@@ -417,91 +437,12 @@ actor MCPRegistry {
         return config
     }
 
-    // MARK: - Tool conversion (MCP inputSchema → ToolDefinition)
-
-    /// Best-effort conversion from MCP's raw JSON-Schema `inputSchema` to our
-    /// flat `FunctionParameters` shape. Nested-object properties are
-    /// flattened to `type: "object"` with a descriptive note. Fully captured
-    /// fidelity is deferred to a later phase (rawSchema pass-through).
-    static func convertToToolDefinition(_ tool: MCPTool) -> ToolDefinition {
-        let schema = tool.inputSchema
-        let rawProps = (schema["properties"] as? [String: Any]) ?? [:]
-        let required = (schema["required"] as? [String]) ?? []
-
-        var properties: [String: ParameterProperty] = [:]
-        for (key, raw) in rawProps {
-            guard let dict = raw as? [String: Any] else { continue }
-            let type = (dict["type"] as? String) ?? "string"
-            var description = (dict["description"] as? String) ?? ""
-            var enumValues: [String]? = nil
-            if let vals = dict["enum"] as? [Any] {
-                enumValues = vals.compactMap { v -> String? in
-                    if let s = v as? String { return s }
-                    return String(describing: v)
-                }
-            }
-            var itemsSchema: ArrayItemsSchema? = nil
-            switch type {
-            case "array":
-                if let items = dict["items"] as? [String: Any] {
-                    let itemType = (items["type"] as? String) ?? "string"
-                    itemsSchema = ArrayItemsSchema(type: itemType)
-                } else {
-                    itemsSchema = ArrayItemsSchema(type: "string")
-                }
-            case "object":
-                // Flatten: note sub-shape in description so the LLM can still form valid args.
-                if let sub = dict["properties"] as? [String: Any], !sub.isEmpty {
-                    let keys = sub.keys.sorted().joined(separator: ", ")
-                    description = description.isEmpty
-                        ? "JSON object with fields: \(keys)"
-                        : "\(description) (JSON object with fields: \(keys))"
-                }
-            default:
-                break
-            }
-
-            properties[key] = ParameterProperty(
-                type: type,
-                description: description,
-                enumValues: enumValues,
-                items: itemsSchema
-            )
-        }
-
-        let fullDescription: String
-        if tool.description.isEmpty {
-            fullDescription = "Tool provided by MCP server '\(tool.serverName)'."
-        } else {
-            fullDescription = "\(tool.description)\n\n(Provided by MCP server '\(tool.serverName)'.)"
-        }
-
-        return ToolDefinition(
-            function: FunctionDefinition(
-                name: tool.prefixedName,
-                description: fullDescription,
-                parameters: FunctionParameters(
-                    properties: properties,
-                    required: required
-                )
-            )
-        )
-    }
-
     // MARK: - Name routing
 
-    /// Split `mcp__<server>__<tool>` into (server, tool). Returns nil if the
-    /// prefix doesn't parse.
-    static func splitPrefixedName(_ prefixed: String) -> (server: String, tool: String)? {
-        guard prefixed.hasPrefix("mcp__") else { return nil }
-        let trimmed = String(prefixed.dropFirst("mcp__".count))
-        guard let sep = trimmed.range(of: "__") else { return nil }
-        let server = String(trimmed[..<sep.lowerBound])
-        let tool = String(trimmed[sep.upperBound...])
-        guard !server.isEmpty, !tool.isEmpty else { return nil }
-        return (server, tool)
-    }
-
+    /// Tool conversion, aliasing and name resolution live in
+    /// `MCPToolSurface` (Services/MCPToolSurface.swift). The registry only
+    /// answers "does this wire name belong to the MCP namespace?" — every
+    /// actual lookup goes through the accepted-tool registry.
     public static func isMCPPrefixed(_ name: String) -> Bool {
         name.hasPrefix("mcp__")
     }

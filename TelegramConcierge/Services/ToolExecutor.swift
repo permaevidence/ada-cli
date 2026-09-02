@@ -531,8 +531,11 @@ actor ToolExecutor {
 
         default:
             if MCPRegistry.isMCPPrefixed(call.function.name) {
+                // Resolution goes through the accepted-tool registry (alias,
+                // or a legacy raw name via its validated reverse map); an
+                // unregistered name is an error, never a passthrough.
                 let mcpResult = await MCPRegistry.shared.callTool(
-                    prefixedName: call.function.name,
+                    name: call.function.name,
                     argumentsJSON: call.function.arguments
                 )
                 return mcpToolResultMessage(call, mcpResult)
@@ -2274,8 +2277,11 @@ actor ToolExecutor {
               !server.isEmpty else {
             return "{\"error\": \"'server' parameter is required.\"}"
         }
+        // `server` must be a handle exactly as listed in the on-demand
+        // section; raw server names that differ from their handle are not
+        // accepted (the registry knows only handles).
         guard let result = await MCPRegistry.shared.toolSchemasForServer(server) else {
-            return "{\"error\": \"MCP server '\(server)' is not available. It may not be installed, or it failed to start.\"}"
+            return "{\"error\": \"MCP server '\(MarkerNeutralizer.escape(server))' is not available. Use the server handle exactly as shown in the on-demand MCPs list; the server may also not be installed, or it failed to start.\"}"
         }
         return result
     }
@@ -2293,9 +2299,8 @@ actor ToolExecutor {
         }
         let arguments = raw["arguments"] as? [String: Any] ?? [:]
 
-        // Construct the prefixed name and serialize arguments for the standard
-        // MCPRegistry.callTool path — reuses all existing validation & dispatch.
-        let prefixedName = "mcp__\(server)__\(tool)"
+        // Serialize arguments and resolve (handle, tool alias/segment) through
+        // the accepted-tool registry — reuses all existing validation & dispatch.
         let argsJSON: String
         if arguments.isEmpty {
             argsJSON = "{}"
@@ -2305,7 +2310,7 @@ actor ToolExecutor {
         } else {
             return ToolResultMessage(toolCallId: call.id, content: "{\"error\": \"Failed to serialize arguments to JSON.\"}")
         }
-        let result = await MCPRegistry.shared.callTool(prefixedName: prefixedName, argumentsJSON: argsJSON)
+        let result = await MCPRegistry.shared.callTool(serverHandle: server, tool: tool, argumentsJSON: argsJSON)
         return mcpToolResultMessage(call, result)
     }
 

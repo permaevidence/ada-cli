@@ -68,6 +68,21 @@ struct Doctor: AsyncParsableCommand {
         note("data: \(StoragePaths.dataRoot.path)")
         note("config: \(StoragePaths.configRoot.path)")
 
+        // MCP routing references (mcp-routing.json routes, agents' mcp_tools
+        // patterns): unresolved or malformed entries are kept verbatim by the
+        // daemon and only reported here.
+        let routingFindings = MCPAgentRouting.doctorFindings()
+        if !routingFindings.isEmpty {
+            print("\nMCP routing")
+            for finding in routingFindings {
+                if finding.problem {
+                    check(finding.text, ok: false, hint: "edit \(MCPAgentRouting.routingURL().path)")
+                } else {
+                    note(finding.text)
+                }
+            }
+        }
+
         print("\nPermissions")
         #if os(macOS)
         check("Full Disk Access", ok: PermissionsService.fullDiskAccessGranted(),

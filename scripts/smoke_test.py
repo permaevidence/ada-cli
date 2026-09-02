@@ -275,6 +275,17 @@ def main():
     check("midturn-selftest", result.returncode == 0,
           (result.stdout + result.stderr)[-1500:])
 
+    # 3c5-ter. MCP tool surface: server handles, canonical aliases (length,
+    # charset, determinism, per-server prefix isolation), escaped
+    # descriptions, refused hostile semantic strings, registry-only dispatch
+    # for direct calls / tool_search / mcp_call, legacy-name grace via the
+    # validated reverse map, and mcp-routing.json / mcp_tools migration.
+    # Spawns fake stdio MCP servers (python3) under an isolated XDG root.
+    result = subprocess.run([os.path.abspath(ADA), "__mcp-surface-selftest"], capture_output=True,
+                            text=True, timeout=300)
+    check("mcp-surface-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
     # 3c6. /deleteuserdata confirmation barrier: bare command teaches, only
     # the stored name (or CONFIRM when none) wipes, everything else refuses.
     # Isolated config root — never touches a real secrets.json.

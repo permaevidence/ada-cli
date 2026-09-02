@@ -65,9 +65,10 @@ public struct MCPTool: Sendable {
     public let description: String
     public let inputSchema: [String: Any]     // Raw JSON object.
 
-    /// Prefixed name surfaced to the LLM: `mcp__<server>__<tool>`.
-    /// Collision-proof and the prefix is the dispatch key in ToolExecutor.
-    public var prefixedName: String { "mcp__\(serverName)__\(toolName)" }
+    /// Legacy raw wire name (`mcp__<server>__<tool>`), as advertised before
+    /// the two-level identity. The model now sees `MCPToolSurface` aliases;
+    /// this form survives only as a reverse-map key during the grace release.
+    public var legacyRawName: String { MCPNaming.legacyRawName(serverName: serverName, toolName: toolName) }
 
     public init(serverName: String, toolName: String, description: String, inputSchema: [String: Any]) {
         self.serverName = serverName
