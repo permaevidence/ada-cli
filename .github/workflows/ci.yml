@@ -18,6 +18,7 @@ jobs:
           apt-get update
           apt-get install -y python3 poppler-utils imagemagick procps curl xz-utils
       - name: Install Node.js LTS (nodejs.org, SHASUMS256-verified) for the live Playwright bootstrap check
+        shell: bash
         run: |
           set -euo pipefail
           VERSION="$(curl -fsSL https://nodejs.org/dist/index.json | python3 -c 'import json,sys; print(next(e["version"] for e in json.load(sys.stdin) if isinstance(e.get("lts"), str)))')"
