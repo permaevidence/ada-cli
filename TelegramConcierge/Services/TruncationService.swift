@@ -20,7 +20,11 @@ enum TruncationService {
     /// instead of paying ~12k tokens of context per opened document.
     /// Console/bash output and search payloads keep the default 50 KB.
     static let documentMaxBytes = 25 * 1024  // 25 KB
-    static let truncationDir = NSTemporaryDirectory() + "ada-tool-output/"
+    static let truncationDir = NSTemporaryDirectory() + "briglia-tool-output/"
+    /// Pre-rename spill directory. Not deleted eagerly: existing conversations
+    /// still reference files in it. Swept by the same 7-day expiry and removed
+    /// once empty.
+    static let legacyTruncationDir = NSTemporaryDirectory() + "ada-tool-output/"
 
     // MARK: - Public
 
@@ -164,15 +168,24 @@ enum TruncationService {
     /// Remove files older than 7 days. Called from context-prune maintenance,
     /// keeping directory scans out of the tool-output hot path.
     static func cleanupOldFiles() {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(atPath: truncationDir) else { return }
         let cutoff = Date().addingTimeInterval(-7 * 24 * 3600)
+        sweep(directory: truncationDir, cutoff: cutoff, removeWhenEmpty: false)
+        sweep(directory: legacyTruncationDir, cutoff: cutoff, removeWhenEmpty: true)
+    }
+
+    private static func sweep(directory: String, cutoff: Date, removeWhenEmpty: Bool) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: directory) else { return }
         for entry in entries where entry.hasPrefix("tool_") {
-            let path = truncationDir + entry
+            let path = directory + entry
             let attrs = try? fm.attributesOfItem(atPath: path)
             if let mtime = attrs?[.modificationDate] as? Date, mtime < cutoff {
                 try? fm.removeItem(atPath: path)
             }
+        }
+        if removeWhenEmpty,
+           let remaining = try? fm.contentsOfDirectory(atPath: directory), remaining.isEmpty {
+            try? fm.removeItem(atPath: directory)
         }
     }
 
@@ -186,7 +199,8 @@ enum TruncationService {
     private static func writeToFile(_ text: String) -> String? {
         let fm = FileManager.default
         do {
-            try fm.createDirectory(atPath: truncationDir, withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: truncationDir, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
         } catch {
             return nil
         }
