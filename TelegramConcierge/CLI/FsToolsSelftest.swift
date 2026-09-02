@@ -171,6 +171,42 @@ struct FsToolsSelftest: AsyncParsableCommand {
         check("apply_patch deleting the secret store is refused",
               patchDelete.content.contains("\"error\"") && FileManager.default.fileExists(atPath: storePath),
               String(patchDelete.content.prefix(300)))
+        // Post-edit invariant (Codex review 2026-09-02): edits that overlap the
+        // token or its field name WITHOUT containing either in full are refused
+        // on the result — substring of the token, substring of the field name,
+        // a batch with one such edit, and replace_all over a fragment.
+        let tokenFragment = String(token.dropFirst(12).prefix(10))
+        let subToken = await FilesystemTools.shared.editFile(path: storePath, oldString: tokenFragment, newString: "XXXXXXXXXX")
+        check("edit_file over a substring of the token is refused", !succeeded(subToken) && storedToken() == token,
+              String(subToken.content.prefix(300)))
+        let subField = await FilesystemTools.shared.editFile(path: storePath, oldString: "bot_token", newString: "bot_tok")
+        check("edit_file over a substring of the token field name is refused", !succeeded(subField) && storedToken() == token,
+              String(subField.content.prefix(300)))
+        let batch = await FilesystemTools.shared.editFile(path: storePath, edits: [
+            FilesystemTools.EditPair(oldString: serperV3, newString: "serper-visible-key-batch00001"),
+            FilesystemTools.EditPair(oldString: tokenFragment, newString: "YYYYYYYYYY"),
+        ])
+        check("batched edit_file with one edit inside the token is refused as a whole",
+              !succeeded(batch) && storedToken() == token && rawStore().contains(serperV3),
+              String(batch.content.prefix(300)))
+        let replaceAll = await FilesystemTools.shared.editFile(path: storePath, oldString: "0123", newString: "9876", replaceAll: true)
+        check("replace_all over a fragment shared with the token is refused", !succeeded(replaceAll) && storedToken() == token,
+              String(replaceAll.content.prefix(300)))
+        let breakJSON = await FilesystemTools.shared.editFile(path: storePath, oldString: "{", newString: "[")
+        check("edit_file that leaves the store non-JSON is refused", !succeeded(breakJSON) && storedToken() == token,
+              String(breakJSON.content.prefix(300)))
+        let fragLine = rawStore().components(separatedBy: "\n").first { $0.contains(token) } ?? ""
+        let patchSub = await ApplyPatch.run(patchText: """
+        *** Begin Patch
+        *** Update File: \(storePath)
+        @@
+        -\(fragLine)
+        +\(fragLine.replacingOccurrences(of: tokenFragment, with: "ZZZZZZZZZZ"))
+        *** End Patch
+        """)
+        check("apply_patch changing the token line is refused on the result", patchSub.content.contains("\"error\"") && storedToken() == token,
+              String(patchSub.content.prefix(300)))
+
         // The rules are scoped to the harness store: a user .env elsewhere is untouched.
         let envPath = tempRoot.appendingPathComponent("project.env").path
         let envWrite = await FilesystemTools.shared.writeFile(

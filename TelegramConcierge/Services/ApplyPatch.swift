@@ -298,6 +298,10 @@ enum ApplyPatch {
                 throw PatchError(message: "file \(path) is not valid UTF-8 text")
             }
             let updated = try applyHunks(to: original, hunks: hunks, path: path)
+            if HarnessSecretStore.isSecretStore(path),
+               let violation = HarnessSecretStore.tokenInvariantViolation(original: original, updated: updated) {
+                throw PatchError(message: violation)
+            }
             guard let data = updated.data(using: .utf8) else {
                 throw PatchError(message: "cannot encode updated content for \(path)")
             }

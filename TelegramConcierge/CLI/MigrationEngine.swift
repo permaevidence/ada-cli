@@ -2114,6 +2114,12 @@ final class MigrationEngine {
     func recover() -> MigrationOutcome {
         log("recovering from journal state \"\(journal.state)\"")
         do {
+            // The journal area may predate this build's owner-only creation
+            // (an interrupted run of an older binary): validate that each
+            // entry is a real directory and re-apply 0700 before anything is
+            // read from or written to it (Codex, Release A review).
+            try tightenJournalArea()
+            Self.crashPoint("after-recovery-tighten")
             // A crash — or a reboot, which restarts an enabled unit — can
             // leave the managed OLD service running again. Stop it before
             // touching anything, whatever direction recovery takes; the
@@ -2469,6 +2475,32 @@ final class MigrationEngine {
     /// Ordinary rollback — valid strictly BEFORE `committing` (nothing has
     /// been parked or retired yet). Restores roots, preimages (verified by
     /// hash), service topology; deletes everything the migration created.
+    /// Recovery preflight over the journal area: `stateDir`, `preimages/`
+    /// and `parked/` must each be absent or a real directory (never a
+    /// symlink or a file — a planted link would redirect restores), and
+    /// every present one is set to 0700 whatever an older build created.
+    func tightenJournalArea() throws {
+        for dir in [stateDirURL, preimagesDir, parkedDir] {
+            var st = stat()
+            guard lstat(dir.path, &st) == 0 else {
+                if errno == ENOENT { continue }
+                throw EngineError(outcome: .failed(
+                    "cannot inspect \(dir.path) (errno \(errno)) — refusing to recover on a guess; "
+                    + "the journal is preserved"))
+            }
+            guard (st.st_mode & S_IFMT) == S_IFDIR else {
+                throw EngineError(outcome: .failed(
+                    "\(dir.path) is not a directory (mode \(String(st.st_mode & S_IFMT, radix: 8))) — a migration "
+                    + "journal area entry was replaced; refusing to recover, the journal is preserved. "
+                    + "Restore it as a plain directory and re-run `\(spec.recoveryHint)`"))
+            }
+            if (st.st_mode & 0o777) != 0o700, chmod(dir.path, 0o700) != 0 {
+                throw EngineError(outcome: .failed(
+                    "cannot set owner-only permissions on \(dir.path) (errno \(errno)) — the journal is preserved"))
+            }
+        }
+    }
+
     func rollback(reason: String?) throws {
         if let reason { log("rolling back: \(reason)") }
         // Every stored preimage is verified against the journal BEFORE the

@@ -1,5 +1,8 @@
 import ArgumentParser
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#endif
 
 /// Hidden deterministic battery for the MCP tool surface (`MCPToolSurface`,
 /// `MCPNaming`, `MCPAgentRouting` migration): naming properties, escaped and
@@ -451,6 +454,70 @@ struct MCPSurfaceSelftest: AsyncParsableCommand {
               && MCPAgentRouting.isValidPattern(abList)
               && !MCPAgentRouting.isValidPattern("mcp__a b__*") && !MCPAgentRouting.isValidPattern(hostilePattern)
               && !MCPAgentRouting.isValidPattern("*") && !MCPAgentRouting.isValidPattern(""))
+
+        // 4.15–4.18 Concurrent writers (Codex, Release A review): the migration
+        //           re-reads under the sidecar lock, replaces conditionally, and
+        //           the cache revalidates against the file on disk.
+        do {
+            // 4.15 cache warm, then an external process-style edit adds an agent:
+            //      the next migration must carry that agent, not the cached view.
+            _ = MCPAgentRouting.currentConfig()
+            var external = try JSONSerialization.jsonObject(with: Data(contentsOf: routingURL)) as? [String: Any] ?? [:]
+            external["External"] = ["mcp__std__admin.tools.list"]   // legacy raw → will be migrated
+            try? await Task.sleep(nanoseconds: 20_000_000)          // distinct mtime even on coarse clocks
+            try JSONSerialization.data(withJSONObject: external, options: [.prettyPrinted, .sortedKeys]).write(to: routingURL)
+            await MCPAgentRouting.refreshFromRegistry()
+            let afterExternal = String(decoding: try Data(contentsOf: routingURL), as: UTF8.self)
+            let seen = MCPAgentRouting.currentConfig()["External"]?.always
+            check("4.15 an external edit made after the cache warmed survives the migration and is itself migrated",
+                  afterExternal.contains("\"External\"")
+                  && seen == [MCPNaming.toolAlias(handle: "std", toolName: "admin.tools.list")],
+                  "\(String(describing: seen))")
+
+            // 4.16 an uncoordinated write that lands between the locked read and
+            //      the conditional replace: the migration must not clobber it.
+            var legacy = external
+            legacy["Late"] = ["mcp__std__a.b"]
+            try JSONSerialization.data(withJSONObject: legacy, options: [.prettyPrinted, .sortedKeys]).write(to: routingURL)
+            var racer = legacy
+            racer["Racer"] = [abList]
+            let racerBytes = try JSONSerialization.data(withJSONObject: racer, options: [.prettyPrinted, .sortedKeys])
+            var hookRan = false
+            MCPAgentRouting.testHookBeforeConditionalWrite = {
+                hookRan = true
+                try? racerBytes.write(to: routingURL)
+            }
+            await MCPAgentRouting.refreshFromRegistry()
+            MCPAgentRouting.testHookBeforeConditionalWrite = nil
+            let afterRace = try Data(contentsOf: routingURL)
+            check("4.16 a write landing inside the migration window is preserved byte-for-byte (migration deferred)",
+                  hookRan && afterRace == racerBytes)
+            check("4.16b the cache does not keep the pre-race view", MCPAgentRouting.currentConfig()["Racer"] != nil)
+            await MCPAgentRouting.refreshFromRegistry()
+            let settled = MCPAgentRouting.currentConfig()
+            check("4.17 the next turn migrates the racer's file (legacy entry rewritten, racer entry kept)",
+                  settled["Late"]?.always == [MCPNaming.toolAlias(handle: "std", toolName: "a.b")]
+                  && settled["Racer"]?.always == [abList], "\(settled)")
+
+            // 4.18 the sidecar lock serializes official writers across processes:
+            //      while another holder has it, save() waits.
+            let lockPath = MCPAgentRouting.routingLockURL().path
+            let acquired = DispatchSemaphore(value: 0)
+            let holdSeconds = 1.0
+            Thread.detachNewThread {
+                let fd = open(lockPath, O_RDWR | O_CREAT, 0o600)
+                if fd >= 0 { _ = flock(fd, LOCK_EX) }
+                acquired.signal()
+                Thread.sleep(forTimeInterval: holdSeconds)
+                if fd >= 0 { flock(fd, LOCK_UN); close(fd) }
+            }
+            acquired.wait()
+            let t0 = Date()
+            try MCPAgentRouting.save(config: settled)
+            let waited = Date().timeIntervalSince(t0)
+            check("4.18 save() waits for a foreign holder of the routing lock (waited \(String(format: "%.2f", waited)) s)",
+                  waited >= holdSeconds * 0.8)
+        }
 
         await registry.shutdownAll()
         MCPAgentRouting.setSurfaceForTesting(nil)

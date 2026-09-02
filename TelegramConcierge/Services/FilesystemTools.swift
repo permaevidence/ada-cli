@@ -484,6 +484,15 @@ actor FilesystemTools {
         if updated == original {
             return OpResult(content: jsonError("No changes made. The replacement produced identical content."))
         }
+        // Harness secret store: the text-level refusals above catch the obvious
+        // cases; the invariant that matters is checked on the RESULT — the
+        // token entry must be byte-identical after the edit (an edit can hit
+        // a substring of the token or of the field name without containing
+        // either in full).
+        if HarnessSecretStore.isSecretStore(path),
+           let violation = HarnessSecretStore.tokenInvariantViolation(original: original, updated: updated) {
+            return OpResult(content: jsonError(violation))
+        }
 
         // --- Phase 4: Write and report ---
         do {

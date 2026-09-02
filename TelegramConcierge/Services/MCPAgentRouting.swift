@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#endif
 
 /// Per-agent MCP tool routing.
 ///
@@ -84,6 +87,20 @@ enum MCPAgentRouting {
 
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var cachedConfig: [String: AgentRouting]?
+    /// On-disk identity the cache mirrors (inode + mtime + size; nil = file
+    /// absent when cached). Reads revalidate against it, so an edit made by
+    /// the agent's file tools, a human, or a profile import in another
+    /// process is seen on the next access instead of at the next restart.
+    nonisolated(unsafe) private static var cachedStamp: DiskStamp?
+    private struct DiskStamp: Equatable {
+        var inode: UInt64
+        var mtimeSec: Int
+        var mtimeNSec: Int
+        var size: Int64
+    }
+    /// Test seam (selftests only): runs inside the routing lock between the
+    /// fresh read and the conditional replacement in `migrateRoutingFile`.
+    nonisolated(unsafe) static var testHookBeforeConditionalWrite: (() -> Void)?
     nonisolated(unsafe) private static var cachedInstalledServers: Set<String> = []
     nonisolated(unsafe) private static var cachedMCPToolNames: Set<String> = []
     nonisolated(unsafe) private static var cachedSurface: MCPToolSurface?
@@ -248,6 +265,12 @@ enum MCPAgentRouting {
         if let surface = currentSurfaceSnapshot() {
             config = canonicalized(config, surface: surface).config
         }
+        try withRoutingLock { try writeLocked(config) }
+    }
+
+    /// Serialize and atomically replace the routing file. Caller holds the
+    /// routing lock. Updates the cache and its disk stamp.
+    private static func writeLocked(_ config: [String: AgentRouting]) throws {
         let url = routingURL()
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
@@ -269,9 +292,49 @@ enum MCPAgentRouting {
             options: [.prettyPrinted, .sortedKeys]
         )
         try data.write(to: url, options: .atomic)
+        let stamp = currentStamp()
         cacheLock.lock()
         cachedConfig = config
+        cachedStamp = stamp
         cacheLock.unlock()
+    }
+
+    /// Stable sidecar lock for the official writers (`save` from profile
+    /// import, `migrateRoutingFile`). The routing file itself is replaced
+    /// atomically (new inode) so the lock cannot live on it. Cross-process
+    /// `flock`, released on return; the fd is CLOEXEC so a spawned MCP
+    /// server can never inherit and hold it.
+    static func routingLockURL() -> URL {
+        StoragePaths.configRoot.appendingPathComponent("mcp-routing.lock")
+    }
+
+    private static func withRoutingLock<T>(_ body: () throws -> T) throws -> T {
+        let url = routingLockURL()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "cannot open \(url.path) for locking"])
+        }
+        defer { close(fd) }
+        while flock(fd, LOCK_EX) != 0 {
+            if errno == EINTR { continue }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "cannot lock \(url.path)"])
+        }
+        defer { flock(fd, LOCK_UN) }
+        return try body()
+    }
+
+    private static func currentStamp() -> DiskStamp? {
+        var st = stat()
+        guard stat(routingURL().path, &st) == 0 else { return nil }
+        #if os(Linux)
+        let sec = Int(st.st_mtim.tv_sec), nsec = Int(st.st_mtim.tv_nsec)
+        #else
+        let sec = Int(st.st_mtimespec.tv_sec), nsec = Int(st.st_mtimespec.tv_nsec)
+        #endif
+        return DiskStamp(inode: UInt64(st.st_ino), mtimeSec: sec, mtimeNSec: nsec, size: Int64(st.st_size))
     }
 
     /// Read the current routing config (creating an empty one in memory if
@@ -425,19 +488,49 @@ enum MCPAgentRouting {
     /// changed, records diagnostics for doctor. Called once per turn from
     /// `refreshFromRegistry()`.
     static func migrateRoutingFile(surface: MCPToolSurface) {
-        let config = loadConfigIfNeeded()
-        let result = canonicalized(config, surface: surface)
-        if result.changed {
-            do {
-                try save(config: result.config)
-                DebugTelemetry.log(.toolStart, summary: "mcp routing migrated to canonical aliases",
-                                   detail: routingURL().path)
-            } catch {
-                DebugTelemetry.log(.toolError, summary: "mcp routing migration failed",
-                                   detail: String(describing: error), isError: true)
+        // Under the sidecar lock: re-read the file (never the cache — a
+        // profile import in another process or a direct edit may have
+        // replaced it since), canonicalize, and replace only if the bytes
+        // on disk are still the bytes that were read. Official writers are
+        // serialized by the lock; an uncoordinated external writer in the
+        // remaining window is detected by the byte comparison and the
+        // migration simply waits for the next turn instead of clobbering.
+        var result: (config: [String: AgentRouting], changed: Bool, diagnostics: [Diagnostic])?
+        do {
+            try withRoutingLock {
+                let url = routingURL()
+                let bytesBefore = try? Data(contentsOf: url)
+                let config = bytesBefore.flatMap(parseConfig) ?? [:]
+                let r = canonicalized(config, surface: surface)
+                result = r
+                if r.changed {
+                    testHookBeforeConditionalWrite?()
+                    let bytesNow = try? Data(contentsOf: url)
+                    if bytesNow != bytesBefore {
+                        DebugTelemetry.log(.toolStart, summary: "mcp routing changed underneath; migration deferred to the next turn",
+                                           detail: url.path)
+                        cacheLock.lock()
+                        cachedConfig = nil
+                        cachedStamp = nil
+                        cacheLock.unlock()
+                        return
+                    }
+                    try writeLocked(r.config)
+                    DebugTelemetry.log(.toolStart, summary: "mcp routing migrated to canonical aliases", detail: url.path)
+                } else {
+                    let stamp = currentStamp()
+                    cacheLock.lock()
+                    cachedConfig = config
+                    cachedStamp = stamp
+                    cacheLock.unlock()
+                }
             }
+        } catch {
+            DebugTelemetry.log(.toolError, summary: "mcp routing migration failed",
+                               detail: String(describing: error), isError: true)
         }
-        let diagnostics = result.diagnostics + fallbackPatternDiagnostics(surface: surface)
+        let r = result ?? canonicalized(loadConfigIfNeeded(), surface: surface)
+        let diagnostics = r.diagnostics + fallbackPatternDiagnostics(surface: surface)
         persistDiagnostics(diagnostics)
     }
 
@@ -504,8 +597,9 @@ enum MCPAgentRouting {
     // MARK: - Config loading
 
     private static func loadConfigIfNeeded() -> [String: AgentRouting] {
+        let stamp = currentStamp()
         cacheLock.lock()
-        if let cached = cachedConfig {
+        if let cached = cachedConfig, cachedStamp == stamp {
             cacheLock.unlock()
             return cached
         }
@@ -514,6 +608,7 @@ enum MCPAgentRouting {
         let loaded = loadFromDisk() ?? [:]
         cacheLock.lock()
         cachedConfig = loaded
+        cachedStamp = stamp
         cacheLock.unlock()
         return loaded
     }
@@ -521,8 +616,14 @@ enum MCPAgentRouting {
     private static func loadFromDisk() -> [String: AgentRouting]? {
         let url = routingURL()
         guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        return parseConfig(data)
+    }
+
+    private static func parseConfig(_ data: Data) -> [String: AgentRouting]? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
         var out: [String: AgentRouting] = [:]

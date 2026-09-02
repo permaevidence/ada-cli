@@ -239,6 +239,34 @@ enum HarnessSecretStore {
         "refused: \(storePath) is Briglia's own secret store and cannot be deleted or moved by the file tools. Use edit_file for individual fields; /deleteuserdata removes the store."
     }
 
+    /// Post-edit invariant, the check the text-level refusals cannot provide
+    /// (an edit may target a substring of the token or of the field name):
+    /// parse both versions of the store and require the token entry to be
+    /// byte-identical. A result that is no longer a JSON object of strings is
+    /// refused too — the store's own loader would reject it and every key
+    /// would be lost to the daemon.
+    static func tokenInvariantViolation(original: String, updated: String) -> String? {
+        func parse(_ s: String) -> [String: String]? {
+            guard let data = s.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            var out: [String: String] = [:]
+            for (k, v) in obj {
+                guard let str = v as? String else { return nil }
+                out[k] = str
+            }
+            return out
+        }
+        guard let after = parse(updated) else {
+            return "edit refused: the result is not a JSON object of string values, which is the only shape Briglia's secret store accepts — the daemon would lose every key. Edit one field at a time and keep the file valid JSON."
+        }
+        let before = parse(original)
+        let key = KeychainHelper.telegramBotTokenKey
+        if before?[key] != after[key] {
+            return "edit refused: the result changes the Telegram bot token entry of Briglia's secret store (the edit overlapped the token or its field name). The token is managed by /switchbot (and `briglia setup`); every other field of this file can be edited one at a time."
+        }
+        return nil
+    }
+
     private static func refusalForTokenField(texts: [String]) -> String? {
         let fieldMarker = "\"\(KeychainHelper.telegramBotTokenKey)\""
         let token = storedToken()

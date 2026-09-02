@@ -1250,12 +1250,18 @@ struct MigrationSelftest: AsyncParsableCommand {
                       finished.code == 0 && !fm.fileExists(atPath: fixture.stateDir),
                       finished.output)
             } else {
-                try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parkedPath)
+                // Recovery re-tightens parked/ itself to 0700 (H7.4b), so the
+                // undeletable simulation lives one level down: a 0500 child
+                // directory with a file inside makes removeItem(parked) fail.
+                let stuck = parkedPath + "/stuck"
+                try fm.createDirectory(atPath: stuck, withIntermediateDirectories: true)
+                fm.createFile(atPath: stuck + "/keep", contents: Data("x".utf8))
+                try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: stuck)
                 let held = runEngine(fixture)
                 check("cleanup-retry: undeletable parked dir reported, journal retained",
                       held.code == 0 && held.output.contains("could not remove")
                       && fm.fileExists(atPath: fixture.stateDir + "/journal.json"), held.output)
-                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parkedPath)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stuck)
                 let finished = runEngine(fixture)
                 check("cleanup-retry: after repair, cleanup completes and the journal is gone",
                       finished.code == 0 && !fm.fileExists(atPath: fixture.stateDir),
@@ -2421,6 +2427,42 @@ struct MigrationSelftest: AsyncParsableCommand {
             check("H7.4: state dir, preimages/ and parked/ are 0700", modes.allSatisfy { $0 == 0o700 },
                   modes.map { $0.map { String($0, radix: 8) } ?? "missing" }.joined(separator: ","))
             _ = runEngine(fixture)
+        }
+
+        // H7.4b — recovery re-tightens a journal area an older build created
+        //         at 0755, and refuses an entry that is no longer a directory.
+        do {
+            let fixture = try makeFixture("h7-modes-recover", units: false)
+            let fm = FileManager.default
+            let preimages = fixture.stateDir + "/preimages"
+            let parked = fixture.stateDir + "/parked"
+            let journalPath = fixture.stateDir + "/journal.json"
+            let crashed = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-prepared"])
+            check("H7.4b: crash injected after prepare", crashed.code == 137, crashed.output)
+            _ = chmod(preimages, 0o755)
+            _ = chmod(parked, 0o755)
+            let tightened = runEngine(fixture, env: ["BRIGLIA_MIGRATE_CRASH_POINT": "after-recovery-tighten"])
+            check("H7.4b: crash injected right after recovery tightened the journal area", tightened.code == 137, tightened.output)
+            let modes = [fixture.stateDir, preimages, parked].map { MigrationEngine.fileMode($0) }
+            check("H7.4b: recovery re-applies 0700 to pre-existing preimages/ and parked/", modes.allSatisfy { $0 == 0o700 },
+                  modes.map { $0.map { String($0, radix: 8) } ?? "missing" }.joined(separator: ","))
+            // parked/ replaced by a symlink to a decoy directory: refused, nothing touched.
+            let decoy = fixture.stateDir + "-decoy"
+            try fm.createDirectory(atPath: decoy, withIntermediateDirectories: true)
+            try fm.removeItem(atPath: parked)
+            try fm.createSymbolicLink(atPath: parked, withDestinationPath: decoy)
+            let refused = runEngine(fixture)
+            let parkedIsLink = (try? fm.destinationOfSymbolicLink(atPath: parked)) != nil
+            check("H7.4b: recovery refuses a journal-area entry that is not a directory (parked/ → symlink), journal preserved",
+                  refused.code != 0 && refused.output.contains("not a directory") && fm.fileExists(atPath: journalPath),
+                  refused.output)
+            check("H7.4b: the planted symlink and its target were not touched",
+                  parkedIsLink && fm.fileExists(atPath: decoy))
+            try fm.removeItem(atPath: parked)
+            try fm.createDirectory(atPath: parked, withIntermediateDirectories: false,
+                                   attributes: [.posixPermissions: 0o700])
+            let done = runEngine(fixture)
+            check("H7.4b: with the directory restored, recovery completes forward", done.code == 0, done.output)
         }
 
         // H7.5 — subprocess output files live under the journal area.
