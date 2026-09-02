@@ -81,9 +81,11 @@ enum ApplyPatch {
                 }
             } catch let e as PatchError {
                 // Attempt rollback.
+                testHookBeforeRollback?()
                 rollback(applied: applied)
                 return OpResult(content: jsonError("patch apply failed mid-write: \(e.message). Rolled back any prior writes."))
             } catch {
+                testHookBeforeRollback?()
                 rollback(applied: applied)
                 return OpResult(content: jsonError("patch apply failed mid-write: \(error.localizedDescription). Rolled back any prior writes."))
             }
@@ -553,14 +555,24 @@ enum ApplyPatch {
         }
     }
 
+    /// Test seam (selftests only): runs right before a mid-write failure's rollback.
+    nonisolated(unsafe) static var testHookBeforeRollback: (() -> Void)?
+
+    /// Rollback is a mutation path like the commit: its writes and deletes of
+    /// the MCP routing file take the routing lock too, so a restore can never
+    /// land between the per-turn migration's byte check and its replacement.
     private static func rollback(applied: [(path: String, preImage: Data?)]) {
         for step in applied.reversed() {
             if let preImage = step.preImage {
                 // Resolve like commitPlan does — restoring through the unresolved
                 // path would replace a symlink the commit wrote through.
-                try? preImage.write(to: URL(fileURLWithPath: step.path).resolvingSymlinksInPath(), options: .atomic)
+                try? MCPAgentRouting.withLockIfRoutingFile(step.path) {
+                    try preImage.write(to: URL(fileURLWithPath: step.path).resolvingSymlinksInPath(), options: .atomic)
+                }
             } else {
-                try? FileManager.default.removeItem(atPath: step.path)
+                try? MCPAgentRouting.withLockIfRoutingFile(step.path) {
+                    try FileManager.default.removeItem(atPath: step.path)
+                }
             }
         }
     }

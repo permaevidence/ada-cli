@@ -542,6 +542,57 @@ struct MCPSurfaceSelftest: AsyncParsableCommand {
                   settled2["Late2"]?.always == [MCPNaming.toolAlias(handle: "std", toolName: "a.b")]
                   && settled2["ToolWriter"]?.always == [abList], "\(settled2)")
 
+            // 4.20 (Codex, round 3) apply_patch ROLLBACK is a mutation path too:
+            //      op1 rewrites the routing file (legacy name), op2 fails at
+            //      commit; the migration enters its post-check seam between
+            //      op1's write and the rollback. The rollback must wait for the
+            //      lock and its restored bytes must survive.
+            let preBytes = try Data(contentsOf: routingURL)
+            let preLines = String(decoding: preBytes, as: UTF8.self).components(separatedBy: "\n")
+            let anchorLine = preLines.first { $0.contains("\"ToolWriter\"") } ?? ""
+            _ = await FilesystemTools.shared.readFile(path: routingURL.path)
+            let blocker = tempRoot.appendingPathComponent("not-a-dir.txt")
+            try Data("x".utf8).write(to: blocker)
+            let failingPatch = """
+            *** Begin Patch
+            *** Update File: \(routingURL.path)
+            @@
+            -\(anchorLine)
+            +  "Rollback" : [ "mcp__std__a.b" ],
+            +\(anchorLine)
+            *** Add File: \(blocker.path)/child.txt
+            +never written
+            *** End Patch
+            """
+            let seamEntered = DispatchSemaphore(value: 0)
+            var migrationEnded: Date?
+            var rollbackWriteEnded: Date?
+            MCPAgentRouting.testHookAfterConditionalCheck = {
+                seamEntered.signal()
+                Thread.sleep(forTimeInterval: 0.6)
+                migrationEnded = Date()
+            }
+            var migrationTask: Task<Void, Never>?
+            ApplyPatch.testHookBeforeRollback = {
+                // op1 is on disk; start the per-turn migration and let it reach
+                // the seam (it now holds the lock) before rollback proceeds.
+                migrationTask = Task.detached { await MCPAgentRouting.refreshFromRegistry() }
+                seamEntered.wait()
+            }
+            let patchResult = await ApplyPatch.run(patchText: failingPatch)
+            rollbackWriteEnded = Date()
+            ApplyPatch.testHookBeforeRollback = nil
+            await migrationTask?.value
+            MCPAgentRouting.testHookAfterConditionalCheck = nil
+            let afterRollback = try Data(contentsOf: routingURL)
+            check("4.20 a failed multi-file patch's rollback of the routing file waits for the lock and survives the migration",
+                  patchResult.content.contains("Rolled back") && afterRollback == preBytes
+                  && (rollbackWriteEnded ?? .distantPast) >= (migrationEnded ?? .distantFuture),
+                  "result=\(patchResult.content.prefix(160)) restored=\(afterRollback == preBytes) rollback=\(String(describing: rollbackWriteEnded)) migration=\(String(describing: migrationEnded))")
+            await MCPAgentRouting.refreshFromRegistry()
+            check("4.20b after the rollback the routing file carries no trace of the failed patch",
+                  MCPAgentRouting.currentConfig()["Rollback"] == nil)
+
             // 4.18 the sidecar lock serializes official writers across processes:
             //      while another holder has it, save() waits.
             let lockPath = MCPAgentRouting.routingLockURL().path
