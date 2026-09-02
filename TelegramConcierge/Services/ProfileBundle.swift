@@ -42,12 +42,21 @@ enum ProfileBundle {
         // mcp.json — re-encode from the struct list so we strip any extraneous
         // fields and produce a canonical sort order.
         let servers = MCPRegistry.loadConfigsFromDisk()
+        let layout = ManagedPlaywright.Layout()
         var mcpServers: [String: Any] = [:]
         for cfg in servers {
-            var dict: [String: Any] = [
-                "command": cfg.command,
-                "args": cfg.arguments
-            ]
+            var dict: [String: Any]
+            if case .managed(let hash) = ManagedPlaywright.shape(of: cfg, layout: layout) {
+                // Logical representation (plan §H4.4 item 6): the managed
+                // marker only — never this machine's installation path.
+                dict = ["managed": ManagedPlaywright.managedMarker(hash: hash)]
+            } else {
+                dict = [
+                    "command": cfg.command,
+                    "args": cfg.arguments
+                ]
+                if let managed = cfg.managed { dict["managed"] = managed }
+            }
             if !cfg.environment.isEmpty { dict["env"] = cfg.environment }
             if cfg.disabled { dict["disabled"] = true }
             if !cfg.secretRefs.isEmpty { dict["secretRefs"] = cfg.secretRefs }
@@ -104,7 +113,7 @@ enum ProfileBundle {
     /// Parse and apply a bundle. Merges — existing MCPs / agents / routing
     /// entries not mentioned in the bundle are left untouched. Entries that
     /// DO appear are overwritten.
-    static func importData(_ data: Data) throws -> ImportResult {
+    static func importData(_ data: Data) async throws -> ImportResult {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw NSError(domain: "ProfileBundle", code: 1, userInfo: [NSLocalizedDescriptionKey: "Bundle is not a JSON object"])
         }
@@ -128,26 +137,44 @@ enum ProfileBundle {
         var merged: [String: MCPServerConfig] = Dictionary(uniqueKeysWithValues: existingServers.map { ($0.name, $0) })
 
         if let bundled = root["mcpServers"] as? [String: Any] {
+            let layout = ManagedPlaywright.Layout()
             for (name, raw) in bundled {
-                guard let dict = raw as? [String: Any],
-                      let command = dict["command"] as? String else {
+                guard let dict = raw as? [String: Any] else {
                     warnings.append("Server '\(name)' in bundle is malformed — skipped.")
                     continue
                 }
-                let args = (dict["args"] as? [String]) ?? []
                 let env = (dict["env"] as? [String: String]) ?? [:]
                 let disabled = (dict["disabled"] as? Bool) ?? false
                 let secretRefs = (dict["secretRefs"] as? [String]) ?? []
                 let desc = dict["description"] as? String
-                let cfg = MCPServerConfig(
-                    name: name,
-                    command: command,
-                    arguments: args,
-                    environment: env,
-                    disabled: disabled,
-                    secretRefs: secretRefs,
-                    description: desc
-                )
+                let cfg: MCPServerConfig
+                if name == ManagedPlaywright.serverName, dict["command"] == nil,
+                   let marker = dict["managed"] as? String {
+                    // Logical managed entry: resolve against THIS machine's
+                    // managed installation. Never commits a reference to a
+                    // directory that is not here (managed-entry verification).
+                    let carried = MCPServerConfig(name: name, command: "", environment: env,
+                                                  disabled: disabled, secretRefs: secretRefs, description: desc)
+                    let (resolved, warning) = resolveManagedPlaywright(marker: marker, layout: layout, basedOn: carried)
+                    if let warning { warnings.append(warning) }
+                    cfg = resolved
+                } else {
+                    guard let command = dict["command"] as? String else {
+                        warnings.append("Server '\(name)' in bundle is malformed — skipped.")
+                        continue
+                    }
+                    let args = (dict["args"] as? [String]) ?? []
+                    cfg = MCPServerConfig(
+                        name: name,
+                        command: command,
+                        arguments: args,
+                        environment: env,
+                        disabled: disabled,
+                        secretRefs: secretRefs,
+                        description: desc,
+                        managed: dict["managed"] as? String
+                    )
+                }
                 if merged[name] != nil {
                     replacedServers.append(name)
                 } else {
@@ -161,7 +188,7 @@ enum ProfileBundle {
                     }
                 }
             }
-            try MCPRegistry.saveConfigsToDisk(Array(merged.values))
+            try await MCPRegistry.shared.saveConfigs(Array(merged.values))
         }
 
         // --- MCP routing ---
@@ -220,6 +247,29 @@ enum ProfileBundle {
             secretsToPopulate: secretsToPopulate,
             warnings: warnings
         )
+    }
+
+    /// The local counterpart of an exported managed marker: the same
+    /// version if it is installed here (marker present), else this build's
+    /// pinned version if installed, else the legacy auto shape — which the
+    /// next start switches once the managed install exists.
+    static func resolveManagedPlaywright(marker: String, layout: ManagedPlaywright.Layout,
+                                         basedOn carried: MCPServerConfig?,
+                                         bundledHash: String? = (try? ManagedPlaywright.Manifests.bundled())?.lockfileHash)
+        -> (MCPServerConfig, String?) {
+        func installed(_ hash: String) -> Bool {
+            let marker = layout.versionDirectory(hash: hash).appendingPathComponent(ManagedPlaywright.completionMarkerName)
+            return (try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == hash
+        }
+        if let hash = ManagedPlaywright.hash(fromMarker: marker), installed(hash) {
+            return (ManagedPlaywright.managedConfig(hash: hash, layout: layout, basedOn: carried), nil)
+        }
+        if let bundledHash, installed(bundledHash) {
+            return (ManagedPlaywright.managedConfig(hash: bundledHash, layout: layout, basedOn: carried),
+                    "playwright: the bundle's managed version is not installed here — resolved to this build's pinned version (playwright-\(bundledHash)).")
+        }
+        return (ManagedPlaywright.legacyConfig(basedOn: carried),
+                "playwright: managed Playwright is not installed on this machine yet — the next start installs the pinned version and switches the entry.")
     }
 
     // MARK: - Helpers

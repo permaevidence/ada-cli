@@ -33,6 +33,13 @@ public struct MCPServerConfig: Sendable, Equatable {
     /// Human-readable purpose shown to the LLM when the server is deferred
     /// for an agent. Auto-generated from tool names if nil.
     public let description: String?
+    /// Marker of a Briglia-managed installation (`"playwright@<lockfile
+    /// hash>"`): the entry's command/args point at the immutable versioned
+    /// directory that `ManagedPlaywright` installed from the bundled
+    /// lockfile. Round-trips through load/save and the profile bundle
+    /// (exported logically, without the machine-specific path). Nil for
+    /// every user-authored server.
+    public let managed: String?
 
     public init(
         name: String,
@@ -41,7 +48,8 @@ public struct MCPServerConfig: Sendable, Equatable {
         environment: [String: String] = [:],
         disabled: Bool = false,
         secretRefs: [String] = [],
-        description: String? = nil
+        description: String? = nil,
+        managed: String? = nil
     ) {
         self.name = name
         self.command = command
@@ -50,6 +58,7 @@ public struct MCPServerConfig: Sendable, Equatable {
         self.disabled = disabled
         self.secretRefs = secretRefs
         self.description = description
+        self.managed = managed
     }
 }
 

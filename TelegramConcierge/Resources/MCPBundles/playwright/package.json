@@ -1,0 +1,9 @@
+{
+  "name": "briglia-managed-playwright",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned @playwright/mcp tree installed by Briglia (npm ci against the committed lockfile)",
+  "dependencies": {
+    "@playwright/mcp": "0.0.80"
+  }
+}

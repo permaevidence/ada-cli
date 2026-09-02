@@ -25,6 +25,7 @@ let package = Package(
             resources: [
                 .copy("Resources/BundledSkills"),
                 .copy("Resources/WhatsAppBridge"),
+                .copy("Resources/MCPBundles"),
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v5)

@@ -7,6 +7,11 @@ import CryptoKit
 #else
 import Crypto
 #endif
+#if canImport(Glibc)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// Singleton actor: owns every connected MCP client, reads `~/.config/briglia/mcp.json`,
 /// resolves Keychain-backed secrets into the spawn environment, bootstraps
@@ -243,6 +248,7 @@ actor MCPRegistry {
             if cfg.disabled { dict["disabled"] = true }
             if !cfg.secretRefs.isEmpty { dict["secretRefs"] = cfg.secretRefs }
             if let desc = cfg.description, !desc.isEmpty { dict["description"] = desc }
+            if let managed = cfg.managed, !managed.isEmpty { dict["managed"] = managed }
             servers[cfg.name] = dict
         }
         let root: [String: Any] = ["mcpServers": servers]
@@ -258,6 +264,79 @@ actor MCPRegistry {
 
     public static func mcpConfigPath() -> String {
         mcpConfigURL().path
+    }
+
+    /// Actor-serialized full save (profile import): the official writers of
+    /// mcp.json are this actor's methods; nothing else in the daemon writes
+    /// the file (plan §H4.4 writer model).
+    func saveConfigs(_ configs: [MCPServerConfig]) throws {
+        try Self.saveConfigsToDisk(configs)
+    }
+
+    enum ManagedEntryUpdate: Equatable {
+        /// The playwright entry now references `playwright-<hash>`.
+        case switched(from: ManagedPlaywright.EntryShape)
+        /// It already did.
+        case alreadyCurrent
+        /// User-authored / edited / disabled: not touched.
+        case leftAlone(ManagedPlaywright.EntryShape)
+        /// No entry existed and `addIfAbsent` was false.
+        case absent
+        case failed(String)
+    }
+
+    /// The switch (plan §H4.4 item 5): re-read `mcp.json` as raw JSON, change
+    /// ONLY the playwright entry's `command`/`args`/`managed` (every other key
+    /// of that entry and every other server survive exactly as parsed —
+    /// including keys this build does not know), write atomically. Refuses
+    /// to reference a directory without its completion marker (managed-entry
+    /// verification). Does not restart clients — the caller reloads.
+    func updateManagedPlaywrightEntry(hash: String, layout: ManagedPlaywright.Layout,
+                                      addIfAbsent: Bool,
+                                      crashAfterWrite: Bool = false) -> ManagedEntryUpdate {
+        let marker = layout.versionDirectory(hash: hash).appendingPathComponent(ManagedPlaywright.completionMarkerName)
+        guard (try? String(contentsOf: marker, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) == hash else {
+            return .failed("playwright-\(hash) has no valid completion marker — not referencing it")
+        }
+        let url = Self.mcpConfigURL()
+        var root: [String: Any] = [:]
+        if let data = FileManager.default.contents(atPath: url.path) {
+            guard let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .failed("mcp.json is not a JSON object — left untouched")
+            }
+            root = parsed
+        }
+        var servers = (root["mcpServers"] as? [String: Any]) ?? [:]
+        let rawEntry = servers[ManagedPlaywright.serverName] as? [String: Any]
+        let current = Self.loadConfigs().first { $0.name == ManagedPlaywright.serverName }
+        let shape = ManagedPlaywright.shape(of: current, layout: layout)
+        switch shape {
+        case .managed(let existing) where existing == hash:
+            return .alreadyCurrent
+        case .managed, .legacyAuto:
+            break
+        case .absent:
+            guard addIfAbsent else { return .absent }
+        case .managedEdited, .userAuthored, .disabled:
+            return .leftAlone(shape)
+        }
+        let invocation = ManagedPlaywright.managedInvocation(hash: hash, layout: layout)
+        var entry = rawEntry ?? ["description": ManagedPlaywright.defaultDescription]
+        entry["command"] = invocation.command
+        entry["args"] = invocation.arguments
+        entry["managed"] = ManagedPlaywright.managedMarker(hash: hash)
+        servers[ManagedPlaywright.serverName] = entry
+        root["mcpServers"] = servers
+        do {
+            try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
+            let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            try PrivateStorage.writeAtomically(data, to: url, mode: 0o600)
+        } catch {
+            return .failed("could not write mcp.json: \(error)")
+        }
+        if crashAfterWrite { _exit(137) }
+        return .switched(from: shape)
     }
 
     // MARK: - Bootstrap
@@ -352,6 +431,7 @@ actor MCPRegistry {
             let disabled = (dict["disabled"] as? Bool) ?? false
             let secretRefs = (dict["secretRefs"] as? [String]) ?? []
             let desc = dict["description"] as? String
+            let managed = dict["managed"] as? String
             out.append(MCPServerConfig(
                 name: name,
                 command: command,
@@ -359,7 +439,8 @@ actor MCPRegistry {
                 environment: env,
                 disabled: disabled,
                 secretRefs: secretRefs,
-                description: desc
+                description: desc,
+                managed: managed
             ))
         }
         return out.sorted { $0.name < $1.name }
@@ -391,7 +472,9 @@ actor MCPRegistry {
         return env
     }
 
-    private static func baseEnvironment() -> [String: String] {
+    /// Internal: `ManagedPlaywright` runs npm and its verification handshake
+    /// in the same environment the server will later be spawned with.
+    nonisolated static func baseEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         // Augment PATH with common install locations so `npx`, `uvx`,
         // `bun`, `python3`, etc. resolve reliably from a GUI-launched
@@ -429,7 +512,8 @@ actor MCPRegistry {
                     environment: config.environment,
                     disabled: config.disabled,
                     secretRefs: config.secretRefs,
-                    description: config.description
+                    description: config.description,
+                    managed: config.managed
                 )
             }
         }
@@ -627,16 +711,85 @@ enum NodeInstaller {
 
 // MARK: - Automatic browser-automation setup
 
-/// Turns on autonomous web browsing without an onboarding step: registers the
-/// Playwright MCP server once and installs Node.js in the background if it's
-/// missing. Runs on every launch of the main window; both halves are no-ops
-/// when already done. The Playwright browser itself downloads on first use.
+/// Turns on autonomous web browsing without an onboarding step: keeps the
+/// `playwright` MCP server registered as the lockfile-managed install
+/// (`ManagedPlaywright`), installing Node.js in the background if it is
+/// missing or too old. Runs on every daemon start; every half is a no-op when
+/// already done. The Playwright browser itself downloads on first use.
+///
+/// Decision table on the current `mcp.json` entry (`ManagedPlaywright.shape`):
+///   absent            fresh install (flag not set): install, then ADD the entry
+///                     only once a verified install exists — a fresh install
+///                     never runs `@latest`; on failure nothing is written and
+///                     the next start retries
+///   legacy auto       (`npx @playwright/mcp@latest`): install, then switch
+///   managed           verify/reuse (or rebuild), re-point when this build
+///                     pins another lockfile
+///   edited/user/disabled  left alone, reported by doctor
 enum BrowserAutomationBootstrap {
     private static let autoConfiguredKey = "playwright_auto_configured"
 
+    /// "Auto-added once; never re-add after a deliberate removal." Lives in
+    /// UserDefaults in production; the selftest substitutes a file.
+    struct FlagStore: Sendable {
+        var isSet: @Sendable () -> Bool
+        var set: @Sendable () -> Void
+        var clear: @Sendable () -> Void
+
+        static let userDefaults = FlagStore(
+            isSet: { UserDefaults.standard.bool(forKey: autoConfiguredKey) },
+            set: { UserDefaults.standard.set(true, forKey: autoConfiguredKey) },
+            clear: { UserDefaults.standard.removeObject(forKey: autoConfiguredKey) })
+
+        static func file(_ url: URL) -> FlagStore {
+            FlagStore(
+                isSet: { FileManager.default.fileExists(atPath: url.path) },
+                set: { try? PrivateStorage.writeAtomically(Data("1".utf8), to: url) },
+                clear: { try? FileManager.default.removeItem(at: url) })
+        }
+    }
+
+    struct Dependencies: Sendable {
+        var layout = ManagedPlaywright.Layout()
+        var manifests: @Sendable () throws -> ManagedPlaywright.Manifests = { try ManagedPlaywright.Manifests.bundled() }
+        var flag: FlagStore = .userDefaults
+        /// Directory holding a usable node + npm, installing Node if needed;
+        /// `(nil, reason)` when none can be had.
+        var nodeDirectory: @Sendable () async -> (String?, String?) = { await ensureNodeDirectory() }
+        var baseEnvironment: [String: String] = MCPRegistry.baseEnvironment()
+        var npmTimeout: TimeInterval = ManagedPlaywright.npmTimeout
+        var handshakeTimeout: TimeInterval = 30
+        var crashPoint: ManagedPlaywright.CrashPoint? = nil
+        /// Restart the registry after a switch (production: yes; the selftest
+        /// inspects the file instead).
+        var reloadRegistry = true
+        var log: @Sendable (String) -> Void = { NSLog("BrowserAutomationBootstrap: %@", $0) }
+    }
+
+    enum Outcome: Equatable {
+        /// The entry references the verified `playwright-<hash>`; `changed`
+        /// says whether this run wrote it.
+        case configured(hash: String, changed: Bool)
+        case leftAlone(ManagedPlaywright.EntryShape)
+        /// Deliberately removed earlier: nothing to do.
+        case notWanted
+        case skipped(String)
+        case failed(String)
+    }
+
     static func ensureConfigured() async {
-        var configs = MCPRegistry.loadConfigsFromDisk()
-        let hasEntry = configs.contains { $0.name == "playwright" }
+        _ = await ensureConfigured(dependencies: Dependencies())
+    }
+
+    @discardableResult
+    static func ensureConfigured(dependencies deps: Dependencies) async -> Outcome {
+        let layout = deps.layout
+        func record(_ outcome: String, hash: String? = nil, reason: String? = nil) {
+            ManagedPlaywright.recordStatus(
+                ManagedPlaywright.BootstrapStatus(at: Date(), outcome: outcome, hash: hash, reason: reason),
+                layout: layout)
+        }
+        let entry = MCPRegistry.loadConfigsFromDisk().first { $0.name == ManagedPlaywright.serverName }
 
         // The "don't re-add after deliberate removal" flag lives in
         // UserDefaults (~/Library/Preferences), which survives a full wipe of
@@ -647,39 +800,92 @@ enum BrowserAutomationBootstrap {
         // uninstall + reinstall came up without the Browse subagent because
         // the stale flag suppressed re-registration.)
         if !FileManager.default.fileExists(atPath: MCPRegistry.configFileURL.path) {
-            UserDefaults.standard.removeObject(forKey: autoConfiguredKey)
+            deps.flag.clear()
+        }
+        if entry != nil { deps.flag.set() }
+
+        let shape = ManagedPlaywright.shape(of: entry, layout: layout)
+        switch shape {
+        case .absent:
+            guard !deps.flag.isSet() else { return .notWanted }
+        case .legacyAuto, .managed:
+            break
+        case .managedEdited, .userAuthored, .disabled:
+            record("left-alone", reason: "\(shape)")
+            return .leftAlone(shape)
         }
 
-        // Register the server exactly once. If an entry exists — including one
-        // the user disabled or edited — leave it alone; and once we've
-        // auto-added it, never re-add after a deliberate removal.
-        if !hasEntry && !UserDefaults.standard.bool(forKey: autoConfiguredKey) {
-            configs.append(MCPServerConfig(
-                name: "playwright",
-                command: "npx",
-                arguments: ["@playwright/mcp@latest"],
-                description: "Browser automation (drives a local browser for the Browse subagent)"
-            ))
-            do {
-                try MCPRegistry.saveConfigsToDisk(configs)
-                UserDefaults.standard.set(true, forKey: autoConfiguredKey)
-                await MCPRegistry.shared.reloadFromDisk()
-                await MCPAgentRouting.refreshFromRegistry()
-            } catch {
-                NSLog("BrowserAutomationBootstrap: failed to save playwright config: \(error.localizedDescription)")
-            }
-        } else if hasEntry {
-            UserDefaults.standard.set(true, forKey: autoConfiguredKey)
+        let manifests: ManagedPlaywright.Manifests
+        do {
+            manifests = try deps.manifests()
+        } catch {
+            let reason = "bundled Playwright manifests unavailable: \(error)"
+            deps.log(reason)
+            record("failed", reason: reason)
+            return .failed(reason)
         }
+        let (nodeDirectory, nodeReason) = await deps.nodeDirectory()
+        guard let nodeDirectory else {
+            let reason = "Node.js unavailable: \(nodeReason ?? "unknown")"
+            deps.log(reason)
+            record("failed", hash: manifests.lockfileHash, reason: reason)
+            return .failed(reason)
+        }
+        let context = ManagedPlaywright.Context(
+            layout: layout, manifests: manifests, nodeDirectory: nodeDirectory,
+            environment: ManagedPlaywright.Context.environment(nodeDirectory: nodeDirectory, base: deps.baseEnvironment),
+            npmTimeout: deps.npmTimeout, handshakeTimeout: deps.handshakeTimeout,
+            crashPoint: deps.crashPoint, log: deps.log)
+        switch await ManagedPlaywright.ensureInstalled(context: context) {
+        case .skipped(let reason):
+            deps.log("skipped: \(reason)")
+            record("skipped", hash: manifests.lockfileHash, reason: reason)
+            return .skipped(reason)
+        case .failed(let reason):
+            deps.log("install failed: \(reason)")
+            record("failed", hash: manifests.lockfileHash, reason: reason)
+            return .failed(reason)
+        case .ready(let hash, let reused):
+            let update = await MCPRegistry.shared.updateManagedPlaywrightEntry(
+                hash: hash, layout: layout, addIfAbsent: shape == .absent,
+                crashAfterWrite: deps.crashPoint == .afterConfigWrite)
+            switch update {
+            case .switched(let from):
+                deps.flag.set()
+                deps.log("playwright entry now references playwright-\(hash) (was \(from); install \(reused ? "reused" : "fresh"))")
+                record("ready", hash: hash)
+                if deps.reloadRegistry {
+                    await MCPRegistry.shared.reloadFromDisk()
+                    await MCPAgentRouting.refreshFromRegistry()
+                }
+                return .configured(hash: hash, changed: true)
+            case .alreadyCurrent:
+                record("ready", hash: hash)
+                return .configured(hash: hash, changed: false)
+            case .leftAlone(let current):
+                record("left-alone", hash: hash, reason: "\(current)")
+                return .leftAlone(current)
+            case .absent:
+                return .notWanted
+            case .failed(let reason):
+                deps.log("switch failed: \(reason)")
+                record("failed", hash: hash, reason: reason)
+                return .failed(reason)
+            }
+        }
+    }
 
-        // Playwright runs through npx: fetch Node quietly if it's absent.
-        // On failure just log — the next launch retries while node is missing.
-        let playwrightActive = MCPRegistry.loadConfigsFromDisk()
-            .contains { $0.name == "playwright" && !$0.disabled }
-        if playwrightActive && NodeInstaller.detectNode() == nil {
-            if let failure = await NodeInstaller.installNode() {
-                NSLog("BrowserAutomationBootstrap: background Node.js install failed: \(failure)")
-            }
+    /// A usable Node (≥ 20, npm beside it), installing the LTS into
+    /// ~/.local/node when none is found — quietly, as before; the next start
+    /// retries after a failure.
+    static func ensureNodeDirectory() async -> (String?, String?) {
+        let first = ManagedPlaywright.resolveNodeDirectory()
+        if let dir = first.directory { return (dir, nil) }
+        if let failure = await NodeInstaller.installNode() {
+            return (nil, "\(first.reason ?? "node not found"); background Node.js install failed: \(failure)")
         }
+        let second = ManagedPlaywright.resolveNodeDirectory(
+            preferred: NodeInstaller.binDir.appendingPathComponent("node").path)
+        return (second.directory, second.reason)
     }
 }

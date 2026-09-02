@@ -127,7 +127,7 @@ actor MCPClient {
         self.isAlive = true
     }
 
-    func initialize() async throws {
+    func initialize(timeout: TimeInterval = 30) async throws {
         let params: [String: Any] = [
             "protocolVersion": MCPProtocol.version,
             "capabilities": [
@@ -141,7 +141,7 @@ actor MCPClient {
         ]
         // Short timeout: initialize is awaited during turn-start bootstrap, so a
         // server that launches but never answers must not hang the agent.
-        _ = try await sendRequest(method: "initialize", params: params, timeout: 30)
+        _ = try await sendRequest(method: "initialize", params: params, timeout: timeout)
         try sendNotification(method: "notifications/initialized", params: [String: Any]())
         isInitialized = true
 

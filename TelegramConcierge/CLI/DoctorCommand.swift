@@ -83,6 +83,20 @@ struct Doctor: AsyncParsableCommand {
             }
         }
 
+        // Managed Playwright (Release C): the entry's shape, the referenced
+        // install's marker, unreferenced/leftover directories, last bootstrap.
+        let playwrightFindings = ManagedPlaywright.doctorFindings(
+            configs: MCPRegistry.loadConfigsFromDisk(), layout: ManagedPlaywright.Layout(),
+            bundledHash: (try? ManagedPlaywright.Manifests.bundled())?.lockfileHash)
+        print("\nBrowser automation (Playwright)")
+        for finding in playwrightFindings {
+            if finding.problem {
+                check(finding.text, ok: false, hint: finding.hint)
+            } else {
+                note(finding.text)
+            }
+        }
+
         // Storage permissions: everything under the roots (projects/ and
         // toolchain/ excluded) is expected owner-only; the daemon's startup
         // sweep tightens stragglers, doctor only reports them.
