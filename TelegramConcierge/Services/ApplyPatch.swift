@@ -513,7 +513,7 @@ enum ApplyPatch {
             let targetURL = URL(fileURLWithPath: path).resolvingSymlinksInPath()
             try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let previousMode = (try? fm.attributesOfItem(atPath: targetURL.path))?[.posixPermissions] as? NSNumber
-            try newContent.write(to: targetURL, options: .atomic)
+            try MCPAgentRouting.withLockIfRoutingFile(path) { try newContent.write(to: targetURL, options: .atomic) }
             if let previousMode {
                 try? fm.setAttributes([.posixPermissions: previousMode], ofItemAtPath: targetURL.path)
             }
@@ -525,14 +525,14 @@ enum ApplyPatch {
 
         case .add(let path, let content):
             try fm.createDirectory(at: URL(fileURLWithPath: path).deletingLastPathComponent(), withIntermediateDirectories: true)
-            try content.write(to: URL(fileURLWithPath: path), options: .atomic)
+            try MCPAgentRouting.withLockIfRoutingFile(path) { try content.write(to: URL(fileURLWithPath: path), options: .atomic) }
             applied.append((path: path, preImage: nil))  // nil preImage = delete on rollback
             await FileTimeTracker.shared.recordRead(path: path)
             await FilesLedger.shared.record(path: path, origin: .generated, description: nil)
             return (path, "", String(data: content, encoding: .utf8) ?? "")
 
         case .delete(let path, let preImage):
-            try fm.removeItem(atPath: path)
+            try MCPAgentRouting.withLockIfRoutingFile(path) { try fm.removeItem(atPath: path) }
             applied.append((path: path, preImage: preImage))
             await FileTimeTracker.shared.forget(path: path)
             await FilesLedger.shared.remove(path: path)
@@ -540,8 +540,8 @@ enum ApplyPatch {
 
         case .move(let fromPath, let toPath, let newContent, let preImage):
             try fm.createDirectory(at: URL(fileURLWithPath: toPath).deletingLastPathComponent(), withIntermediateDirectories: true)
-            try newContent.write(to: URL(fileURLWithPath: toPath), options: .atomic)
-            try fm.removeItem(atPath: fromPath)
+            try MCPAgentRouting.withLockIfRoutingFile(toPath) { try newContent.write(to: URL(fileURLWithPath: toPath), options: .atomic) }
+            try MCPAgentRouting.withLockIfRoutingFile(fromPath) { try fm.removeItem(atPath: fromPath) }
             applied.append((path: fromPath, preImage: preImage))  // rollback restores the original
             applied.append((path: toPath, preImage: nil))          // rollback deletes the new file
             await FileTimeTracker.shared.forget(path: fromPath)

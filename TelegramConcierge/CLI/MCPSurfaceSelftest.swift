@@ -499,6 +499,49 @@ struct MCPSurfaceSelftest: AsyncParsableCommand {
                   settled["Late"]?.always == [MCPNaming.toolAlias(handle: "std", toolName: "a.b")]
                   && settled["Racer"]?.always == [abList], "\(settled)")
 
+            // 4.19 (Codex, round 2) a competing write through Briglia's OWN file
+            //      tools that starts while the migration is between its byte
+            //      check and its replacement: the tool takes the routing lock,
+            //      so it lands after the migration and is not lost; the next
+            //      turn migrates the tool's content.
+            var legacy2 = try JSONSerialization.jsonObject(with: Data(contentsOf: routingURL)) as? [String: Any] ?? [:]
+            legacy2["Late2"] = ["mcp__std__a.b"]
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            try JSONSerialization.data(withJSONObject: legacy2, options: [.prettyPrinted, .sortedKeys]).write(to: routingURL)
+            _ = await FilesystemTools.shared.readFile(path: routingURL.path)   // read-before-write ledger
+            var toolContent = legacy2
+            toolContent["ToolWriter"] = [abList]
+            let toolBytes = try JSONSerialization.data(withJSONObject: toolContent, options: [.prettyPrinted, .sortedKeys])
+            let toolText = String(decoding: toolBytes, as: UTF8.self)
+            let inWindow = DispatchSemaphore(value: 0)
+            var migrationWriteEnded: Date?
+            var toolWriteEnded: Date?
+            var toolResult = ""
+            MCPAgentRouting.testHookAfterConditionalCheck = {
+                inWindow.signal()                       // the tool write starts now, inside the window
+                Thread.sleep(forTimeInterval: 0.6)      // and must not land before we return
+                migrationWriteEnded = Date()
+            }
+            let toolTask = Task.detached {
+                inWindow.wait()
+                let r = await FilesystemTools.shared.writeFile(path: routingURL.path, content: toolText)
+                return (Date(), r.content)
+            }
+            await MCPAgentRouting.refreshFromRegistry()
+            MCPAgentRouting.testHookAfterConditionalCheck = nil
+            (toolWriteEnded, toolResult) = await toolTask.value
+            let onDisk = try Data(contentsOf: routingURL)
+            let toolSucceeded = toolResult.contains("\"success\":true") || toolResult.contains("\"success\": true")
+            check("4.19 a file-tool write started inside the migration window waits for the lock and is not lost",
+                  toolSucceeded && onDisk == toolBytes
+                  && (toolWriteEnded ?? .distantPast) >= (migrationWriteEnded ?? .distantFuture),
+                  "tool=\(toolResult.prefix(160)) ended=\(String(describing: toolWriteEnded)) migration=\(String(describing: migrationWriteEnded))")
+            await MCPAgentRouting.refreshFromRegistry()
+            let settled2 = MCPAgentRouting.currentConfig()
+            check("4.19b the next turn migrates the tool's content (legacy entry rewritten, tool entry kept)",
+                  settled2["Late2"]?.always == [MCPNaming.toolAlias(handle: "std", toolName: "a.b")]
+                  && settled2["ToolWriter"]?.always == [abList], "\(settled2)")
+
             // 4.18 the sidecar lock serializes official writers across processes:
             //      while another holder has it, save() waits.
             let lockPath = MCPAgentRouting.routingLockURL().path

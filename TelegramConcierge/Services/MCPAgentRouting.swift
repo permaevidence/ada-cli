@@ -98,9 +98,10 @@ enum MCPAgentRouting {
         var mtimeNSec: Int
         var size: Int64
     }
-    /// Test seam (selftests only): runs inside the routing lock between the
-    /// fresh read and the conditional replacement in `migrateRoutingFile`.
+    /// Test seams (selftests only): run inside the routing lock — before the
+    /// byte comparison, and after it passed but before the replacement.
     nonisolated(unsafe) static var testHookBeforeConditionalWrite: (() -> Void)?
+    nonisolated(unsafe) static var testHookAfterConditionalCheck: (() -> Void)?
     nonisolated(unsafe) private static var cachedInstalledServers: Set<String> = []
     nonisolated(unsafe) private static var cachedMCPToolNames: Set<String> = []
     nonisolated(unsafe) private static var cachedSurface: MCPToolSurface?
@@ -308,7 +309,24 @@ enum MCPAgentRouting {
         StoragePaths.configRoot.appendingPathComponent("mcp-routing.lock")
     }
 
-    private static func withRoutingLock<T>(_ body: () throws -> T) throws -> T {
+    /// True when `path` denotes the routing file (symlinks resolved on both
+    /// sides). The model-facing file tools take the routing lock around
+    /// their write of this one file, so an agent edit and the per-turn
+    /// migration can never interleave between the migration's byte check
+    /// and its replacement.
+    static func isRoutingFile(_ path: String) -> Bool {
+        let candidate = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        let routing = routingURL().resolvingSymlinksInPath().standardizedFileURL.path
+        return candidate == routing
+    }
+
+    /// Run `body` under the routing lock when `path` is the routing file;
+    /// plain call otherwise.
+    static func withLockIfRoutingFile<T>(_ path: String, _ body: () throws -> T) throws -> T {
+        isRoutingFile(path) ? try withRoutingLock(body) : try body()
+    }
+
+    static func withRoutingLock<T>(_ body: () throws -> T) throws -> T {
         let url = routingLockURL()
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
@@ -515,6 +533,7 @@ enum MCPAgentRouting {
                         cacheLock.unlock()
                         return
                     }
+                    testHookAfterConditionalCheck?()
                     try writeLocked(r.config)
                     DebugTelemetry.log(.toolStart, summary: "mcp routing migrated to canonical aliases", detail: url.path)
                 } else {

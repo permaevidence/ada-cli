@@ -318,7 +318,7 @@ actor FilesystemTools {
                 finalData.append(contentsOf: [0xEF, 0xBB, 0xBF])
             }
             finalData.append(Data(finalText.utf8))
-            try finalData.write(to: targetURL, options: .atomic)
+            try MCPAgentRouting.withLockIfRoutingFile(path) { try finalData.write(to: targetURL, options: .atomic) }
             if let previousMode {
                 // Restore the original mode (e.g. the executable bit on scripts) —
                 // the atomic rename otherwise resets it to the temp file's default.
@@ -507,7 +507,7 @@ actor FilesystemTools {
             // bit) — resolve and preserve, matching write_file.
             let targetURL = URL(fileURLWithPath: path).resolvingSymlinksInPath()
             let previousMode = (try? FileManager.default.attributesOfItem(atPath: targetURL.path))?[.posixPermissions] as? NSNumber
-            try finalData.write(to: targetURL, options: .atomic)
+            try MCPAgentRouting.withLockIfRoutingFile(path) { try finalData.write(to: targetURL, options: .atomic) }
             if let previousMode {
                 try? FileManager.default.setAttributes([.posixPermissions: previousMode], ofItemAtPath: targetURL.path)
             }
