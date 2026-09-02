@@ -121,10 +121,13 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 TEST_PREFS_PREFIXES = ("ada-mig-probe-", "ada-mig-st-", "ada-setup-api-selftest-", "briglia-s4-")
 
 
-def _test_prefs_domain_count():
+def _test_prefs_domains_since(t0):
     """macOS only: throwaway UserDefaults domains the selftests create must
     not accumulate in ~/Library/Preferences (each leaked one is a 42-byte
-    empty plist cfprefsd leaves behind unless the test purges it)."""
+    empty plist cfprefsd leaves behind unless the test purges it). Returns
+    the matching files written at or after `t0` — a stale shell from an
+    earlier run (cleaned by the selftests' own stale sweep) is not this
+    run's leak, and an older leak must not mask a new one."""
     if sys.platform != "darwin":
         return None
     prefs = os.path.expanduser("~/Library/Preferences")
@@ -132,12 +135,21 @@ def _test_prefs_domain_count():
         names = os.listdir(prefs)
     except OSError:
         return None
-    return sum(1 for n in names if n.startswith(TEST_PREFS_PREFIXES))
+    out = []
+    for n in names:
+        if not n.startswith(TEST_PREFS_PREFIXES):
+            continue
+        try:
+            if os.stat(os.path.join(prefs, n)).st_mtime >= t0 - 1:
+                out.append(n)
+        except OSError:
+            pass
+    return out
 
 
 def main():
     print(f"Briglia binary: {ADA}")
-    prefs_domains_before = _test_prefs_domain_count()
+    smoke_started_at = time.time()
 
     # 1. --version
     result = subprocess.run([ADA, "--version"], capture_output=True, text=True, timeout=60)
@@ -2105,12 +2117,17 @@ def main():
           reaped and child_dead and len(kids) == 1,
           f"reaped={reaped} child_dead={child_dead} kids={kids}")
 
-    # Selftest hygiene: no throwaway preference domain survives the run.
-    prefs_domains_after = _test_prefs_domain_count()
-    if prefs_domains_before is not None:
+    # Selftest hygiene: no throwaway preference domain written during this
+    # run survives it. cfprefsd can write the empty shell late under load;
+    # the selftests' final sweep waits for it, and their stale sweep removes
+    # anything an earlier run left — so give the last shell a moment here.
+    leaked = _test_prefs_domains_since(smoke_started_at)
+    if leaked:
+        time.sleep(15)
+        leaked = _test_prefs_domains_since(smoke_started_at)
+    if leaked is not None:
         check("selftests leave no throwaway preference domains behind",
-              prefs_domains_after == prefs_domains_before,
-              f"{prefs_domains_before} before, {prefs_domains_after} after "
+              not leaked, f"written during this run: {', '.join(sorted(leaked))} "
               f"(prefixes {', '.join(TEST_PREFS_PREFIXES)})")
 
     print(f"\n{passed} passed, {failed} failed")

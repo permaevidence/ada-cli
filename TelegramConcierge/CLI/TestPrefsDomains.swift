@@ -57,6 +57,28 @@ enum TestPrefsDomains {
         if !purged.contains(name) { purged.append(name) }
     }
 
+    /// Unlink every empty shell with a test prefix whose modification time
+    /// is older than `olderThan` seconds, in every candidate preferences
+    /// directory. Files holding data are never touched.
+    static func sweepStaleShells(olderThan: TimeInterval) {
+        let fm = FileManager.default
+        var dirs: [String] = []
+        for path in candidatePaths("x") {
+            dirs.append((path as NSString).deletingLastPathComponent)
+        }
+        for dir in Set(dirs) {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for name in names where name.hasSuffix(".plist") && isTestDomain(name) {
+                let path = dir + "/" + name
+                guard let attrs = try? fm.attributesOfItem(atPath: path),
+                      let mtime = attrs[.modificationDate] as? Date,
+                      Date().timeIntervalSince(mtime) > olderThan,
+                      isEmptyShell(path) else { continue }
+                _ = unlink(path)
+            }
+        }
+    }
+
     /// True when the file at `path` is gone or holds an empty plist
     /// dictionary (the shell) — i.e. nothing is left to preserve.
     private static func isEmptyShellOrGone(_ path: String) -> Bool {
@@ -92,7 +114,13 @@ enum TestPrefsDomains {
     /// to clean. Returns the names still holding data after the timeout —
     /// the caller reports them; they also fail the smoke suite's count check.
     @discardableResult
-    static func finalSweep(timeout: TimeInterval = 12) -> [String] {
+    static func finalSweep(timeout: TimeInterval = 30) -> [String] {
+        // Self-healing first: a shell that cfprefsd wrote AFTER an earlier
+        // run's sweep gave up (seen once under heavy load: >12 s) is by
+        // construction a throwaway domain — the prefixes are reserved for
+        // tests — so any stale empty shell older than a minute is removed
+        // before this run's own bookkeeping.
+        sweepStaleShells(olderThan: 60)
         lock.lock()
         let names = purged
         lock.unlock()
