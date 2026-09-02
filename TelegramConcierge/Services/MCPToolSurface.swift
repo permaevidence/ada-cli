@@ -308,11 +308,14 @@ enum MCPSchemaValidation {
 /// through this value, never through string parsing of the wire name.
 struct MCPToolSurface {
 
-    /// Release A ships a one-release grace for legacy raw names
-    /// (`mcp__<server>__<tool>`): they resolve only through the validated
-    /// reverse map, and only when exactly one accepted tool owns them.
-    /// Release B flips this to `false`; raw names are then refused.
-    static let legacyRawNameGraceEnabled = true
+    /// Release A (v0.2.4) shipped a one-release grace for legacy raw names
+    /// (`mcp__<server>__<tool>`): they resolved through the validated
+    /// reverse map when exactly one accepted tool owned them. Since Release
+    /// B (v0.2.5) raw names are refused at dispatch and no longer match
+    /// `mcp_tools` patterns; the reverse map is kept for the persisted
+    /// routing-file migration (a device that skipped 0.2.4 still gets its
+    /// mcp-routing.json rewritten) and for doctor's suggestions.
+    static let legacyRawNameGraceEnabled = false
 
     struct AcceptedTool {
         let alias: String
@@ -341,7 +344,7 @@ struct MCPToolSurface {
         case unknown
         /// A legacy raw name owned by more than one accepted tool.
         case ambiguous([String])
-        case legacyRefused
+        case legacyRefused(alias: String?)
     }
 
     private(set) var servers: [String: Server] = [:]          // handle → server
@@ -439,9 +442,10 @@ struct MCPToolSurface {
 
     private func resolveLegacy(rawName: String) -> Resolution {
         guard let owners = legacyReverse[rawName], !owners.isEmpty else { return .unknown }
-        guard Self.legacyRawNameGraceEnabled else { return .legacyRefused }
-        if owners.count == 1, let tool = tools[owners[0]] { return .tool(tool) }
-        return .ambiguous(owners.sorted())
+        if owners.count > 1 { return .ambiguous(owners.sorted()) }
+        guard Self.legacyRawNameGraceEnabled else { return .legacyRefused(alias: owners.first) }
+        if let tool = tools[owners[0]] { return .tool(tool) }
+        return .unknown
     }
 
     /// Unique legacy raw name → alias map (ambiguous names excluded), for

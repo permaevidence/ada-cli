@@ -44,6 +44,27 @@ rely on TLS to fetch the release; every later update verifies the embedded
 Ed25519 signature with the key pinned inside the binary. The installer says
 so when it runs in that mode.
 
+## Storage permissions
+
+Everything Briglia keeps under `~/.config/briglia` and `~/.local/share/briglia`
+is owner-only: both roots are `0700`, files `0600`, directories `0700`
+(`projects/` — your own work product — and `toolchain/` are excluded). Every
+start re-tightens stragglers, and `briglia doctor` reports anything wider.
+This protects against other accounts on the same machine, not against
+processes running as you: an MCP server or a command the agent runs can read
+whatever the agent can. Before v0.2.5, two places kept activity metadata at
+weaker-than-data permissions — the migration engine's `preimages/` and
+`parked/` listings and the web-pipeline log; both are owner-only now.
+
+## Self-tests and release builds
+
+Release binaries refuse the internal migration-run entry point that the
+migration self-test drives itself with, so `__migration-selftest` runs only
+on development builds (`swift build`, version `-dev`). The signed release
+pipeline proves on the shipped binary that the entry point refuses and that
+`briglia migrate --status` and the startup probe still answer. To re-check a
+production install, use `briglia migrate --status` and `briglia doctor`.
+
 ## Supported versions
 
 Only the latest released version is supported. Fixes ship as a new

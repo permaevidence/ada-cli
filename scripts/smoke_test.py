@@ -41,6 +41,7 @@ import pty
 import re
 import select
 import shutil
+import stat
 import socket
 import subprocess
 import sys
@@ -1247,8 +1248,68 @@ def main():
             push([tg_update(101, "hello two")])
             pwait("hello two", 30)
 
+        # H2 private-by-default storage: plant wide entries under the roots
+        # before the first start; the daemon's startup sweep must tighten
+        # them (owner bits kept), leave projects/ alone, and the tightened
+        # skill helper must still execute.
+        data_root = os.path.join(home, ".local", "share", "briglia")
+        config_root = os.path.join(home, ".config", "briglia")
+        planted_file = os.path.join(data_root, "smoke_wide.json")
+        planted_dir = os.path.join(data_root, "subagent_sessions")
+        planted_helper = os.path.join(config_root, "skills", "smoke", "helper.sh")
+        planted_project = os.path.join(data_root, "projects", "p", "readme.md")
+        os.makedirs(planted_dir, exist_ok=True)
+        os.chmod(planted_dir, 0o755)
+        with open(planted_file, "w") as f:
+            f.write("{}")
+        os.chmod(planted_file, 0o644)
+        os.makedirs(os.path.dirname(planted_helper), exist_ok=True)
+        with open(planted_helper, "w") as f:
+            f.write("#!/bin/sh\necho helper-ok\n")
+        os.chmod(planted_helper, 0o755)
+        os.makedirs(os.path.dirname(planted_project), exist_ok=True)
+        with open(planted_project, "w") as f:
+            f.write("x")
+        os.chmod(planted_project, 0o644)
+        os.chmod(data_root, 0o755)
+
+        def mode_of(path):
+            return stat.S_IMODE(os.lstat(path).st_mode)
+
         tg_mark("phase1-start")
         out1, rc1 = run_poller_phase({}, phase1)
+        helper_run = subprocess.run([planted_helper], capture_output=True, text=True)
+        check("storage: startup sweep tightened planted entries (0644→0600, 0755→0700, roots 0700), "
+              "projects/ untouched, swept helper still runs",
+              mode_of(planted_file) == 0o600 and mode_of(planted_dir) == 0o700
+              and mode_of(planted_helper) == 0o700 and mode_of(planted_project) == 0o644
+              and mode_of(data_root) == 0o700 and mode_of(config_root) == 0o700
+              and helper_run.stdout.strip() == "helper-ok"
+              and ("tightened to owner-only" in out1),
+              f"file={oct(mode_of(planted_file))} dir={oct(mode_of(planted_dir))} "
+              f"helper={oct(mode_of(planted_helper))} project={oct(mode_of(planted_project))} "
+              f"data={oct(mode_of(data_root))} config={oct(mode_of(config_root))} "
+              f"helper_out={helper_run.stdout!r}\n" + out1[-1500:])
+        # Other-uid isolation (Linux CI runs as root in the container): with
+        # the scratch home made traversable, another uid must still be unable
+        # to list the data root or read the conversation.
+        if sys.platform.startswith("linux") and os.geteuid() == 0 and shutil.which("su"):
+            for d in (home, os.path.join(home, ".local"), os.path.join(home, ".local", "share"),
+                      os.path.join(home, ".config")):
+                os.chmod(d, 0o711)
+            conv = os.path.join(data_root, "conversation.json")
+            probe = subprocess.run(
+                ["su", "-s", "/bin/sh", "nobody", "-c",
+                 f"ls {data_root} >/dev/null 2>&1 && echo LISTED; "
+                 f"cat {conv} >/dev/null 2>&1 && echo READ; echo done"],
+                capture_output=True, text=True, timeout=30)
+            if "done" in probe.stdout:
+                check("storage: another uid can neither list the data root nor read conversation.json",
+                      "LISTED" not in probe.stdout and "READ" not in probe.stdout
+                      and os.path.exists(conv),
+                      f"stdout={probe.stdout!r} stderr={probe.stderr!r} conv_exists={os.path.exists(conv)}")
+            else:
+                print(f"  [harness] other-uid probe unavailable: {probe.stdout!r} {probe.stderr!r}")
         check("poller: same-batch duplicate dropped",
               out1.count("[Telegram] hello one") == 1
               and "Dropping re-delivered update 100" in out1,
@@ -1924,6 +1985,28 @@ def main():
               f"{phase11_state} body2_found={body2 is not None} "
               f"annotation_ok={annotation_ok} ordering_ok={ordering_ok} rc={rc11}\n"
               + tg_timeline() + "\n" + out11[-2500:])
+        # H2 (b): after every phase ran, nothing under the roots (projects/
+        # and toolchain/ excluded) may carry a group/other bit — this catches
+        # a writer that bypasses PrivateStorage and creates a wide file after
+        # the last startup sweep.
+        wide_entries = []
+        for root in (data_root, config_root):
+            if not os.path.isdir(root):
+                continue
+            if mode_of(root) & 0o077:
+                wide_entries.append(f"{root} {oct(mode_of(root))}")
+            for dirpath, dirnames, filenames in os.walk(root):
+                if dirpath == root:
+                    dirnames[:] = [d for d in dirnames if d not in ("projects", "toolchain")]
+                for name in dirnames + filenames:
+                    path = os.path.join(dirpath, name)
+                    st = os.lstat(path)
+                    if stat.S_ISLNK(st.st_mode) or not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+                        continue
+                    if stat.S_IMODE(st.st_mode) & 0o077:
+                        wide_entries.append(f"{path} {oct(stat.S_IMODE(st.st_mode))}")
+        check("storage: no entry under the roots carries group/other bits after the poller phases",
+              not wide_entries, "\n".join(wide_entries[:40]))
     finally:
         tg.shutdown()
         llm.shutdown()

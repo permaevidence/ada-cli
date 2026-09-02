@@ -303,7 +303,7 @@ struct MCPSurfaceSelftest: AsyncParsableCommand {
         //      so passing the stored token as an argument makes the server
         //      "return" it. Store is the isolated XDG root set above.
         do {
-            let token = "5551234567:AAGoldenTokenValue_0123456789abcdef"
+            let token = "5551234567:AAGoldenTokenValue_0123456789abcde"
             try KeychainHelper.save(key: KeychainHelper.telegramBotTokenKey, value: token)
             defer { try? KeychainHelper.delete(key: KeychainHelper.telegramBotTokenKey) }
             let alias = MCPNaming.toolAlias(handle: "std", toolName: "a_b")
@@ -340,9 +340,10 @@ struct MCPSurfaceSelftest: AsyncParsableCommand {
               viaAlias?.name == "a.b" && viaAlias?.server == "std" && viaSegment?.server == "a.b")
         let legacyPair = received(await registry.callTool(serverHandle: "a.b", tool: "list", argumentsJSON: "{}"))
         let legacyName = received(await registry.callTool(name: "mcp__std__admin.tools.list", argumentsJSON: "{}"))
-        check("3.9 legacy raw forms resolve only via the reverse map during the grace release",
-              MCPToolSurface.legacyRawNameGraceEnabled
-              && legacyPair?.server == "a.b" && legacyName?.name == "admin.tools.list")
+        let legacyNameResult = await registry.callTool(name: "mcp__std__admin.tools.list", argumentsJSON: "{}")
+        check("3.9 legacy raw forms are refused since Release B (never dispatched, error names the alias form)",
+              !MCPToolSurface.legacyRawNameGraceEnabled && legacyPair == nil && legacyName == nil
+              && legacyNameResult.text.contains("mcp__std__admin_tools_list"), legacyNameResult.text)
         let crossServer = await registry.callTool(serverHandle: hA_B, tool: abList, argumentsJSON: "{}")
         check("3.10 an alias of another server passed with the wrong handle is refused",
               crossServer.text.contains("Unknown MCP tool"))
@@ -423,15 +424,21 @@ struct MCPSurfaceSelftest: AsyncParsableCommand {
         let fallbackRaw = MCPAgentRouting.allToolsForAgent(agent: "Nobody", allTools: allTools, fallbackPatterns: ["mcp__std__admin.tools.list"]).map(\.function.name)
         let fallbackAlias = MCPAgentRouting.allToolsForAgent(agent: "Nobody", allTools: allTools, fallbackPatterns: [MCPNaming.toolAlias(handle: "std", toolName: "admin.tools.list")]).map(\.function.name)
         let fallbackWildcard = MCPAgentRouting.allToolsForAgent(agent: "Nobody", allTools: allTools, fallbackPatterns: ["mcp__a.b__*"]).map(\.function.name)
-        check("4.8 mcp_tools patterns dual-match raw and alias forms; a raw per-server wildcard maps to the handle",
-              fallbackRaw == fallbackAlias && fallbackRaw.count == 1 && fallbackWildcard == [abList], "\(fallbackRaw) \(fallbackWildcard)")
+        check("4.8 mcp_tools patterns match aliases only: raw name and raw per-server wildcard select nothing (grace ended)",
+              fallbackRaw.isEmpty && fallbackAlias.count == 1 && fallbackWildcard.isEmpty, "\(fallbackRaw) \(fallbackAlias) \(fallbackWildcard)")
+        let rawFallbackDiag = MCPAgentRouting.diagnose(
+            MCPAgentRouting.canonicalPattern("mcp__std__admin.tools.list", surface: surface, legacyRewrite: false),
+            original: "mcp__std__admin.tools.list", source: "mcp_tools T", surface: surface)
+        check("4.8b doctor suggests the alias for a raw mcp_tools pattern",
+              rawFallbackDiag?.suggestion == "legacy raw name; use \(MCPNaming.toolAlias(handle: "std", toolName: "admin.tools.list"))",
+              String(describing: rawFallbackDiag))
         // Diagnostics for doctor.
         let diagData = try Data(contentsOf: MCPAgentRouting.diagnosticsURL())
         let diagText = String(decoding: diagData, as: UTF8.self)
         check("4.9 diagnostics record the absent server and the malformed pattern with the source",
               diagText.contains("mcp__ghost__*") && diagText.contains("not connected")
               && diagText.contains("main.deferred") && diagText.contains("outside [A-Za-z0-9_.-]"))
-        let broken = MCPAgentRouting.diagnose(MCPAgentRouting.canonicalPattern("mcp__a.b__*", surface: surface),
+        let broken = MCPAgentRouting.diagnose(MCPAgentRouting.canonicalPattern("mcp__a.b__*", surface: surface, legacyRewrite: true),
                                               original: "mcp__a.b__*", source: "mcp_tools T", surface: surface)
         let brokenNoGrace = MCPAgentRouting.diagnose("mcp__a.b__*", original: "mcp__a.b__*", source: "mcp_tools T", surface: surface)
         check("4.10 a wildcard whose prefix breaks under hashing is reported with the alias-based replacement",

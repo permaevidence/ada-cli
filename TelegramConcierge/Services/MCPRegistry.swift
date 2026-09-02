@@ -149,8 +149,9 @@ actor MCPRegistry {
             return MCPToolCallResult(text: jsonError("Unknown MCP tool '\(requested)' — use tool_search(server: <handle>) to list the canonical tool names"), images: [])
         case .ambiguous(let owners):
             return MCPToolCallResult(text: jsonError("Legacy MCP tool name '\(requested)' is ambiguous (\(owners.joined(separator: ", "))) — use the canonical alias"), images: [])
-        case .legacyRefused:
-            return MCPToolCallResult(text: jsonError("Legacy MCP tool name '\(requested)' is no longer accepted — use the canonical alias from tool_search"), images: [])
+        case .legacyRefused(let alias):
+            let hint = alias.map { "use \($0)" } ?? "use the canonical alias from tool_search"
+            return MCPToolCallResult(text: jsonError("Legacy MCP tool name '\(requested)' is no longer accepted — \(hint)"), images: [])
         }
         guard let entry = entries[accepted.serverName], !entry.failed else {
             let reason = entries[accepted.serverName]?.failureReason ?? "not installed or not configured"

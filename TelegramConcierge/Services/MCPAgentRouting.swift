@@ -380,12 +380,13 @@ enum MCPAgentRouting {
     ///   - Exact:        "mcp__playwright__browser_click"
     ///   - Suffix glob:  "mcp__playwright__*"
     ///   - Broad glob:   "mcp__*"
-    /// During the grace release a legacy raw pattern is first canonicalized
-    /// through the registry snapshot (exact names via the validated reverse
-    /// map — unique owners only; per-server wildcards via the server-name →
-    /// handle map). Invalid patterns never match.
+    /// Patterns match canonical aliases and handle wildcards only (the
+    /// Release A raw-name grace ended with Release B — see
+    /// `MCPToolSurface.legacyRawNameGraceEnabled`). Invalid patterns never
+    /// match.
     static func matches(pattern: String, name: String) -> Bool {
-        let canonical = canonicalPattern(pattern, surface: currentSurfaceSnapshot())
+        let canonical = canonicalPattern(pattern, surface: currentSurfaceSnapshot(),
+                                         legacyRewrite: MCPToolSurface.legacyRawNameGraceEnabled)
         guard isValidPattern(canonical) else { return false }
         return literalMatch(pattern: canonical, name: name)
     }
@@ -402,7 +403,13 @@ enum MCPAgentRouting {
     /// Canonical (alias-based) form of a pattern for the given registry
     /// snapshot; the pattern itself when it is already canonical or cannot be
     /// resolved. Idempotent.
-    static func canonicalPattern(_ pattern: String, surface: MCPToolSurface?) -> String {
+    /// `legacyRewrite` enables the raw-name → alias rewrite through the
+    /// reverse map. Persisted-route migration always passes `true` (data
+    /// repair, idempotent, never drops an entry); live matching of
+    /// `mcp_tools` patterns passes the grace flag, which is off since
+    /// Release B — a raw pattern then matches nothing and doctor reports it
+    /// with the alias to use.
+    static func canonicalPattern(_ pattern: String, surface: MCPToolSurface?, legacyRewrite: Bool) -> String {
         guard let surface, pattern.hasPrefix(MCPNaming.prefix) else { return pattern }
         if pattern.hasSuffix("*") {
             let body = String(pattern.dropLast())
@@ -410,13 +417,12 @@ enum MCPAgentRouting {
             let middle = String(body.dropFirst(MCPNaming.prefix.count).dropLast(MCPNaming.separator.count))
             guard !middle.isEmpty else { return pattern }
             if surface.server(handle: middle) != nil { return pattern }
-            guard MCPToolSurface.legacyRawNameGraceEnabled,
+            guard legacyRewrite,
                   let handle = surface.handle(forServerName: middle), handle != middle else { return pattern }
             return MCPNaming.serverWildcard(handle: handle)
         }
         if surface.tools[pattern] != nil { return pattern }
-        guard MCPToolSurface.legacyRawNameGraceEnabled,
-              let alias = surface.uniqueLegacyAliases[pattern] else { return pattern }
+        guard legacyRewrite, let alias = surface.uniqueLegacyAliases[pattern] else { return pattern }
         return alias
     }
 
@@ -437,7 +443,7 @@ enum MCPAgentRouting {
         var diagnostics: [Diagnostic] = []
         func rewrite(_ list: [String], source: String) -> [String] {
             list.map { pattern in
-                let canonical = canonicalPattern(pattern, surface: surface)
+                let canonical = canonicalPattern(pattern, surface: surface, legacyRewrite: true)
                 if canonical != pattern { changed = true }
                 if let diagnostic = diagnose(canonical, original: pattern, source: source, surface: surface) {
                     diagnostics.append(diagnostic)
@@ -475,6 +481,8 @@ enum MCPAgentRouting {
                     suggestion = "server '\(middle)' is not connected (not configured, disabled, or failed to start)"
                 }
             }
+        } else if let alias = surface.uniqueLegacyAliases[canonical] {
+            suggestion = "legacy raw name; use \(alias)"
         } else if let owners = surface.legacyReverse[canonical], owners.count > 1 {
             suggestion = "legacy name is ambiguous; use one of: \(owners.sorted().joined(separator: ", "))"
         }
@@ -493,7 +501,9 @@ enum MCPAgentRouting {
             // A routing-file entry overrides the fallback; skip agents that have one.
             if config[sub.name] != nil || caseMatchedAgentKey(sub.name, in: config) != nil { continue }
             for pattern in patterns {
-                let canonical = canonicalPattern(pattern, surface: surface)
+                // Live semantics: what `matches()` would do with the pattern.
+                let canonical = canonicalPattern(pattern, surface: surface,
+                                                 legacyRewrite: MCPToolSurface.legacyRawNameGraceEnabled)
                 if let diagnostic = diagnose(canonical, original: pattern, source: "mcp_tools \(sub.name)", surface: surface) {
                     out.append(diagnostic)
                 }

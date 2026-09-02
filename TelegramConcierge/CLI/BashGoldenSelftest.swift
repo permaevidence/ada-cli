@@ -554,7 +554,7 @@ struct BashGoldenSelftest: AsyncParsableCommand {
         // MARK: 18. Redaction scope goldens (CredentialCatalog, owner decision 2026-09-02)
         print("\nRedaction scope goldens")
         func section18() async throws {
-            let token = "5551234567:AAGoldenTokenValue_0123456789abcdef"
+            let token = "5551234567:AAGoldenTokenValue_0123456789abcde"
             let opencodeKey = "sk-opencode-golden-visible-0123456789"
             try KeychainHelper.save(key: KeychainHelper.telegramBotTokenKey, value: token)
             try KeychainHelper.save(key: ProviderProfiles.opencodeApiKeyKey, value: opencodeKey)
