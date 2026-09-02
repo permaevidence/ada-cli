@@ -71,39 +71,57 @@ enum TestPrefsDomains {
         return false
     }
 
-    /// Wait (bounded) for every purged domain's on-disk shell to become
-    /// empty, then unlink it. Returns the names still holding data after
-    /// the timeout — the caller reports them; they will also fail the smoke
-    /// suite's count check.
+    /// True when the file at `path` holds an empty plist dictionary (the
+    /// shell) or no bytes — nothing left to preserve.
+    private static func isEmptyShell(_ path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path) else { return false }
+        if data.isEmpty { return true }
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) else {
+            return false
+        }
+        if let dict = plist as? [String: Any] { return dict.isEmpty }
+        return false
+    }
+
+    /// Wait (bounded) for every purged domain's on-disk shell to APPEAR and
+    /// unlink it. A domain whose file is merely absent is not done: right
+    /// after `removePersistentDomain` the file is typically gone, and the
+    /// shell is written a few seconds later — treating "gone" as finished is
+    /// exactly how shells leaked past the first version of this sweep. A
+    /// domain whose shell never materializes within the timeout has nothing
+    /// to clean. Returns the names still holding data after the timeout —
+    /// the caller reports them; they also fail the smoke suite's count check.
     @discardableResult
     static func finalSweep(timeout: TimeInterval = 12) -> [String] {
         lock.lock()
         let names = purged
         lock.unlock()
         guard !names.isEmpty else { return [] }
+        let fm = FileManager.default
         let deadline = Date().addingTimeInterval(timeout)
         var pending = Set(names)
-        while !pending.isEmpty {
+        while !pending.isEmpty, Date() < deadline {
             for name in Array(pending) {
-                let paths = candidatePaths(name)
-                if paths.allSatisfy(isEmptyShellOrGone) {
-                    for path in paths where FileManager.default.fileExists(atPath: path) {
-                        unlink(path)
-                    }
+                let existing = candidatePaths(name).filter { fm.fileExists(atPath: $0) }
+                guard !existing.isEmpty else { continue }          // shell not written yet — keep waiting
+                if existing.allSatisfy(isEmptyShell) {
+                    existing.forEach { _ = unlink($0) }
                     pending.remove(name)
                 }
             }
-            if pending.isEmpty || Date() >= deadline { break }
-            usleep(200_000)
+            if !pending.isEmpty { usleep(200_000) }
         }
-        // Unlink whatever became empty during the last poll as well.
+        var holdingData: [String] = []
         for name in pending {
-            for path in candidatePaths(name)
-                where FileManager.default.fileExists(atPath: path) && isEmptyShellOrGone(path) {
-                unlink(path)
+            let existing = candidatePaths(name).filter { fm.fileExists(atPath: $0) }
+            if existing.isEmpty { continue }                        // never materialized — nothing to clean
+            if existing.allSatisfy(isEmptyShell) {
+                existing.forEach { _ = unlink($0) }
+            } else {
+                holdingData.append(name)
             }
         }
         lock.lock(); purged.removeAll(); lock.unlock()
-        return pending.sorted()
+        return holdingData.sorted()
     }
 }
