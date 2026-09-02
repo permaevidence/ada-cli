@@ -23,8 +23,8 @@ SRC = os.path.join(ROOT, "TelegramConcierge")
 ALLOWLIST = os.path.join(ROOT, "scripts", "private-storage-allowlist.txt")
 
 PATTERN = re.compile(
-    r"\.write\(to:|\.write\(toFile:|createFile\(atPath|createDirectory\(at\b|"
-    r"createDirectory\(atPath|FileHandle\(forWritingTo|FileHandle\(forUpdating|"
+    r"\.write\(to:|\.write\(toFile:|createFile\(|createDirectory\(|"
+    r"FileHandle\(forWritingTo|FileHandle\(forUpdating|"
     r"\bfopen\(|O_CREAT\b|\bmkdir\(|\bmkdirat\(|\bopenat\("
 )
 SKIP_FILE = re.compile(r"Selftest|PrivateStorage\.swift$|selftest", re.IGNORECASE)

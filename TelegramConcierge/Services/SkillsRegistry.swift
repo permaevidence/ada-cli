@@ -321,11 +321,8 @@ enum SkillsRegistry {
         let dir = skillsDirectoryURL()
         if FileManager.default.fileExists(atPath: dir.path) { return true }
         do {
-            try FileManager.default.createDirectory(
-                at: dir,
-                withIntermediateDirectories: true,
-                attributes: nil
-            )
+            // Under the config root: owner-only like every other root child.
+            try PrivateStorage.ensureDirectory(dir)
             return true
         } catch {
             return false
