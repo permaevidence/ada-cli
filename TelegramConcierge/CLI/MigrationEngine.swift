@@ -2600,8 +2600,23 @@ struct MigrationRunCommand: ParsableCommand {
     @Option(name: .long, help: "Print a UserDefaults persistent domain as JSON and exit.")
     var dumpPrefsDomain: String?
 
+    /// The raw engine runner exists for the selftest battery only. It is
+    /// admitted solely in development builds — the same version predicate
+    /// the dev seams and release-policy overrides use — and refused before
+    /// ANY branch (forward, --rollback, --detect, --doctor,
+    /// --dump-prefs-domain) in a release build. No environment override.
+    static let refusalText = "__migrate-run is a development-build command"
+
+    static func isDevelopmentBuild(version: String = adaCLIVersion) -> Bool {
+        version.hasSuffix("-dev")
+    }
+
     func run() throws {
         AdaCLI.prepareIO()
+        guard Self.isDevelopmentBuild() else {
+            print(Self.refusalText)
+            throw ExitCode(2)
+        }
         if let domain = dumpPrefsDomain {
             // Read in a FRESH process so the caller never sees its own
             // process-local UserDefaults cache.

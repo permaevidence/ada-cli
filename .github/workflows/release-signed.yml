@@ -94,6 +94,8 @@ jobs:
         run: ./.github/scripts/stamp-version.sh "$VERSION"
       - name: Build
         run: swift build -c release
+      - name: Release-artifact checks (development-only commands refuse; migration path answers)
+        run: ./.github/scripts/check-release-artifact.sh .build/release/briglia
       - name: Package
         run: |
           mkdir -p dist
@@ -118,6 +120,8 @@ jobs:
         run: ./.github/scripts/stamp-version.sh "$VERSION"
       - name: Build (static Swift stdlib)
         run: swift build -c release --static-swift-stdlib
+      - name: Release-artifact checks (development-only commands refuse; migration path answers)
+        run: ./.github/scripts/check-release-artifact.sh .build/release/briglia
       - name: Package
         run: |
           mkdir -p dist
@@ -144,6 +148,8 @@ jobs:
         run: ./.github/scripts/stamp-version.sh "$VERSION"
       - name: Build (static Swift stdlib)
         run: swift build -c release --static-swift-stdlib
+      - name: Release-artifact checks (development-only commands refuse; migration path answers)
+        run: ./.github/scripts/check-release-artifact.sh .build/release/briglia
       - name: Package
         run: |
           mkdir -p dist
