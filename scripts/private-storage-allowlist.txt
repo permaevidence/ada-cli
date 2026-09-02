@@ -30,21 +30,11 @@ TelegramConcierge/CLI/TriggerCommand.swift :: try Data("this is not a fire recor
 TelegramConcierge/CLI/TriggerCommand.swift :: try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/CLI/UpgradeService.swift :: try fm.createDirectory(at: tmp, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/CLI/UpgradeService.swift :: try? data.write(to: restartMarkerURL, options: .atomic) :: unreviewed
-TelegramConcierge/Models/ToolModels.swift :: try data.write(to: url, options: .atomic) :: unreviewed
-TelegramConcierge/Models/ToolModels.swift :: try fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/AgentMailService.swift :: try archiveData.write(to: archivePath) :: unreviewed
-TelegramConcierge/Services/AgentMailService.swift :: try data.write(to: Self.pollStateURL, options: [.atomic]) :: unreviewed
-TelegramConcierge/Services/AgentMailService.swift :: try fm.createDirectory(at: destDir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/AgentMailService.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/AgentMailService.swift :: try script.data(using: .utf8)?.write(to: wrapper, options: [.atomic]) :: unreviewed
+TelegramConcierge/Services/AgentMailService.swift :: try archiveData.write(to: archivePath) :: agentmail release archive staged under NSTemporaryDirectory, outside both roots, removed after extraction
+TelegramConcierge/Services/AgentMailService.swift :: try fm.createDirectory(at: destDir, withIntermediateDirectories: true) :: ~/.local/bin is outside both roots (user-level executables, not harness state)
+TelegramConcierge/Services/AgentMailService.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: agentmail release archive staged under NSTemporaryDirectory, outside both roots, removed after extraction
+TelegramConcierge/Services/AgentMailService.swift :: try script.data(using: .utf8)?.write(to: wrapper, options: [.atomic]) :: the agentmail broker wrapper lives in ~/.local/bin, outside both roots; it holds no secret (fetches the key at run time) and is chmod 0755 explicitly on the next line
 TelegramConcierge/Services/AgentTurnOverrides.swift :: try data.write(to: url, options: .atomic) :: unreviewed
-TelegramConcierge/Services/ApplyPatch.swift :: try MCPAgentRouting.withLockIfRoutingFile(path) { try content.write(to: URL(fileURLWithPath: path), options: .atomic) } :: unreviewed
-TelegramConcierge/Services/ApplyPatch.swift :: try MCPAgentRouting.withLockIfRoutingFile(path) { try newContent.write(to: targetURL, options: .atomic) } :: unreviewed
-TelegramConcierge/Services/ApplyPatch.swift :: try MCPAgentRouting.withLockIfRoutingFile(toPath) { try newContent.write(to: URL(fileURLWithPath: toPath), options: .atomic) } :: unreviewed
-TelegramConcierge/Services/ApplyPatch.swift :: try fm.createDirectory(at: URL(fileURLWithPath: path).deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/ApplyPatch.swift :: try fm.createDirectory(at: URL(fileURLWithPath: toPath).deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/ApplyPatch.swift :: try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/ApplyPatch.swift :: try preImage.write(to: URL(fileURLWithPath: step.path).resolvingSymlinksInPath(), options: .atomic) :: unreviewed
 TelegramConcierge/Services/BalanceMonitor.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/BalanceMonitor.swift :: try? data.write(to: storeURL, options: .atomic) :: unreviewed
 TelegramConcierge/Services/CalendarService.swift :: try data.write(to: calendarFileURL, options: [.atomic]) :: unreviewed
@@ -82,68 +72,50 @@ TelegramConcierge/Services/ConversationManager.swift :: try? FileManager.default
 TelegramConcierge/Services/ConversationManager.swift :: try? FileManager.default.createDirectory(at: toolAttachmentsDirectory, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/ConversationManager.swift :: try? imageData.write(to: documentsDirectory.appendingPathComponent(fileName)) :: unreviewed
 TelegramConcierge/Services/DebugTelemetry.swift :: try? data.write(to: fileURL, options: .atomic) :: unreviewed
-TelegramConcierge/Services/DiffUtil.swift :: try (new.data(using: .utf8) ?? Data()).write(to: newURL, options: .atomic) :: unreviewed
-TelegramConcierge/Services/DiffUtil.swift :: try (old.data(using: .utf8) ?? Data()).write(to: oldURL, options: .atomic) :: unreviewed
-TelegramConcierge/Services/FileDescriptionService.swift :: try data.write(to: url, options: .atomic) :: unreviewed
+TelegramConcierge/Services/DiffUtil.swift :: try (new.data(using: .utf8) ?? Data()).write(to: newURL, options: .atomic) :: diff(1) input pair under NSTemporaryDirectory, outside both roots, removed on return
+TelegramConcierge/Services/DiffUtil.swift :: try (old.data(using: .utf8) ?? Data()).write(to: oldURL, options: .atomic) :: diff(1) input pair under NSTemporaryDirectory, outside both roots, removed on return
+TelegramConcierge/Services/FileDescriptionService.swift :: try data.write(to: url, options: .atomic) :: selftest-only seam (_testStoreURL, a temp file the selftest supplies); production stores descriptions in UserDefaults, not in a file
 TelegramConcierge/Services/FilesLedger.swift :: try data.write(to: tmp, options: .atomic) :: unreviewed
 TelegramConcierge/Services/FilesLedger.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/FilesystemTools.swift :: try MCPAgentRouting.withLockIfRoutingFile(path) { try finalData.write(to: targetURL, options: .atomic) } :: unreviewed
-TelegramConcierge/Services/FilesystemTools.swift :: try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/FireOutbox.swift :: try data.write(to: url(for: record.id), options: .atomic) :: unreviewed
-TelegramConcierge/Services/GitCheckpoint.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/GitCheckpoint.swift :: try? data.write(to: ledgerURL, options: .atomic) :: unreviewed
-TelegramConcierge/Services/GoogleWorkspaceService.swift :: try data.write(to: clientSecretFileURL, options: [.atomic]) :: unreviewed
-TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: destDir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: gwsConfigDirectory, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/GoogleWorkspaceService.swift :: try tarData.write(to: tarPath) :: unreviewed
-TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: directory(for: kind), withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: root, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: scratchReposRoot, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/MCPAgentRouting.swift :: let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600) :: unreviewed
-TelegramConcierge/Services/MCPAgentRouting.swift :: try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/MCPAgentRouting.swift :: try data.write(to: url, options: .atomic) :: unreviewed
-TelegramConcierge/Services/MCPAgentRouting.swift :: try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/MCPAgentRouting.swift :: try? data.write(to: url, options: .atomic) :: unreviewed
-TelegramConcierge/Services/MCPRegistry.swift :: try data.write(to: url, options: .atomic) :: unreviewed
-TelegramConcierge/Services/MCPRegistry.swift :: try fm.createDirectory(at: binDir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/MCPRegistry.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/MCPRegistry.swift :: try tarData.write(to: tarPath) :: unreviewed
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try data.write(to: clientSecretFileURL, options: [.atomic]) :: ~/.config/gws/client_secret.json belongs to the gws CLI, outside both roots; chmod 0600 explicitly on the next line
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: destDir, withIntermediateDirectories: true) :: ~/.local/bin is outside both roots (user-level executables, not harness state)
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: gwsConfigDirectory, withIntermediateDirectories: true) :: ~/.config/gws is the gws CLI's own directory, outside both roots (the config root is ~/.config/briglia)
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: gws release tarball staged under NSTemporaryDirectory, outside both roots, removed after extraction
+TelegramConcierge/Services/GoogleWorkspaceService.swift :: try tarData.write(to: tarPath) :: gws release tarball staged under NSTemporaryDirectory, outside both roots, removed after extraction
+TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: directory(for: kind), withIntermediateDirectories: true) :: ~/Documents/Briglia is the user-browsed landing zone, deliberately outside the XDG roots (files for the user, not harness state)
+TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: root, withIntermediateDirectories: true) :: ~/Documents/Briglia is the user-browsed landing zone, deliberately outside the XDG roots (files for the user, not harness state)
+TelegramConcierge/Services/LandingZone.swift :: try fm.createDirectory(at: scratchReposRoot, withIntermediateDirectories: true) :: ~/Documents/Briglia is the user-browsed landing zone, deliberately outside the XDG roots (files for the user, not harness state)
+TelegramConcierge/Services/MCPAgentRouting.swift :: let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600) :: routing sidecar flock file created O_CREAT 0o600 (literal); a lock file must keep its inode, so it cannot be replaced atomically
+TelegramConcierge/Services/MCPRegistry.swift :: try fm.createDirectory(at: binDir, withIntermediateDirectories: true) :: ~/.local/bin is outside both roots (user-level executables, not harness state)
+TelegramConcierge/Services/MCPRegistry.swift :: try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true) :: node tarball staged under NSTemporaryDirectory, outside both roots, removed after extraction
+TelegramConcierge/Services/MCPRegistry.swift :: try tarData.write(to: tarPath) :: node tarball staged under NSTemporaryDirectory, outside both roots, removed after extraction
 TelegramConcierge/Services/MindExportService.swift :: try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/MindExportService.swift :: try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/MindExportService.swift :: try configData.write(to: tempDir.appendingPathComponent("mind_config.json")) :: unreviewed
 TelegramConcierge/Services/MindExportService.swift :: try fm.createDirectory(at: tempDir, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/MindExportService.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/ProfileBundle.swift :: try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/ProfileBundle.swift :: try content.data(using: .utf8)?.write(to: dest, options: .atomic) :: unreviewed
-TelegramConcierge/Services/ProjectsZipAutoExtractor.swift :: try? fileManager.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/ProjectsZipAutoExtractor.swift :: try? fileManager.createDirectory(at: folder, withIntermediateDirectories: true) :: projects/ under the data root is excluded from the policy (the user's work product, plan H2.2)
 TelegramConcierge/Services/ReminderService.swift :: try (try encoder.encode(rows)).write(to: file, options: .atomic) :: unreviewed
 TelegramConcierge/Services/ReminderService.swift :: try data.write(to: remindersFileURL, options: .atomic) :: unreviewed
 TelegramConcierge/Services/ReminderService.swift :: try scriptSource.write(to: fileURL, atomically: true, encoding: .utf8) :: unreviewed
 TelegramConcierge/Services/ReminderService.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/ReminderService.swift :: try? data.write(to: noticesFileURL, options: .atomic) :: unreviewed
-TelegramConcierge/Services/StreamingOutput.swift :: try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Services/StreamingOutput.swift :: try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) :: briglia-tool-output/ spill dir under NSTemporaryDirectory, outside both roots, created 0700; the spill file itself is created 0600 below
 TelegramConcierge/Services/SubagentSerializer.swift :: try content.data(using: .utf8)?.write(to: url, options: .atomic) :: unreviewed
 TelegramConcierge/Services/SubagentSessionRegistry.swift :: try data.write(to: url, options: .atomic) :: unreviewed
 TelegramConcierge/Services/SubagentSessionRegistry.swift :: try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) :: unreviewed
 TelegramConcierge/Services/TelegramBotService.swift :: try data.write(to: localURL) :: unreviewed
 TelegramConcierge/Services/TelegramBotService.swift :: try? data.write(to: offsetStateURL, options: .atomic) :: unreviewed
 TelegramConcierge/Services/TodoStore.swift :: try? data.write(to: tmp, options: .atomic) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try data.write(to: fileURL) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try imageData.write(to: documentsURL) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try imageData.write(to: imagesURL) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try input.write(to: inputFile!, atomically: true, encoding: .utf8) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try output.write(to: saveURL, atomically: true, encoding: .utf8) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try srt.write(to: outputURL, atomically: true, encoding: .utf8) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try? data.write(to: documentsLastOpenedIndexURL, options: .atomic) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try? finalOutputData.write(to: imagePath) :: unreviewed
-TelegramConcierge/Services/ToolExecutor.swift :: try? finalOutputData.write(to: savedPath) :: unreviewed
+TelegramConcierge/Services/ToolExecutor.swift :: try input.write(to: inputFile!, atomically: true, encoding: .utf8) :: shortcut input staged under NSTemporaryDirectory for the shortcuts CLI, outside both roots
+TelegramConcierge/Services/ToolExecutor.swift :: try output.write(to: saveURL, atomically: true, encoding: .utf8) :: inspect_media save_to is a caller-chosen path (the OCR transcript goes where the agent asked), not harness state
+TelegramConcierge/Services/ToolExecutor.swift :: try srt.write(to: outputURL, atomically: true, encoding: .utf8) :: SRT destination is a caller-chosen path (next to the input media or an explicit output_path), not harness state
 TelegramConcierge/Services/TriggerSpool.swift :: O_WRONLY | O_CREAT, 0o600) :: unreviewed
 TelegramConcierge/Services/TriggerSpool.swift :: try data.write(to: tempURL) :: unreviewed
 TelegramConcierge/Services/TriggerSpool.swift :: try? Data("\(next)".utf8).write(to: url, options: .atomic) :: unreviewed
-TelegramConcierge/Services/TruncationService.swift :: try fm.createDirectory(atPath: truncationDir, withIntermediateDirectories: true, :: unreviewed
-TelegramConcierge/Services/TruncationService.swift :: try text.write(toFile: path, atomically: true, encoding: .utf8) :: unreviewed
+TelegramConcierge/Services/TruncationService.swift :: try fm.createDirectory(atPath: truncationDir, withIntermediateDirectories: true, :: briglia-tool-output/ spill dir under NSTemporaryDirectory, outside both roots, created 0700 (attributes on the next line)
+TelegramConcierge/Services/TruncationService.swift :: try text.write(toFile: path, atomically: true, encoding: .utf8) :: truncated-output spill file inside the 0700 briglia-tool-output/ dir under NSTemporaryDirectory, outside both roots; swept after 7 days
 TelegramConcierge/Services/UserdataToolchain.swift :: .write(to: baseStatus, atomically: true, encoding: .utf8) :: unreviewed
 TelegramConcierge/Services/UserdataToolchain.swift :: .write(to: txTmp.appendingPathComponent("manifest.json"), :: unreviewed
 TelegramConcierge/Services/UserdataToolchain.swift :: .write(to: url, atomically: true, encoding: .utf8) :: unreviewed
@@ -157,19 +129,15 @@ TelegramConcierge/Services/UserdataToolchain.swift :: try fm.createDirectory(at:
 TelegramConcierge/Services/UserdataToolchain.swift :: try text.write(to: wrapper, atomically: true, encoding: .utf8) :: unreviewed
 TelegramConcierge/Services/UserdataToolchain.swift :: try? FileManager.default.createDirectory(at: root.deletingLastPathComponent(), :: unreviewed
 TelegramConcierge/Services/UserdataToolchain.swift :: try? fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/WebOrchestrator+Helpers.swift :: if let handle = try? FileHandle(forWritingTo: current) { :: unreviewed
-TelegramConcierge/Services/WebOrchestrator+Helpers.swift :: try? Data(line.utf8).write(to: current) :: unreviewed
-TelegramConcierge/Services/WebOrchestrator+Helpers.swift :: try? fm.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/WhatsAppChannelService.swift :: try data.write(to: url) :: unreviewed
-TelegramConcierge/Services/WhatsAppChannelService.swift :: try fm.createDirectory(at: authDirectory, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/WhatsAppChannelService.swift :: try fm.createDirectory(at: bridgeDirectory, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Services/WhatsAppChannelService.swift :: try fm.createDirectory(at: mediaDirectory, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Utilities/KeychainHelper.swift :: let fd = open(lockURL.path, O_CREAT | O_WRONLY, 0o600) :: unreviewed
-TelegramConcierge/Utilities/KeychainHelper.swift :: try data.write(to: storeURL, options: .atomic) :: unreviewed
-TelegramConcierge/Utilities/PlatformMedia.swift :: do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) } catch { return nil } :: unreviewed
-TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: fileURL) } catch { :: unreviewed
-TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: src) } catch { return nil } :: unreviewed
-TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: tmp) } catch { return nil } :: unreviewed
-TelegramConcierge/Utilities/PlatformMedia.swift :: try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Utilities/PlatformMedia.swift :: try? FileManager.default.createDirectory(at: rasterDir, withIntermediateDirectories: true) :: unreviewed
-TelegramConcierge/Utilities/PlatformMedia.swift :: try? FileManager.default.createDirectory(at: sliceDir, withIntermediateDirectories: true) :: unreviewed
+TelegramConcierge/Utilities/KeychainHelper.swift :: let fd = open(lockURL.path, O_CREAT | O_WRONLY, 0o600) :: secret-store sidecar flock file created O_CREAT 0o600 (literal); a lock file must keep its inode, so it cannot be replaced atomically
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) } catch { return nil } :: convert(1) work dir under NSTemporaryDirectory, outside both roots, removed on return
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: fileURL) } catch { :: PDF work copy in an ada-pdf- dir under NSTemporaryDirectory, outside both roots, removed in deinit
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: src) } catch { return nil } :: convert(1) input under NSTemporaryDirectory, outside both roots, removed on return
+TelegramConcierge/Utilities/PlatformMedia.swift :: do { try data.write(to: tmp) } catch { return nil } :: identify(1) input under NSTemporaryDirectory, outside both roots, removed on return
+TelegramConcierge/Utilities/PlatformMedia.swift :: try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) :: ada-pdf- work dir under NSTemporaryDirectory, outside both roots, removed in deinit
+TelegramConcierge/Utilities/PlatformMedia.swift :: try? FileManager.default.createDirectory(at: rasterDir, withIntermediateDirectories: true) :: pdftoppm raster dir inside the ada-pdf- work dir under NSTemporaryDirectory, outside both roots, removed on return
+TelegramConcierge/Utilities/PlatformMedia.swift :: try? FileManager.default.createDirectory(at: sliceDir, withIntermediateDirectories: true) :: pdfseparate slice dir inside the ada-pdf- work dir under NSTemporaryDirectory, outside both roots, removed on return
+TelegramConcierge/Utilities/PrivateStorage+FileTools.swift :: try FileManager.default.createDirectory(at: base.deletingLastPathComponent(), withIntermediateDirectories: true) :: out-of-scope branch of the file-tool policy: parent directory of the user's own file, created as before (no mode policy outside the roots)
+TelegramConcierge/Utilities/PrivateStorage+FileTools.swift :: try data.write(to: URL(fileURLWithPath: path), options: .atomic) :: out-of-scope branch of the file-tool policy (apply_patch add/move to a destination the plan verified absent): the user's own file keeps the pre-H2 atomic replace
+TelegramConcierge/Utilities/PrivateStorage+FileTools.swift :: try data.write(to: URL(fileURLWithPath: path).resolvingSymlinksInPath(), options: .atomic) :: out-of-scope branch of the file-tool policy (apply_patch rollback): the user's own file keeps the pre-H2 behaviour — resolved link, atomic replace
+TelegramConcierge/Utilities/PrivateStorage+FileTools.swift :: try data.write(to: targetURL, options: .atomic) :: out-of-scope branch of the file-tool policy: the user's own file (outside the roots or in projects/ / toolchain/) keeps the pre-H2 behaviour — resolved link, atomic replace, exact previous mode restored

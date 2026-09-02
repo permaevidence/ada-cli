@@ -292,9 +292,9 @@ final class WhatsAppChannelService: ObservableObject {
     /// only when missing or when package.json changed.
     private func deployBridgeIfNeeded(nodePath: String) async throws {
         let fm = FileManager.default
-        try fm.createDirectory(at: bridgeDirectory, withIntermediateDirectories: true)
-        try fm.createDirectory(at: authDirectory, withIntermediateDirectories: true)
-        try fm.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
+        try PrivateStorage.ensureDirectory(bridgeDirectory)
+        try PrivateStorage.ensureDirectory(authDirectory)
+        try PrivateStorage.ensureDirectory(mediaDirectory)
 
         // Ships inside the app bundle at Contents/Resources/WhatsAppBridge/
         // (same folder-reference mechanism as BundledSkills).
@@ -525,7 +525,7 @@ final class WhatsAppChannelService: ObservableObject {
     /// Write transient outbound payloads here so the bridge can read them by path.
     private func spoolOutbound(_ data: Data, suffix: String) throws -> URL {
         let url = mediaDirectory.appendingPathComponent("out_\(UUID().uuidString.prefix(8)).\(suffix)")
-        try data.write(to: url)
+        try PrivateStorage.writeAtomically(data, to: url)
         return url
     }
 }

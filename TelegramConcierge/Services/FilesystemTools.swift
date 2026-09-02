@@ -280,14 +280,14 @@ actor FilesystemTools {
 
         let fm = FileManager.default
         let fileExists = fm.fileExists(atPath: path)
-        // `.atomic` renames a temp file over the target path, which would silently
-        // replace a symlink with a regular file — resolve and write to the destination.
-        let targetURL = URL(fileURLWithPath: path).resolvingSymlinksInPath()
         // Capture the pre-image before overwriting: content for the unified diff,
         // line ending + BOM so a rewrite doesn't silently change the file's on-disk
-        // representation, and POSIX mode because the atomic rename creates a new inode.
+        // representation. The POSIX mode and a symlink at the path are handled by
+        // the write itself (`PrivateStorage.fileToolWrite`): inside Briglia's
+        // roots the private-storage policy applies (owner bits kept, group/other
+        // stripped, link resolved and its target classified); elsewhere the
+        // file is the user's and keeps its exact previous mode.
         let previousFile: TextFileSnapshot?
-        var previousMode: NSNumber? = nil
         if fileExists {
             do {
                 try await FileTimeTracker.shared.assertFresh(path: path)
@@ -295,7 +295,6 @@ actor FilesystemTools {
                 return OpResult(content: jsonError(error.localizedDescription))
             }
             previousFile = try? Self.readTextFileSnapshot(path: path)
-            previousMode = (try? fm.attributesOfItem(atPath: targetURL.path))?[.posixPermissions] as? NSNumber
         } else {
             previousFile = nil
         }
@@ -312,17 +311,14 @@ actor FilesystemTools {
         }
 
         do {
-            try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try PrivateStorage.fileToolEnsureParentDirectory(ofRequestedPath: path, outsideRoots: .resolveAndPreserveMode)
             var finalData = Data()
             if preservedBOM {
                 finalData.append(contentsOf: [0xEF, 0xBB, 0xBF])
             }
             finalData.append(Data(finalText.utf8))
-            try MCPAgentRouting.withLockIfRoutingFile(path) { try finalData.write(to: targetURL, options: .atomic) }
-            if let previousMode {
-                // Restore the original mode (e.g. the executable bit on scripts) —
-                // the atomic rename otherwise resets it to the temp file's default.
-                try? fm.setAttributes([.posixPermissions: previousMode], ofItemAtPath: targetURL.path)
+            try MCPAgentRouting.withLockIfRoutingFile(path) {
+                try PrivateStorage.fileToolWrite(finalData, toRequestedPath: path, outsideRoots: .resolveAndPreserveMode)
             }
             // Refresh FileTime snapshot so subsequent edits still pass the staleness check.
             await FileTimeTracker.shared.recordRead(path: path)
@@ -502,14 +498,11 @@ actor FilesystemTools {
                 finalData.append(contentsOf: [0xEF, 0xBB, 0xBF])
             }
             finalData.append(Data(finalText.utf8))
-            // `.atomic` renames a temp file over the target, which would replace a
-            // symlink with a regular file and reset the POSIX mode (e.g. the executable
-            // bit) — resolve and preserve, matching write_file.
-            let targetURL = URL(fileURLWithPath: path).resolvingSymlinksInPath()
-            let previousMode = (try? FileManager.default.attributesOfItem(atPath: targetURL.path))?[.posixPermissions] as? NSNumber
-            try MCPAgentRouting.withLockIfRoutingFile(path) { try finalData.write(to: targetURL, options: .atomic) }
-            if let previousMode {
-                try? FileManager.default.setAttributes([.posixPermissions: previousMode], ofItemAtPath: targetURL.path)
+            // Symlink and mode handling live in the write itself, matching
+            // write_file: policy inside Briglia's roots, exact previous mode
+            // and resolved link elsewhere.
+            try MCPAgentRouting.withLockIfRoutingFile(path) {
+                try PrivateStorage.fileToolWrite(finalData, toRequestedPath: path, outsideRoots: .resolveAndPreserveMode)
             }
             await FileTimeTracker.shared.recordRead(path: path)
             await FilesLedger.shared.record(path: path, origin: .edited, description: nil)

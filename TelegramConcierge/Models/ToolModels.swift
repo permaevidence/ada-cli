@@ -526,10 +526,10 @@ struct ToolResultMessage: Codable {
         let dir = StoragePaths.dataRoot
             .appendingPathComponent("tool_attachments", isDirectory: true)
         do {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try PrivateStorage.ensureDirectory(dir)
             let safeName = sanitizedSnapshotFilename(filename)
             let url = dir.appendingPathComponent("\(UUID().uuidString)-\(safeName)")
-            try data.write(to: url, options: .atomic)
+            try PrivateStorage.writeAtomically(data, to: url)
             return url.path
         } catch {
             print("[ToolResultMessage] Failed to snapshot attachment \(filename): \(error)")

@@ -420,7 +420,7 @@ final class ForegroundStreamCollector: PipeByteSink, @unchecked Sendable {
     private func openSpillLocked() {
         let dir = TruncationService.truncationDir
         do {
-            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         } catch {
             markSpillFailedLocked()
             return

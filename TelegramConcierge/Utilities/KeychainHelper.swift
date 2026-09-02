@@ -165,8 +165,7 @@ enum KeychainHelper {
         // Writes materialize the config root; reads never do (StoragePaths:
         // diagnostics must not create empty new roots that mask the
         // identity-migration detection).
-        try? FileManager.default.createDirectory(
-            at: StoragePaths.configRoot, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(StoragePaths.configRoot)
         // Serialize against every OTHER Briglia process before deciding what the
         // store contains. Held across read-modify-write so two concurrent
         // writers can't both start from the same base and last-writer-wins.
@@ -194,11 +193,11 @@ enum KeychainHelper {
         // config dir, full disk), in-memory reads must not pretend the value
         // was saved — that made `briglia setup` look successful and break only
         // after restart.
-        try data.write(to: storeURL, options: .atomic)
+        // 0600 is applied to the temp file BEFORE the rename, so the store
+        // never exists with a wider mode (PrivateStorage).
+        try PrivateStorage.writeAtomically(data, to: storeURL, mode: 0o600)
         cache = store
         cacheStamp = statStore()  // still under flock: the stamp is ours
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
     }
 
     private static func storeLocked() -> [String: String] {

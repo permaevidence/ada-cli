@@ -191,7 +191,7 @@ enum ProfileBundle {
         var agentsReplaced: [String] = []
         if let bundledAgents = root["agents"] as? [[String: String]] {
             let dir = SubagentSerializer.agentsDirectory()
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try PrivateStorage.ensureDirectory(dir)
             for entry in bundledAgents {
                 guard let filename = entry["filename"], !filename.isEmpty,
                       let content = entry["content"] else { continue }
@@ -204,7 +204,9 @@ enum ProfileBundle {
                 }
                 let dest = dir.appendingPathComponent(sanitized, isDirectory: false)
                 let existed = FileManager.default.fileExists(atPath: dest.path)
-                try content.data(using: .utf8)?.write(to: dest, options: .atomic)
+                if let data = content.data(using: .utf8) {
+                    try PrivateStorage.writeAtomically(data, to: dest)
+                }
                 if existed { agentsReplaced.append(sanitized) } else { agentsAdded.append(sanitized) }
             }
         }

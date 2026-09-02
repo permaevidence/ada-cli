@@ -509,15 +509,12 @@ enum ApplyPatch {
         let fm = FileManager.default
         switch plan.kind {
         case .write(let path, let newContent, let preImage):
-            // `.atomic` renames a temp file over the target, which would replace a
-            // symlink with a regular file and reset the POSIX mode — resolve and
-            // preserve, matching write_file/edit_file.
-            let targetURL = URL(fileURLWithPath: path).resolvingSymlinksInPath()
-            try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let previousMode = (try? fm.attributesOfItem(atPath: targetURL.path))?[.posixPermissions] as? NSNumber
-            try MCPAgentRouting.withLockIfRoutingFile(path) { try newContent.write(to: targetURL, options: .atomic) }
-            if let previousMode {
-                try? fm.setAttributes([.posixPermissions: previousMode], ofItemAtPath: targetURL.path)
+            // Symlink and mode handling live in the write, matching
+            // write_file/edit_file: the private-storage policy inside
+            // Briglia's roots, resolved link + exact previous mode elsewhere.
+            try PrivateStorage.fileToolEnsureParentDirectory(ofRequestedPath: path, outsideRoots: .resolveAndPreserveMode)
+            try MCPAgentRouting.withLockIfRoutingFile(path) {
+                try PrivateStorage.fileToolWrite(newContent, toRequestedPath: path, outsideRoots: .resolveAndPreserveMode)
             }
             applied.append((path: path, preImage: preImage))
             await FileTimeTracker.shared.recordRead(path: path)
@@ -526,8 +523,10 @@ enum ApplyPatch {
             return (path, oldText, String(data: newContent, encoding: .utf8) ?? "")
 
         case .add(let path, let content):
-            try fm.createDirectory(at: URL(fileURLWithPath: path).deletingLastPathComponent(), withIntermediateDirectories: true)
-            try MCPAgentRouting.withLockIfRoutingFile(path) { try content.write(to: URL(fileURLWithPath: path), options: .atomic) }
+            try PrivateStorage.fileToolEnsureParentDirectory(ofRequestedPath: path, outsideRoots: .plain)
+            try MCPAgentRouting.withLockIfRoutingFile(path) {
+                try PrivateStorage.fileToolWrite(content, toRequestedPath: path, outsideRoots: .plain)
+            }
             applied.append((path: path, preImage: nil))  // nil preImage = delete on rollback
             await FileTimeTracker.shared.recordRead(path: path)
             await FilesLedger.shared.record(path: path, origin: .generated, description: nil)
@@ -541,8 +540,10 @@ enum ApplyPatch {
             return nil
 
         case .move(let fromPath, let toPath, let newContent, let preImage):
-            try fm.createDirectory(at: URL(fileURLWithPath: toPath).deletingLastPathComponent(), withIntermediateDirectories: true)
-            try MCPAgentRouting.withLockIfRoutingFile(toPath) { try newContent.write(to: URL(fileURLWithPath: toPath), options: .atomic) }
+            try PrivateStorage.fileToolEnsureParentDirectory(ofRequestedPath: toPath, outsideRoots: .plain)
+            try MCPAgentRouting.withLockIfRoutingFile(toPath) {
+                try PrivateStorage.fileToolWrite(newContent, toRequestedPath: toPath, outsideRoots: .plain)
+            }
             try MCPAgentRouting.withLockIfRoutingFile(fromPath) { try fm.removeItem(atPath: fromPath) }
             applied.append((path: fromPath, preImage: preImage))  // rollback restores the original
             applied.append((path: toPath, preImage: nil))          // rollback deletes the new file
@@ -564,10 +565,12 @@ enum ApplyPatch {
     private static func rollback(applied: [(path: String, preImage: Data?)]) {
         for step in applied.reversed() {
             if let preImage = step.preImage {
-                // Resolve like commitPlan does — restoring through the unresolved
-                // path would replace a symlink the commit wrote through.
+                // Same write path as the commit: the policy inside Briglia's
+                // roots (the restored file keeps the policy mode), the link
+                // resolved elsewhere — restoring through the unresolved path
+                // would replace a symlink the commit wrote through.
                 try? MCPAgentRouting.withLockIfRoutingFile(step.path) {
-                    try preImage.write(to: URL(fileURLWithPath: step.path).resolvingSymlinksInPath(), options: .atomic)
+                    try PrivateStorage.fileToolWrite(preImage, toRequestedPath: step.path, outsideRoots: .resolveOnly)
                 }
             } else {
                 try? MCPAgentRouting.withLockIfRoutingFile(step.path) {

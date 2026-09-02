@@ -233,7 +233,7 @@ final class GitCheckpointTracker: @unchecked Sendable {
 
     static var ledgerURL: URL {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("git_checkpoints.json")
     }
 
@@ -255,7 +255,7 @@ final class GitCheckpointTracker: @unchecked Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         if let data = try? encoder.encode(entries) {
-            try? data.write(to: ledgerURL, options: .atomic)
+            try? PrivateStorage.writeAtomically(data, to: ledgerURL)
         }
     }
 }

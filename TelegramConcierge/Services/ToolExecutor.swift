@@ -2342,7 +2342,7 @@ actor ToolExecutor {
             let fileName = "mcp_image_\(UUID().uuidString.prefix(8))_\(idx + 1).\(Self.fileExtension(forImageMime: mime))"
             let fileURL = imagesDirectory.appendingPathComponent(fileName)
             do {
-                try data.write(to: fileURL)
+                try PrivateStorage.writeAtomically(data, to: fileURL)
             } catch {
                 print("[ToolExecutor] Failed to save MCP image \(fileName): \(error)")
                 // Continue anyway — the in-memory attachment still reaches the model.
@@ -2728,13 +2728,13 @@ struct ReadDocumentResult: Codable {
 extension ToolExecutor {
     private var documentsDirectory: URL {
         let folder = StoragePaths.dataRoot.appendingPathComponent("documents", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder
     }
 
     private var documentsLastOpenedIndexURL: URL {
         let folder = StoragePaths.dataRoot
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(folder)
         return folder.appendingPathComponent("documents_last_opened.json")
     }
 
@@ -2745,7 +2745,7 @@ extension ToolExecutor {
 
     private func saveDocumentsLastOpenedIndex(_ index: [String: Int64]) {
         guard let data = try? JSONEncoder().encode(index) else { return }
-        try? data.write(to: documentsLastOpenedIndexURL, options: .atomic)
+        try? PrivateStorage.writeAtomically(data, to: documentsLastOpenedIndexURL)
     }
 
     private func recordDocumentOpened(filename: String, openedAt: Date = Date()) {
@@ -3190,8 +3190,8 @@ extension ToolExecutor {
             let imagesURL = imagesDirectory.appendingPathComponent(fileName)
             
             do {
-                try imageData.write(to: documentsURL)
-                try imageData.write(to: imagesURL)
+                try PrivateStorage.writeAtomically(imageData, to: documentsURL)
+                try PrivateStorage.writeAtomically(imageData, to: imagesURL)
                 print("[ToolExecutor] Saved generated image: \(fileName) (\(imageData.count) bytes)")
             } catch {
                 print("[ToolExecutor] Failed to save generated image: \(error)")
@@ -3594,8 +3594,8 @@ extension ToolExecutor {
                 let savedPath = documentsDirectory.appendingPathComponent(savedFilename)
                 let imagePath = imagesDirectory.appendingPathComponent(savedFilename)
                 
-                try? finalOutputData.write(to: savedPath)
-                try? finalOutputData.write(to: imagePath)
+                try? PrivateStorage.writeAtomically(finalOutputData, to: savedPath)
+                try? PrivateStorage.writeAtomically(finalOutputData, to: imagePath)
                 
                 fileAttachment = FileAttachment(data: finalOutputData, mimeType: mimeType, filename: savedFilename, sourcePath: savedPath.path)
                 outputInfo = ", \"output_file\": {\"filename\": \"\(savedFilename)\", \"mimeType\": \"\(mimeType)\", \"sizeBytes\": \(finalOutputData.count), \"message\": \"Image output saved and visible for analysis\"}"

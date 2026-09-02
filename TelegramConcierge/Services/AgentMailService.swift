@@ -515,7 +515,7 @@ actor AgentMailService {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             let data = try encoder.encode(state)
-            try data.write(to: Self.pollStateURL, options: [.atomic])
+            try PrivateStorage.writeAtomically(data, to: Self.pollStateURL)
             consecutivePersistFailures = 0
         } catch {
             consecutivePersistFailures += 1

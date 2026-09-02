@@ -273,10 +273,7 @@ enum MCPAgentRouting {
     /// routing lock. Updates the cache and its disk stamp.
     private static func writeLocked(_ config: [String: AgentRouting]) throws {
         let url = routingURL()
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
         // Serialize: if deferred is empty, write as plain array for cleanliness
         var dict: [String: Any] = [:]
         for (agent, routing) in config {
@@ -292,7 +289,8 @@ enum MCPAgentRouting {
             withJSONObject: dict,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try data.write(to: url, options: .atomic)
+        // Owner-only (plan H2.4): the routing file is harness state.
+        try PrivateStorage.writeAtomically(data, to: url, mode: 0o600)
         let stamp = currentStamp()
         cacheLock.lock()
         cachedConfig = config
@@ -328,7 +326,7 @@ enum MCPAgentRouting {
 
     static func withRoutingLock<T>(_ body: () throws -> T) throws -> T {
         let url = routingLockURL()
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
         let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         guard fd >= 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
@@ -586,8 +584,8 @@ enum MCPAgentRouting {
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(file) else { return }
         let url = diagnosticsURL()
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
+        try? PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
+        try? PrivateStorage.writeAtomically(data, to: url)
     }
 
     /// Doctor lines: last recorded diagnostics plus a sync charset check of

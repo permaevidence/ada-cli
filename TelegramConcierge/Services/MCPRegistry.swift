@@ -247,15 +247,13 @@ actor MCPRegistry {
         }
         let root: [String: Any] = ["mcpServers": servers]
         let url = mcpConfigURL()
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
         let data = try JSONSerialization.data(
             withJSONObject: root,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try data.write(to: url, options: .atomic)
+        // Owner-only (plan H2.4): `env` may carry plaintext secrets.
+        try PrivateStorage.writeAtomically(data, to: url, mode: 0o600)
     }
 
     public static func mcpConfigPath() -> String {

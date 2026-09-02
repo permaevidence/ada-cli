@@ -8,14 +8,18 @@ import FoundationNetworking
 /// Appends web-pipeline diagnostics to ~/.local/share/briglia/logs/
 /// web-pipeline.log — stdout prints vanish for Finder-launched installs, so
 /// this is the only forensic trail in production. Rotates daily: the first
-/// write of a new day moves the file to web-pipeline.previous.log, keeping at
-/// most ~2 days on disk. A 10 MB in-day cap guards pathological volume.
-/// Local-only; never leaves the Mac.
+/// write of a new day moves the file to web-pipeline.previous.log, and that
+/// previous file is dropped once it is older than 7 days. A 10 MB in-day cap
+/// guards pathological volume. Owner-only files in an owner-only directory
+/// (every search query and fetched URL lands here). Local-only; never leaves
+/// the Mac.
 final class WebPipelineLog: @unchecked Sendable {
     static let shared = WebPipelineLog()
 
     private let queue = DispatchQueue(label: "com.permaevidence.briglia.web-pipeline-log")
     private let maxBytes = 10_000_000
+    /// `web-pipeline.previous.log` older than this is removed at write time.
+    static let previousLogRetention: TimeInterval = 7 * 24 * 60 * 60
 
     private static let stampFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -40,12 +44,25 @@ final class WebPipelineLog: @unchecked Sendable {
         queue.async { self.write(line) }
     }
 
+    /// Selftest seam: blocks until every line appended so far is on disk.
+    func flushForTesting() {
+        queue.sync {}
+    }
+
     private func write(_ line: String) {
         let fm = FileManager.default
         let dir = logsDirectory
         let current = dir.appendingPathComponent("web-pipeline.log")
         let previous = dir.appendingPathComponent("web-pipeline.previous.log")
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? PrivateStorage.ensureDirectory(dir)
+
+        // Retention (plan H2.7): the rotated file is forensic material for a
+        // few days, not forever.
+        if let prevAttrs = try? fm.attributesOfItem(atPath: previous.path),
+           let prevModified = prevAttrs[.modificationDate] as? Date,
+           Date().timeIntervalSince(prevModified) > Self.previousLogRetention {
+            try? fm.removeItem(at: previous)
+        }
 
         if let attrs = try? fm.attributesOfItem(atPath: current.path) {
             let modified = attrs[.modificationDate] as? Date
@@ -57,13 +74,11 @@ final class WebPipelineLog: @unchecked Sendable {
             }
         }
 
-        if let handle = try? FileHandle(forWritingTo: current) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data(line.utf8))
-        } else {
-            try? Data(line.utf8).write(to: current)
-        }
+        // Created 0600 (or tightened) and appended through its own
+        // descriptor; a symlink at the log path is refused.
+        guard let handle = try? PrivateStorage.openForAppend(current) else { return }
+        defer { try? handle.close() }
+        try? handle.write(contentsOf: Data(line.utf8))
     }
 }
 
