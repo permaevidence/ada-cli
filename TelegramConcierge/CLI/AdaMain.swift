@@ -279,7 +279,23 @@ struct BundleCheck: ParsableCommand {
             print("✖ resource bundle found but BundledSkills is missing — corrupted install?")
             throw ExitCode(1)
         }
+        // Release C: the pinned Playwright manifests ship in the bundle; a
+        // bundle without them (or with a lockfile that fails the sanity
+        // rules) would make every start fall back to "install failed".
+        let manifests: ManagedPlaywright.Manifests
+        do {
+            manifests = try ManagedPlaywright.Manifests.bundled()
+        } catch {
+            print("✖ resource bundle found but MCPBundles/playwright manifests are missing — corrupted install? (\(error))")
+            throw ExitCode(1)
+        }
+        let lockProblems = manifests.lockfileProblems()
+        guard lockProblems.isEmpty else {
+            print("✖ bundled Playwright lockfile fails its sanity rules: \(lockProblems.joined(separator: "; "))")
+            throw ExitCode(1)
+        }
         print("✔ resource bundle OK: \(bundleURL.path)")
+        print("✔ managed Playwright manifests: @playwright/mcp \(manifests.pinnedVersion ?? "?") (lockfile \(manifests.lockfileHash))")
     }
 }
 

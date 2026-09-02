@@ -16,7 +16,17 @@ jobs:
       - name: Install runtime dependencies
         run: |
           apt-get update
-          apt-get install -y python3 poppler-utils imagemagick procps curl
+          apt-get install -y python3 poppler-utils imagemagick procps curl xz-utils
+      - name: Install Node.js LTS (nodejs.org, SHASUMS256-verified) for the live Playwright bootstrap check
+        run: |
+          set -euo pipefail
+          VERSION="$(curl -fsSL https://nodejs.org/dist/index.json | python3 -c 'import json,sys; print(next(e["version"] for e in json.load(sys.stdin) if isinstance(e.get("lts"), str)))')"
+          FILE="node-${VERSION}-linux-x64.tar.xz"
+          curl -fsSLO "https://nodejs.org/dist/${VERSION}/${FILE}"
+          curl -fsSL "https://nodejs.org/dist/${VERSION}/SHASUMS256.txt" | grep " ${FILE}\$" | sha256sum -c -
+          mkdir -p /opt/node && tar -xJf "${FILE}" -C /opt/node --strip-components=1
+          echo "/opt/node/bin" >> "$GITHUB_PATH"
+          /opt/node/bin/node --version
       - name: Build
         run: swift build
       - name: Smoke test

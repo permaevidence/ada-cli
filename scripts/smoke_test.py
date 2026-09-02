@@ -377,6 +377,24 @@ def main():
     # 3c6. /deleteuserdata confirmation barrier: bare command teaches, only
     # the stored name (or CONFIRM when none) wipes, everything else refuses.
     # Isolated config root — never touches a real secrets.json.
+    # Managed Playwright (Release C): fake node/npm/server battery — install
+    # transaction, reuse, quarantine, failures, timeout + process group,
+    # lock, orphans, external edits, profile bundle, registry reload, crash
+    # injection at five boundaries (development builds).
+    result = subprocess.run([os.path.abspath(ADA), "__playwright-selftest"], capture_output=True,
+                            text=True, timeout=600)
+    check("playwright-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-2500:])
+    # Live: the real bootstrap (bundled lockfile, real npm ci, real handshake)
+    # wherever a usable Node is on PATH (CI installs one; skipped otherwise).
+    if shutil.which("node") and shutil.which("npm"):
+        result = subprocess.run([os.path.abspath(ADA), "__playwright-selftest", "--live"], capture_output=True,
+                                text=True, timeout=900)
+        check("playwright-selftest --live (real npm ci against the committed lockfile)", result.returncode == 0,
+              (result.stdout + result.stderr)[-2500:])
+    else:
+        print("· playwright-selftest --live skipped (no node/npm on PATH)")
+
     result = subprocess.run([ADA, "__deleteuserdata-selftest"], capture_output=True, text=True, timeout=120)
     check("deleteuserdata-selftest", result.returncode == 0,
           (result.stdout + result.stderr)[-1500:])

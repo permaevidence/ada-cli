@@ -4,7 +4,9 @@
 #   1. the development-only engine runner `__migrate-run` refuses in every
 #      mode (forward, --rollback, --detect, --doctor, --dump-prefs-domain)
 #      with exit 2 and the fixed refusal text — release builds are stamped
-#      to a bare SemVer, which is what closes it;
+#      to a bare SemVer, which is what closes it; the managed-Playwright
+#      crash-injection driver (`__playwright-selftest --child-run`) refuses
+#      the same way;
 #   2. the migration path itself still answers: `migrate --status`,
 #      `migrate --dump-spec`, `__migrate-probe`, `__migrate-gate` — the
 #      commands the installer and the production migration use — so the
@@ -65,6 +67,14 @@ expect_refusal "__migrate-run --rollback (no spec)" __migrate-run --rollback
 expect_refusal "__migrate-run --detect"            __migrate-run --spec /dev/null --detect
 expect_refusal "__migrate-run --doctor"            __migrate-run --spec /dev/null --doctor
 expect_refusal "__migrate-run --dump-prefs-domain" __migrate-run --dump-prefs-domain briglia-release-artifact-check
+
+# 1b. The managed-Playwright crash-injection driver (Release C) refuses too.
+set +e; out="$("$BIN" __playwright-selftest --child-run /dev/null 2>&1)"; rc=$?; set -e
+if [[ $rc -eq 2 && "$out" == *"__playwright-selftest --child-run is a development-build command"* ]]; then
+    echo "✔ __playwright-selftest --child-run: refused (exit 2)"
+else
+    echo "✖ __playwright-selftest --child-run: expected exit 2 + refusal text, got exit $rc:"; echo "$out" | tail -5; fail=1
+fi
 
 # 2. The migration path stays open on a clean scratch HOME.
 expect_ok "migrate --status"    "not needed"  migrate --status
