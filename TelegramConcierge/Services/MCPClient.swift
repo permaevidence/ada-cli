@@ -38,8 +38,18 @@ actor MCPClient {
     private var process: Process?
     private var stdinHandle: FileHandle?
 
-    // Read state
+    // Read state. Chunks from the stdout pipe are queued in arrival order and
+    // consumed by ONE task: a reply larger than a pipe read (playwright's
+    // tools/list is ~30 KB) spans several chunks, and handing each chunk to
+    // its own unordered Task let two of them land in the buffer swapped —
+    // the frame then failed to decode, the buffer was reset, and the reply
+    // was lost until the request timed out (seen as intermittent
+    // "tools/list timed out … server unresponsive").
     private var readBuffer = Data()
+    private var stdoutPipe: Pipe?
+    private var stderrPipe: Pipe?
+    private var readerTask: Task<Void, Never>?
+    private var chunkContinuation: AsyncStream<Data>.Continuation?
 
     // Request correlation
     private var nextRequestId: Int = 1
@@ -103,11 +113,18 @@ actor MCPClient {
             Task { await self.handleTermination() }
         }
 
-        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        let (chunks, continuation) = AsyncStream<Data>.makeStream()
+        chunkContinuation = continuation
+        stdout.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            guard let self = self else { return }
-            Task { await self.ingest(data) }
+            continuation.yield(data)
+        }
+        readerTask = Task { [weak self] in
+            for await chunk in chunks {
+                guard let self else { break }
+                await self.ingest(chunk)
+            }
         }
 
         // MCP servers sometimes emit diagnostic chatter on stderr; drain
@@ -124,6 +141,8 @@ actor MCPClient {
 
         self.process = proc
         self.stdinHandle = stdin.fileHandleForWriting
+        self.stdoutPipe = stdout
+        self.stderrPipe = stderr
         self.isAlive = true
     }
 
@@ -156,6 +175,13 @@ actor MCPClient {
         process?.terminate()
         process = nil
         stdinHandle = nil
+        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        chunkContinuation?.finish()
+        chunkContinuation = nil
+        readerTask = nil
+        stdoutPipe = nil
+        stderrPipe = nil
         isAlive = false
         isInitialized = false
     }

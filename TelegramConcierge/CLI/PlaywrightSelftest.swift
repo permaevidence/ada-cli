@@ -934,6 +934,31 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         try fm.copyItem(at: fx.goodCli, to: URL(fileURLWithPath: layout.cliPath(token: newE)))
         try fm.removeItem(at: layout.versionDirectory(token: fastE))
 
+        // MARK: 24. Large MCP replies must survive chunked pipe delivery
+
+        // The real @playwright/mcp answers tools/list with ~30 KB; a reply
+        // that spans several pipe reads must reassemble in order. A fake
+        // server with a ~400 KB tool list, handshaken repeatedly.
+        let bigCli = tempRoot.appendingPathComponent("big-cli.js")
+        try ("import os\nos.environ['FAKE_MCP_BIG'] = '1'\n" + fakeServerSource).write(to: bigCli, atomically: true, encoding: .utf8)
+        var bigFailures: [String] = []
+        let bigStart = Date()
+        for i in 0..<25 {
+            let client = MCPClient(config: MCPServerConfig(name: "big", command: fx.nodeDir.appendingPathComponent("node").path, arguments: [bigCli.path]),
+                                   resolvedEnvironment: fx.environment())
+            do {
+                try await client.start()
+                try await client.initialize(timeout: 15)
+                let tools = await client.listedTools
+                if tools.count != 1500 { bigFailures.append("run \(i): \(tools.count) tools") }
+            } catch {
+                bigFailures.append("run \(i): \(error)")
+            }
+            await client.shutdown()
+        }
+        check("24.1 25 handshakes against a server whose tools/list is ~400 KB: every reply reassembled (1500 tools each), none lost to chunk reordering",
+              bigFailures.isEmpty && Date().timeIntervalSince(bigStart) < 60, bigFailures.prefix(3).joined(separator: " | "))
+
         // MARK: 20. Repaired same-token install reloads the registry (Codex round 2 additional)
 
         try writeConfig(["mcpServers": ["playwright": managedEntry(token: hA)]])
@@ -1271,6 +1296,8 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         {"name": "browser_click", "description": "Click", "inputSchema": {"type": "object", "properties": {"ref": {"type": "string"}}}},
         {"name": "browser_snapshot", "description": "Snapshot", "inputSchema": {"type": "object", "properties": {}}},
     ]
+    if os.environ.get("FAKE_MCP_BIG"):
+        tools = [{"name": "tool_%04d" % i, "description": "d" * 200, "inputSchema": {"type": "object", "properties": {"q": {"type": "string", "description": "x" * 40}}}} for i in range(1500)]
     for line in sys.stdin:
         line = line.strip()
         if not line:
