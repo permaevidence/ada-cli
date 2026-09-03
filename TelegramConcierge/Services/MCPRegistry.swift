@@ -276,11 +276,21 @@ actor MCPRegistry {
         mcpConfigURL().path
     }
 
-    /// Actor-serialized full save (profile import): the official writers of
-    /// mcp.json are this actor's methods; nothing else in the daemon writes
-    /// the file (plan §H4.4 writer model).
-    func saveConfigs(_ configs: [MCPServerConfig]) throws {
-        try Self.saveConfigsToDisk(configs)
+    /// Selftest seam: runs inside the config lock during `mergeServers`,
+    /// after the read and before the write.
+    nonisolated(unsafe) static var testHookInsideMerge: (() -> Void)?
+
+    /// Actor-serialized read-modify-write of mcp.json under the config lock
+    /// (profile import): `transform` sees the servers as loaded and returns
+    /// the full list to save. The official writers of mcp.json are this
+    /// actor's methods; the file tools share the same sidecar lock.
+    func mergeServers(_ transform: ([MCPServerConfig]) throws -> [MCPServerConfig]) throws {
+        try MCPAgentRouting.withConfigLock {
+            let existing = Self.loadConfigs()
+            let merged = try transform(existing)
+            Self.testHookInsideMerge?()
+            try Self.saveConfigsToDisk(merged)
+        }
     }
 
     enum ManagedEntryUpdate: Equatable {
@@ -873,7 +883,9 @@ enum BrowserAutomationBootstrap {
             environment: ManagedPlaywright.Context.environment(nodeDirectory: nodeDirectory, base: deps.baseEnvironment),
             npmTimeout: deps.npmTimeout, handshakeTimeout: deps.handshakeTimeout,
             crashPoint: deps.crashPoint, referencedToken: referencedToken, log: deps.log)
-        switch await ManagedPlaywright.ensureInstalled(context: context) {
+        let (installed, installLock) = await ManagedPlaywright.ensureInstalled(context: context)
+        defer { installLock?.release() }
+        switch installed {
         case .skipped(let reason):
             deps.log("skipped: \(reason)")
             record("skipped", reason: reason)
@@ -883,18 +895,22 @@ enum BrowserAutomationBootstrap {
             record("failed", reason: reason)
             return .failed(reason)
         case .ready(let token, let reused, let quarantineAfterSwitch):
+            // Still under the installation lock (returned held): the switch
+            // takes the configuration lock inside it, and so does the
+            // post-switch quarantine — installation → configuration, always.
             let update = await MCPRegistry.shared.updateManagedPlaywrightEntry(
                 token: token, layout: layout, addIfAbsent: shape == .absent,
                 crashAfterWrite: deps.crashPoint == .afterConfigWrite)
             // A referenced tree that failed verification is quarantined only
-            // now that the configuration no longer points at it; if the
-            // switch did not happen (left alone), it stays where it is.
+            // now that the configuration no longer points at it — re-checked
+            // under the configuration lock, so an edit that pointed back at
+            // it meanwhile keeps it.
             func quarantineOldIfSafe() {
                 guard let old = quarantineAfterSwitch, old != token else { return }
-                if let failure = ManagedPlaywright.quarantine(token: old, layout: layout) {
-                    deps.log("could not quarantine playwright-\(old): \(failure)")
-                } else {
-                    deps.log("quarantined playwright-\(old) (failed verification; no longer referenced)")
+                switch ManagedPlaywright.quarantineIfUnreferenced(token: old, layout: layout) {
+                case .quarantined: deps.log("quarantined playwright-\(old) (failed verification; no longer referenced)")
+                case .referenced: deps.log("playwright-\(old) is referenced again — left in place")
+                case .failed(let failure): deps.log("could not quarantine playwright-\(old): \(failure)")
                 }
             }
             switch update {
@@ -911,7 +927,14 @@ enum BrowserAutomationBootstrap {
             case .alreadyCurrent:
                 quarantineOldIfSafe()
                 record("ready", token: token)
-                return .configured(token: token, changed: false)
+                // The entry already named this token but the directory was
+                // (re)built this start: a registry that bootstrapped the
+                // server as failed meanwhile must see the repaired install.
+                if !reused && deps.reloadRegistry {
+                    await MCPRegistry.shared.reloadFromDisk()
+                    await MCPAgentRouting.refreshFromRegistry()
+                }
+                return .configured(token: token, changed: !reused)
             case .leftAlone(let current):
                 record("left-alone", token: token, reason: "\(current)")
                 return .leftAlone(current)

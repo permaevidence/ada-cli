@@ -58,9 +58,14 @@ import Glibc
 /// references a directory that this code removed, whatever fails or crashes.
 ///
 /// A timed-out `npm ci` whose process group cannot be confirmed gone leaves a
-/// POISONED record (`playwright.poisoned-<uuid>.json`, holding the group id)
-/// and keeps its staging directory; every later bootstrap re-kills the group
-/// and refuses to proceed until it is gone, then removes both.
+/// POISONED record (`playwright.poisoned-<uuid>.json`) and keeps its staging
+/// directory. The record names the surviving processes by IDENTITY (pid +
+/// kernel start time + boot id), never by a bare group id a later boot could
+/// have handed to someone else: a later bootstrap signals only processes
+/// whose identity still matches, refuses to proceed while any of them lives,
+/// and releases staging + record once they are gone. A record that cannot be
+/// read, or a staging tree whose record could not be written (parked as
+/// `playwright.manual-<uuid>/`), blocks bootstraps until a human looks.
 ///
 /// The Playwright BROWSER is not part of the pinned tree: it lives in
 /// Playwright's own cache and is installed by the server's `browser_install`
@@ -184,6 +189,18 @@ enum ManagedPlaywright {
         func poisonedRecordURL() -> URL {
             mcpRoot.appendingPathComponent("playwright.poisoned-\(UUID().uuidString.lowercased()).json")
         }
+        /// A staging tree whose safety record could not be written: parked
+        /// under a name no automatic path ever touches.
+        func manualDirectory() -> URL {
+            mcpRoot.appendingPathComponent("playwright.manual-\(UUID().uuidString.lowercased())", isDirectory: true)
+        }
+        /// Exactly `playwright.staging-<uuid>`: one path component, no
+        /// separators, no traversal — the only shape a poison record may name.
+        static func isStagingBasename(_ name: String) -> Bool {
+            guard name.hasPrefix("playwright.staging-"), !name.contains("/"), !name.contains("..") else { return false }
+            let uuid = name.dropFirst("playwright.staging-".count)
+            return uuid.count == 36 && uuid.allSatisfy { $0.isHexDigit || $0 == "-" } && !uuid.contains(where: { $0.isUppercase })
+        }
         /// A token not yet present for `hash`: the plain hash when free, else
         /// `<hash>-r<8 hex>`.
         func freeToken(hash: String) -> String {
@@ -213,11 +230,12 @@ enum ManagedPlaywright {
             ((try? FileManager.default.contentsOfDirectory(atPath: mcpRoot.path)) ?? [])
                 .compactMap(Layout.token(fromDirectoryName:)).sorted()
         }
-        func leftovers() -> (staging: [String], corrupt: [String], poisoned: [String]) {
+        func leftovers() -> (staging: [String], corrupt: [String], poisoned: [String], manual: [String]) {
             let names = (try? FileManager.default.contentsOfDirectory(atPath: mcpRoot.path)) ?? []
             return (names.filter { $0.hasPrefix("playwright.staging-") }.sorted(),
                     names.filter { $0.hasPrefix("playwright.corrupt-") }.sorted(),
-                    names.filter { $0.hasPrefix("playwright.poisoned-") && $0.hasSuffix(".json") }.sorted())
+                    names.filter { $0.hasPrefix("playwright.poisoned-") && $0.hasSuffix(".json") }.sorted(),
+                    names.filter { $0.hasPrefix("playwright.manual-") }.sorted())
         }
     }
 
@@ -383,30 +401,35 @@ enum ManagedPlaywright {
     }
 
     /// The whole transaction under the installation lock. Never touches
-    /// `mcp.json` — the caller performs the switch through `MCPRegistry`.
-    static func ensureInstalled(context: Context) async -> InstallOutcome {
+    /// `mcp.json` — the caller performs the switch through `MCPRegistry`. On
+    /// `.ready` the installation lock is RETURNED still held: the caller keeps
+    /// it across the switch and the post-switch quarantine (lock order:
+    /// installation → configuration) and releases it afterwards. It is nil
+    /// for every other outcome.
+    static func ensureInstalled(context: Context) async -> (outcome: InstallOutcome, lock: InstallLock?) {
         let layout = context.layout
         let hash = context.manifests.lockfileHash
         do {
             try PrivateStorage.ensureDirectory(layout.mcpRoot)
         } catch {
-            return .failed("cannot create \(layout.mcpRoot.path): \(error)")
+            return (.failed("cannot create \(layout.mcpRoot.path): \(error)"), nil)
         }
         let lock: InstallLock
         do {
             guard let acquired = try InstallLock.tryAcquire(layout.installLock) else {
-                return .skipped("installation lock held by another process")
+                return (.skipped("installation lock held by another process"), nil)
             }
             lock = acquired
         } catch {
-            return .failed("installation lock: \(error)")
+            return (.failed("installation lock: \(error)"), nil)
         }
-        defer { lock.release() }
+        var keepLock = false
+        defer { if !keepLock { lock.release() } }
 
-        // Poisoned staging first: a timed-out npm whose group could not be
-        // confirmed gone. Re-kill; refuse to proceed while it lives.
-        if let poison = settlePoisoned(layout: layout, log: context.log) {
-            return .skipped(poison)
+        // Poisoned / manual-recovery leftovers first: refuse to proceed (and
+        // to clean anything) while a recorded process may still write.
+        if let block = settlePoisoned(layout: layout, log: context.log) {
+            return (.skipped(block), nil)
         }
         // Orphans: with the lock held for the whole bootstrap, any remaining
         // staging directory belongs to a dead holder; corrupt directories
@@ -437,24 +460,34 @@ enum ManagedPlaywright {
                     context.log("referenced \(dir.lastPathComponent) failed verification (\(problem)) — kept in place until a replacement is switched in")
                     quarantineAfterSwitch = token
                 } else {
-                    context.log("\(dir.lastPathComponent) failed verification (\(problem)) — quarantining")
-                    if let failure = quarantine(token: token, layout: layout) { return .failed(failure) }
+                    context.log("\(dir.lastPathComponent) failed verification (\(problem)) — quarantining if still unreferenced")
+                    switch quarantineIfUnreferenced(token: token, layout: layout) {
+                    case .quarantined: break
+                    case .referenced:
+                        // An edit landed meanwhile and points at it: not ours
+                        // to rename now; the next start sees it as the
+                        // referenced invalid tree and repairs it in place.
+                        context.log("\(dir.lastPathComponent) became referenced — left in place")
+                    case .failed(let failure):
+                        return (.failed(failure), nil)
+                    }
                 }
                 continue
             }
             if chosen == nil { chosen = token }
         }
         if let chosen {
-            return .ready(token: chosen, reused: true, quarantineAfterSwitch: quarantineAfterSwitch)
+            keepLock = true
+            return (.ready(token: chosen, reused: true, quarantineAfterSwitch: quarantineAfterSwitch), lock)
         }
 
         // Staging build under a token that is not present yet.
         let token = layout.freeToken(hash: hash)
         let versionDir = layout.versionDirectory(token: token)
         let staging = layout.stagingDirectory()
-        func abandon(_ reason: String) -> InstallOutcome {
+        func abandon(_ reason: String) -> (InstallOutcome, InstallLock?) {
             try? FileManager.default.removeItem(at: staging)
-            return .failed(reason)
+            return (.failed(reason), nil)
         }
         do {
             try PrivateStorage.ensureDirectory(staging)
@@ -480,14 +513,27 @@ enum ManagedPlaywright {
             let detail = run.exitCode == 124 ? "npm ci timed out after \(Int(context.npmTimeout))s" : "npm ci exited \(run.exitCode)"
             if run.processGroupVerifiedGone == false, let pgid = run.processGroupID {
                 // Descendants may still be alive and writing into staging:
-                // keep the directory, record the group, refuse later
-                // bootstraps until it is gone (settlePoisoned).
-                let record = PoisonedRecord(stagingDirectory: staging.lastPathComponent, processGroup: pgid,
+                // keep the directory, record WHO (identities, not a reusable
+                // number), refuse later bootstraps until they are gone
+                // (settlePoisoned). If the record cannot be made durable, the
+                // tree is parked under a manual-recovery name that no
+                // automatic path touches — never silently proceed.
+                let members = ProcessGroups.members(of: pgid).filter { !$0.zombie }.map(\.identity)
+                let record = PoisonedRecord(version: 2, stagingDirectory: staging.lastPathComponent,
+                                            processGroup: pgid, members: members, bootID: ProcessGroups.bootID(),
                                             at: Date(), reason: detail)
-                if let data = try? JSONEncoder.iso.encode(record) {
-                    try? PrivateStorage.writeAtomically(data, to: layout.poisonedRecordURL())
+                do {
+                    let data = try JSONEncoder.iso.encode(record)
+                    try writePoisonRecord(data, to: layout.poisonedRecordURL())
+                    return (.failed("\(detail); process group \(pgid) still has \(members.count) live member(s) — staging kept as poisoned, later starts refuse until they are gone: \(tail)"), nil)
+                } catch {
+                    let manual = layout.manualDirectory()
+                    if rename(staging.path, manual.path) == 0 {
+                        try? PrivateStorage.fsyncDirectory(layout.mcpRoot.path)
+                        return (.failed("\(detail); process group \(pgid) still alive and its safety record could not be written (\(error)) — staging parked as \(manual.lastPathComponent) for manual recovery; bootstraps refuse until it is removed by hand"), nil)
+                    }
+                    return (.failed("\(detail); process group \(pgid) still alive, its safety record could not be written (\(error)) and the staging directory could not be parked (\(String(cString: strerror(errno)))) — inspect \(layout.mcpRoot.path) by hand"), nil)
                 }
-                return .failed("\(detail); process group \(pgid) still has live members — staging kept as poisoned, later starts refuse until the group is gone: \(tail)")
             }
             return abandon("\(detail): \(tail)")
         }
@@ -515,55 +561,118 @@ enum ManagedPlaywright {
         do {
             try PrivateStorage.fsyncDirectory(layout.mcpRoot.path)
         } catch {
-            return .failed("fsync after publish: \(error)")
+            return (.failed("fsync after publish: \(error)"), nil)
         }
         crash(.afterParentFsync, if: context)
-        return .ready(token: token, reused: false, quarantineAfterSwitch: quarantineAfterSwitch)
+        keepLock = true
+        return (.ready(token: token, reused: false, quarantineAfterSwitch: quarantineAfterSwitch), lock)
     }
 
-    /// Renames `playwright-<token>` to `playwright.corrupt-<uuid>` (parent
-    /// fsynced). Nil on success, else the reason. Callers guarantee the
-    /// configuration does not reference the token.
-    static func quarantine(token: String, layout: Layout) -> String? {
-        let dir = layout.versionDirectory(token: token)
-        let corrupt = layout.corruptDirectory()
-        guard rename(dir.path, corrupt.path) == 0 else {
-            return "cannot quarantine \(dir.lastPathComponent): \(String(cString: strerror(errno)))"
+    /// Selftest seam: throws instead of writing the poison record.
+    nonisolated(unsafe) static var poisonRecordWriteOverride: ((URL, Data) throws -> Void)?
+
+    static func writePoisonRecord(_ data: Data, to url: URL) throws {
+        if let poisonRecordWriteOverride { try poisonRecordWriteOverride(url, data); return }
+        try PrivateStorage.writeAtomically(data, to: url)
+    }
+
+    enum QuarantineResult: Equatable {
+        case quarantined
+        /// `mcp.json` references the token (managed shape): left untouched.
+        case referenced
+        case failed(String)
+    }
+
+    /// Selftest seam: runs after the decision to quarantine and BEFORE the
+    /// configuration lock is taken (the window an external edit can use).
+    nonisolated(unsafe) static var testHookBeforeQuarantineLock: ((String) -> Void)?
+
+    /// Renames `playwright-<token>` to `playwright.corrupt-<uuid>` only if,
+    /// re-read under the configuration lock, `mcp.json` does not reference
+    /// the token. Lock order everywhere: installation lock (held by the
+    /// caller) → configuration lock (taken here). An edit that lands before
+    /// the lock makes this a no-op; one that arrives after it waits for the
+    /// rename and then references a directory that is gone — which the next
+    /// start repairs (missing referenced directory ⇒ rebuild), never an
+    /// edit this code overwrote.
+    static func quarantineIfUnreferenced(token: String, layout: Layout) -> QuarantineResult {
+        testHookBeforeQuarantineLock?(token)
+        do {
+            return try MCPAgentRouting.withConfigLock {
+                let url = MCPRegistry.configFileURL
+                if let data = FileManager.default.contents(atPath: url.path),
+                   let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let servers = root["mcpServers"] as? [String: Any],
+                   let raw = servers[serverName] as? [String: Any],
+                   let current = MCPRegistry.parseConfig(name: serverName, dict: raw),
+                   case .managed(let referenced) = shape(of: current, layout: layout),
+                   referenced == token {
+                    return .referenced
+                }
+                let dir = layout.versionDirectory(token: token)
+                let corrupt = layout.corruptDirectory()
+                guard rename(dir.path, corrupt.path) == 0 else {
+                    return .failed("cannot quarantine \(dir.lastPathComponent): \(String(cString: strerror(errno)))")
+                }
+                do { try PrivateStorage.fsyncDirectory(layout.mcpRoot.path) } catch {
+                    return .failed("fsync after quarantine: \(error)")
+                }
+                return .quarantined
+            }
+        } catch {
+            return .failed("config lock: \(error)")
         }
-        do { try PrivateStorage.fsyncDirectory(layout.mcpRoot.path) } catch {
-            return "fsync after quarantine: \(error)"
-        }
-        return nil
     }
 
     struct PoisonedRecord: Codable, Equatable {
+        var version: Int
         var stagingDirectory: String
         var processGroup: Int32
+        /// The processes that were alive in the group when the record was
+        /// written; only these — matched by pid AND start time — are ever
+        /// signalled again.
+        var members: [ProcessGroups.Identity]
+        var bootID: String?
         var at: Date
         var reason: String
     }
 
-    /// Poisoned records (lock must be held): re-kill each recorded group; a
-    /// group still alive blocks this start (returns the reason); one that is
-    /// gone releases its staging directory and record.
+    /// Poisoned and manual-recovery leftovers (lock must be held). Returns a
+    /// reason to refuse this start, or nil to proceed:
+    /// - a record whose recorded processes (identity-matched, same boot) are
+    ///   still alive: they are SIGKILLed individually; if any survives, refuse;
+    /// - all gone (or another boot): staging + record released;
+    /// - an unreadable/invalid record, or a `playwright.manual-*` tree:
+    ///   refuse, touch nothing (manual recovery).
     static func settlePoisoned(layout: Layout, log: @Sendable (String) -> Void) -> String? {
         let fm = FileManager.default
-        for name in layout.leftovers().poisoned {
+        let leftovers = layout.leftovers()
+        if let manual = leftovers.manual.first {
+            return "\(manual) is parked for manual recovery (a timed-out npm ci whose safety record could not be written) — inspect \(layout.mcpRoot.path), make sure no npm/node from it is still running, remove it by hand"
+        }
+        for name in leftovers.poisoned {
             let url = layout.mcpRoot.appendingPathComponent(name)
             guard let data = fm.contents(atPath: url.path),
-                  let record = try? JSONDecoder.iso.decode(PoisonedRecord.self, from: data) else {
-                try? fm.removeItem(at: url)     // unreadable record: nothing to wait for
-                continue
+                  let record = try? JSONDecoder.iso.decode(PoisonedRecord.self, from: data),
+                  record.version == 2,
+                  Layout.isStagingBasename(record.stagingDirectory) else {
+                return "\(name) is unreadable or malformed — manual recovery: inspect \(layout.mcpRoot.path), end any npm/node from a previous timed-out install, remove the record and its staging directory by hand"
             }
-            if processGroupHasLiveMembers(record.processGroup) {
-                kill(-record.processGroup, SIGKILL)
-                if processGroupHasLiveMembers(record.processGroup) {
-                    return "process group \(record.processGroup) from a timed-out npm ci (\(record.reason)) is still alive — nothing installed this start"
+            var alive: [ProcessGroups.Identity] = []
+            if record.bootID == ProcessGroups.bootID() {
+                alive = ProcessGroups.stillAlive(record.members)
+                if !alive.isEmpty {
+                    for member in alive { kill(member.pid, SIGKILL) }
+                    Thread.sleep(forTimeInterval: 0.2)
+                    alive = ProcessGroups.stillAlive(record.members)
                 }
+            }
+            if !alive.isEmpty {
+                return "process group \(record.processGroup) from a timed-out npm ci (\(record.reason)) still has \(alive.count) live member(s) (pid \(alive.map { String($0.pid) }.joined(separator: ", "))) — nothing installed this start"
             }
             try? fm.removeItem(at: layout.mcpRoot.appendingPathComponent(record.stagingDirectory))
             try? fm.removeItem(at: url)
-            log("poisoned staging \(record.stagingDirectory) released (group \(record.processGroup) gone)")
+            log("poisoned staging \(record.stagingDirectory) released (recorded processes gone)")
         }
         return nil
     }
@@ -813,27 +922,100 @@ enum ManagedPlaywright {
     /// (GitHub's Swift container), a killed grandchild of npm stays a zombie
     /// forever and the group would never read as gone. On Linux `/proc` gives
     /// the state; elsewhere launchd reaps orphans and the kill probe suffices.
-    /// Selftest seam: pretend a group is (or is not) alive.
-    nonisolated(unsafe) static var liveGroupProbeOverride: ((Int32) -> Bool)?
-
     static func processGroupHasLiveMembers(_ pgid: Int32) -> Bool {
-        if let liveGroupProbeOverride { return liveGroupProbeOverride(pgid) }
-        #if os(Linux)
-        if let names = try? FileManager.default.contentsOfDirectory(atPath: "/proc") {
-            var scanned = false
-            for name in names where Int32(name) != nil {
-                guard let stat = try? String(contentsOfFile: "/proc/\(name)/stat", encoding: .utf8),
-                      let close = stat.range(of: ")", options: .backwards) else { continue }
-                scanned = true
-                // After the parenthesised comm: state ppid pgrp …
-                let fields = stat[close.upperBound...].split(separator: " ")
-                guard fields.count > 2, fields[0] != "Z" else { continue }
-                if Int32(fields[2]) == pgid { return true }
-            }
-            if scanned { return false }
+        !ProcessGroups.members(of: pgid).filter { !$0.zombie }.isEmpty
+    }
+
+    // MARK: - Process identity
+
+    /// Enumerates the processes of a process group with an identity that a
+    /// reused pid cannot forge: pid + kernel start time (+ the boot id at the
+    /// record level). Linux reads `/proc/<pid>/stat`; macOS asks
+    /// `sysctl KERN_PROC_PGRP`. Zombies are reported as such (a container
+    /// without a reaper keeps them forever; they hold no files).
+    enum ProcessGroups {
+        struct Identity: Codable, Equatable, Hashable {
+            let pid: Int32
+            let startTime: UInt64
         }
-        #endif
-        return !(kill(-pgid, 0) == -1 && errno == ESRCH)
+        struct Member: Equatable {
+            let identity: Identity
+            let zombie: Bool
+        }
+
+        /// Selftest seam: substitute the enumeration.
+        nonisolated(unsafe) static var membersOverride: ((Int32) -> [Member])?
+
+        static func members(of pgid: Int32) -> [Member] {
+            if let membersOverride { return membersOverride(pgid) }
+            return enumerate().filter { $0.pgid == pgid }.map { Member(identity: Identity(pid: $0.pid, startTime: $0.start), zombie: $0.zombie) }
+        }
+
+        /// Those of `recorded` that exist right now with the same start time
+        /// and are not zombies.
+        static func stillAlive(_ recorded: [Identity]) -> [Identity] {
+            let current = enumerateOrOverride()
+            return recorded.filter { id in
+                current.contains { $0.identity == id && !$0.zombie }
+            }
+        }
+
+        private static func enumerateOrOverride() -> [Member] {
+            if let membersOverride {
+                // The override answers per group; a recorded member's group
+                // is not known here, so ask for the sentinel group -1 which
+                // the selftest maps to "every process it simulates".
+                return membersOverride(-1)
+            }
+            return enumerate().map { Member(identity: Identity(pid: $0.pid, startTime: $0.start), zombie: $0.zombie) }
+        }
+
+        private struct Raw { let pid: Int32; let pgid: Int32; let start: UInt64; let zombie: Bool }
+
+        private static func enumerate() -> [Raw] {
+            #if os(Linux)
+            var out: [Raw] = []
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return out }
+            for name in names {
+                guard let pid = Int32(name),
+                      let stat = try? String(contentsOfFile: "/proc/\(name)/stat", encoding: .utf8),
+                      let close = stat.range(of: ")", options: .backwards) else { continue }
+                // After the parenthesised comm: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice threads itrealvalue starttime …
+                let fields = stat[close.upperBound...].split(separator: " ")
+                guard fields.count > 19, let pgid = Int32(fields[2]), let start = UInt64(fields[19]) else { continue }
+                out.append(Raw(pid: pid, pgid: pgid, start: start, zombie: fields[0] == "Z"))
+            }
+            return out
+            #else
+            var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+            var size = 0
+            guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+            var buffer = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride + 16)
+            var actual = buffer.count * MemoryLayout<kinfo_proc>.stride
+            guard sysctl(&mib, 4, &buffer, &actual, nil, 0) == 0 else { return [] }
+            let count = actual / MemoryLayout<kinfo_proc>.stride
+            return buffer.prefix(count).map { proc in
+                let tv = proc.kp_proc.p_starttime
+                let start = UInt64(tv.tv_sec) &* 1_000_000 &+ UInt64(tv.tv_usec)
+                return Raw(pid: proc.kp_proc.p_pid, pgid: proc.kp_eproc.e_pgid, start: start,
+                           zombie: Int32(proc.kp_proc.p_stat) == SZOMB)
+            }
+            #endif
+        }
+
+        /// A per-boot value: after a reboot every recorded process is gone
+        /// by definition, whatever pids and start times say.
+        static func bootID() -> String? {
+            #if os(Linux)
+            return (try? String(contentsOfFile: "/proc/sys/kernel/random/boot_id", encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            #else
+            var tv = timeval()
+            var size = MemoryLayout<timeval>.size
+            guard sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 else { return nil }
+            return "\(tv.tv_sec).\(tv.tv_usec)"
+            #endif
+        }
     }
 
     // MARK: - Bootstrap status (doctor)
@@ -908,11 +1090,22 @@ enum ManagedPlaywright {
         }
         for name in leftovers.poisoned {
             let url = layout.mcpRoot.appendingPathComponent(name)
-            let record = FileManager.default.contents(atPath: url.path).flatMap { try? JSONDecoder.iso.decode(PoisonedRecord.self, from: $0) }
-            let group = record.map { "process group \($0.processGroup)" } ?? "unreadable record"
-            out.append(Finding(text: "poisoned staging from a timed-out npm ci (\(group)): bootstraps refuse until the group is gone",
+            if let record = FileManager.default.contents(atPath: url.path).flatMap({ try? JSONDecoder.iso.decode(PoisonedRecord.self, from: $0) }),
+               record.version == 2, Layout.isStagingBasename(record.stagingDirectory) {
+                let alive = record.bootID == ProcessGroups.bootID() ? ProcessGroups.stillAlive(record.members) : []
+                out.append(Finding(text: "poisoned staging \(record.stagingDirectory) from a timed-out npm ci (group \(record.processGroup); \(alive.count) recorded process(es) still alive): bootstraps refuse until they are gone",
+                                   problem: true,
+                                   hint: alive.isEmpty ? "the next start releases it" : "end pid \(alive.map { String($0.pid) }.joined(separator: ", ")) (ps -o pid,pgid,comm) — the next start then cleans up"))
+            } else {
+                out.append(Finding(text: "\(name) is unreadable or malformed — manual recovery",
+                                   problem: true,
+                                   hint: "inspect \(layout.mcpRoot.path), end any npm/node from a previous timed-out install, remove the record and its staging directory by hand"))
+            }
+        }
+        for name in leftovers.manual {
+            out.append(Finding(text: "\(name) is parked for manual recovery (timed-out npm ci whose safety record could not be written): bootstraps refuse",
                                problem: true,
-                               hint: "check for surviving npm/node processes (ps -o pid,pgid,comm) and end them; the next start then cleans up"))
+                               hint: "make sure no npm/node from it is still running, then remove it under \(layout.mcpRoot.path)"))
         }
         if let status = readStatus(layout: layout) {
             let fmt = ISO8601DateFormatter()

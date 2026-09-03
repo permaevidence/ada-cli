@@ -133,11 +133,13 @@ enum ProfileBundle {
         var replacedServers: [String] = []
         var secretsToPopulate: [(String, String)] = []
 
-        let existingServers = MCPRegistry.loadConfigsFromDisk()
-        var merged: [String: MCPServerConfig] = Dictionary(uniqueKeysWithValues: existingServers.map { ($0.name, $0) })
-
         if let bundled = root["mcpServers"] as? [String: Any] {
             let layout = ManagedPlaywright.Layout()
+            // The whole read-modify-write runs inside the actor under the
+            // config lock shared with the file tools (Codex, Release C
+            // round 2): nothing can land between the read and the write.
+            try await MCPRegistry.shared.mergeServers { existingServers in
+            var merged: [String: MCPServerConfig] = Dictionary(uniqueKeysWithValues: existingServers.map { ($0.name, $0) })
             for (name, raw) in bundled {
                 guard let dict = raw as? [String: Any] else {
                     warnings.append("Server '\(name)' in bundle is malformed — skipped.")
@@ -189,7 +191,8 @@ enum ProfileBundle {
                     }
                 }
             }
-            try await MCPRegistry.shared.saveConfigs(Array(merged.values))
+            return Array(merged.values)
+            }
         }
 
         // --- MCP routing ---
