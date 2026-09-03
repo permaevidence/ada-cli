@@ -802,7 +802,11 @@ enum BrowserAutomationBootstrap {
         var nodeDirectory: @Sendable () async -> (String?, String?) = { await ensureNodeDirectory() }
         var baseEnvironment: [String: String] = MCPRegistry.baseEnvironment()
         var npmTimeout: TimeInterval = ManagedPlaywright.npmTimeout
-        var handshakeTimeout: TimeInterval = 30
+        /// Verification handshake bound. Background work with nobody waiting,
+        /// so generous: a Raspberry Pi under load takes a while to start
+        /// node + playwright-core, and a timeout is treated as "could not
+        /// verify now", never as a broken install.
+        var handshakeTimeout: TimeInterval = 90
         var crashPoint: ManagedPlaywright.CrashPoint? = nil
         /// Restart the registry after a switch (production: yes; the selftest
         /// inspects the file instead).

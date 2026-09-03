@@ -146,7 +146,7 @@ actor MCPClient {
         isInitialized = true
 
         // Discover tools immediately so first-turn tool-list assembly is sync.
-        try await refreshTools()
+        try await refreshTools(timeout: timeout)
     }
 
     func shutdown() async {
@@ -162,8 +162,8 @@ actor MCPClient {
 
     // MARK: - Tools
 
-    func refreshTools() async throws {
-        let result = try await sendRequest(method: "tools/list", params: [String: Any](), timeout: 30)
+    func refreshTools(timeout: TimeInterval = 30) async throws {
+        let result = try await sendRequest(method: "tools/list", params: [String: Any](), timeout: timeout)
         let raw: [Any]
         if let arr = result["tools"] as? [Any] {
             raw = arr

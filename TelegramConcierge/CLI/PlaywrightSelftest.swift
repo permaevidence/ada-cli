@@ -82,6 +82,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let npmLog: URL
         let goodCli: URL
         let brokenCli: URL
+        let slowCli: URL
         let python: String
 
         var configFile: URL { StoragePaths.configRoot.appendingPathComponent("mcp.json") }
@@ -160,10 +161,13 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         try fakeServerSource.write(to: goodCli, atomically: true, encoding: .utf8)
         let brokenCli = root.appendingPathComponent("broken-cli.js")
         try "import sys\nsys.stderr.write('fixture: broken server\\n')\nsys.exit(1)\n".write(to: brokenCli, atomically: true, encoding: .utf8)
+        // Same server, but initialize takes longer than the test handshake bound.
+        let slowCli = root.appendingPathComponent("slow-cli.js")
+        try ("import os\nos.environ['FAKE_MCP_DELAY'] = '30'\n" + fakeServerSource).write(to: slowCli, atomically: true, encoding: .utf8)
         return Fixtures(root: root, nodeDir: nodeDir,
                         controlFile: root.appendingPathComponent("npm-control.json"),
                         npmLog: root.appendingPathComponent("npm-log.jsonl"),
-                        goodCli: goodCli, brokenCli: brokenCli, python: python)
+                        goodCli: goodCli, brokenCli: brokenCli, slowCli: slowCli, python: python)
     }
 
     // MARK: - Battery
@@ -884,6 +888,36 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         check("19.9 no mcp.json at all: provably unreferenced, quarantined",
               ManagedPlaywright.quarantineIfUnreferenced(token: qTok, layout: layout) == .quarantined && !fm.fileExists(atPath: qDir.path))
         for name in layout.leftovers().corrupt { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
+
+        // MARK: 23. A slow handshake is not a verdict
+
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: newE)]])
+        try fm.removeItem(atPath: layout.cliPath(token: newE))
+        try fm.copyItem(at: fx.slowCli, to: URL(fileURLWithPath: layout.cliPath(token: newE)))
+        let bytes23 = readConfigBytes()
+        let count23 = fx.npmInvocations().count
+        let slow23 = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
+        var slowOK = false
+        if case .skipped(let r) = slow23, r.contains("could not verify") { slowOK = true }
+        check("23.1 referenced tree whose handshake times out: skipped this start, tree kept, config byte-identical, no rebuild, no quarantine",
+              slowOK && fm.fileExists(atPath: layout.versionDirectory(token: newE).path) && readConfigBytes() == bytes23
+              && fx.npmInvocations().count == count23 && layout.leftovers().corrupt.isEmpty
+              && ManagedPlaywright.readStatus(layout: layout)?.outcome == "skipped", "\(slow23)")
+        // Unreferenced slow tree sorted first, a fast valid one after it: the
+        // slow one is skipped (kept), the fast one chosen.
+        try writeConfig(["mcpServers": ["playwright": legacyEntry()]])
+        let fastE = hE + "-rfa570000"
+        try fm.copyItem(at: layout.versionDirectory(token: newE), to: layout.versionDirectory(token: fastE))
+        try fm.removeItem(atPath: layout.cliPath(token: fastE))
+        try fm.copyItem(at: fx.goodCli, to: URL(fileURLWithPath: layout.cliPath(token: fastE)))
+        let pick23 = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
+        check("23.2 unreferenced slow tree before a fast valid one: skipped and kept, the fast one chosen and switched in, no npm",
+              pick23 == .configured(token: fastE, changed: true) && fm.fileExists(atPath: layout.versionDirectory(token: newE).path)
+              && layout.leftovers().corrupt.isEmpty && fx.npmInvocations().count == count23, "\(pick23)")
+        // Restore the plain tree's fast server for the sections that follow.
+        try fm.removeItem(atPath: layout.cliPath(token: newE))
+        try fm.copyItem(at: fx.goodCli, to: URL(fileURLWithPath: layout.cliPath(token: newE)))
+        try fm.removeItem(at: layout.versionDirectory(token: fastE))
 
         // MARK: 20. Repaired same-token install reloads the registry (Codex round 2 additional)
 

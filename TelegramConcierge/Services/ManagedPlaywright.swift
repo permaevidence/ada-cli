@@ -459,11 +459,21 @@ enum ManagedPlaywright {
             // the remaining unreferenced trees get the static checks so an
             // invalid leftover is still quarantined without a spawn each.
             if let problem = await verify(directory: dir, expectedHash: hash, context: context, handshake: chosen == nil) {
+                if case .transient(let reason) = problem {
+                    // Not a verdict: a slow handshake never quarantines or
+                    // replaces a tree. The referenced one keeps its place and
+                    // this start ends here; an unreferenced one is skipped.
+                    if token == context.referencedToken {
+                        return (.skipped("could not verify the referenced \(dir.lastPathComponent) this start: \(reason) — left as is, retried at the next start"), nil)
+                    }
+                    context.log("\(dir.lastPathComponent): \(reason) — skipped this start")
+                    continue
+                }
                 if token == context.referencedToken {
-                    context.log("referenced \(dir.lastPathComponent) failed verification (\(problem)) — kept in place until a replacement is switched in")
+                    context.log("referenced \(dir.lastPathComponent) failed verification (\(problem.description)) — kept in place until a replacement is switched in")
                     quarantineAfterSwitch = token
                 } else {
-                    context.log("\(dir.lastPathComponent) failed verification (\(problem)) — quarantining if still unreferenced")
+                    context.log("\(dir.lastPathComponent) failed verification (\(problem.description)) — quarantining if still unreferenced")
                     switch quarantineIfUnreferenced(token: token, layout: layout) {
                     case .quarantined: break
                     case .referenced:
@@ -524,7 +534,7 @@ enum ManagedPlaywright {
             return abandon("\(detail): \(tail)")
         }
         if let problem = await verify(directory: staging, expectedHash: nil, context: context) {
-            return abandon("staged install failed verification: \(problem)")
+            return abandon("staged install failed verification: \(problem.description)")
         }
         do {
             try PrivateStorage.writeAtomically(Data((hash + "\n").utf8), to: staging.appendingPathComponent(completionMarkerName))
@@ -703,26 +713,43 @@ enum ManagedPlaywright {
     /// the pinned package present at the pinned version, the executable
     /// present, and a live `initialize` handshake whose `tools/list` includes
     /// `browser_navigate`. Otherwise the reason.
-    static func verify(directory: URL, expectedHash: String?, context: Context, handshake: Bool = true) async -> String? {
+    enum VerifyProblem: Equatable {
+        /// The tree is structurally wrong (missing files, wrong version,
+        /// server exits or answers wrongly): quarantine/rebuild territory.
+        case invalid(String)
+        /// The tree could not be judged right now (the handshake timed out —
+        /// a loaded or slow machine, not a broken install): keep it, retry at
+        /// a later start.
+        case transient(String)
+
+        var description: String {
+            switch self {
+            case .invalid(let s): return s
+            case .transient(let s): return s
+            }
+        }
+    }
+
+    static func verify(directory: URL, expectedHash: String?, context: Context, handshake: Bool = true) async -> VerifyProblem? {
         let fm = FileManager.default
         if let expectedHash {
             let marker = directory.appendingPathComponent(completionMarkerName)
             guard let text = try? String(contentsOf: marker, encoding: .utf8) else {
-                return "no completion marker"
+                return .invalid("no completion marker")
             }
             guard text.trimmingCharacters(in: .whitespacesAndNewlines) == expectedHash else {
-                return "completion marker names another lockfile"
+                return .invalid("completion marker names another lockfile")
             }
         }
         let cli = directory.appendingPathComponent(cliRelativePath).path
-        guard fm.fileExists(atPath: cli) else { return "\(cliRelativePath) missing" }
+        guard fm.fileExists(atPath: cli) else { return .invalid("\(cliRelativePath) missing") }
         if let pinned = context.manifests.pinnedVersion {
             guard let data = fm.contents(atPath: directory.appendingPathComponent(packageRelativePath).path),
                   let pkg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let version = pkg["version"] as? String else {
-                return "installed package.json unreadable"
+                return .invalid("installed package.json unreadable")
             }
-            guard version == pinned else { return "installed @playwright/mcp \(version) is not the pinned \(pinned)" }
+            guard version == pinned else { return .invalid("installed @playwright/mcp \(version) is not the pinned \(pinned)") }
         }
         guard handshake else { return nil }
         let config = MCPServerConfig(name: "playwright-verify", command: context.nodeDirectory + "/node", arguments: [cli])
@@ -732,12 +759,15 @@ enum ManagedPlaywright {
             try await client.initialize(timeout: context.handshakeTimeout)
         } catch {
             await client.shutdown()
-            return "handshake failed: \(error)"
+            if case MCPClientError.timedOut = error {
+                return .transient("handshake timed out after \(Int(context.handshakeTimeout))s (machine busy or slow — not treated as a broken install)")
+            }
+            return .invalid("handshake failed: \(error)")
         }
         let tools = await client.listedTools
         await client.shutdown()
         guard tools.contains(where: { $0.toolName == requiredTool }) else {
-            return "server answered but exposes no \(requiredTool) (\(tools.count) tools)"
+            return .invalid("server answered but exposes no \(requiredTool) (\(tools.count) tools)")
         }
         return nil
     }
