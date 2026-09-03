@@ -134,6 +134,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             deps.baseEnvironment = environment()
             deps.npmTimeout = npmTimeout
             deps.handshakeTimeout = 8
+            deps.steadyStateHandshakeDelay = 0
             deps.crashPoint = crash
             deps.reloadRegistry = reload
             deps.log = log
@@ -308,6 +309,20 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let again = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mA, flag: flag))
         check("3.1 second start: verified and reused, config untouched, npm not run again",
               again == .configured(token: hA, changed: false) && readConfigBytes() == before3 && fx.npmInvocations().count == 1, "\(again)")
+
+        var delayed = fx.dependencies(manifests: mA, flag: flag)
+        delayed.steadyStateHandshakeDelay = 0.6
+        let tDelay = Date()
+        let steady = await BrowserAutomationBootstrap.ensureConfigured(dependencies: delayed)
+        let steadyElapsed = Date().timeIntervalSince(tDelay)
+        try writeConfig(["mcpServers": ["playwright": legacyEntry()]])
+        let tLegacy = Date()
+        let legacyQuick = await BrowserAutomationBootstrap.ensureConfigured(dependencies: delayed)
+        let legacyElapsed = Date().timeIntervalSince(tLegacy)
+        check("3.2 steady state (entry already on this build's lockfile, marker present) waits the handshake delay; a legacy entry does not",
+              steady == .configured(token: hA, changed: false) && steadyElapsed >= 0.6
+              && legacyQuick == .configured(token: hA, changed: true) && legacyElapsed < 0.6,
+              "steady=\(steadyElapsed)s legacy=\(legacyElapsed)s \(steady) \(legacyQuick)")
 
         // MARK: 4. Legacy switch preserves everything else
 
@@ -1146,6 +1161,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         env["PATH"] = nodeDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         deps.baseEnvironment = env
         deps.handshakeTimeout = 8
+        deps.steadyStateHandshakeDelay = 0
         deps.reloadRegistry = false
         deps.crashPoint = (spec["crashPoint"] as? String).flatMap(ManagedPlaywright.CrashPoint.init(rawValue:))
         deps.log = { print("log: \($0)") }
@@ -1171,6 +1187,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         deps.flag = .file(tempRoot.appendingPathComponent("flag"))
         deps.nodeDirectory = { (nodeDir, nil) }
         deps.reloadRegistry = false
+        deps.steadyStateHandshakeDelay = 0
         deps.log = { print("log: \($0)") }
         let t0 = Date()
         let outcome = await BrowserAutomationBootstrap.ensureConfigured(dependencies: deps)

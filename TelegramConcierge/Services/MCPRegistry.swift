@@ -807,6 +807,13 @@ enum BrowserAutomationBootstrap {
         /// node + playwright-core, and a timeout is treated as "could not
         /// verify now", never as a broken install.
         var handshakeTimeout: TimeInterval = 90
+        /// Steady state (the entry already references this build's lockfile
+        /// and the tree carries its marker): the verification handshake is
+        /// deferred this long so a turn arriving right after a restart gets
+        /// the CPU for its own server spawn first — the two would otherwise
+        /// start node + playwright-core at the same moment on a small
+        /// machine. Nothing is written before or during the wait.
+        var steadyStateHandshakeDelay: TimeInterval = 30
         var crashPoint: ManagedPlaywright.CrashPoint? = nil
         /// Restart the registry after a switch (production: yes; the selftest
         /// inspects the file instead).
@@ -874,6 +881,13 @@ enum BrowserAutomationBootstrap {
             deps.log(reason)
             record("failed", reason: reason)
             return .failed(reason)
+        }
+        if case .managed(let token) = shape,
+           ManagedPlaywright.Layout.lockfileHash(ofToken: token) == manifests.lockfileHash,
+           (try? String(contentsOf: layout.versionDirectory(token: token).appendingPathComponent(ManagedPlaywright.completionMarkerName), encoding: .utf8))?
+               .trimmingCharacters(in: .whitespacesAndNewlines) == manifests.lockfileHash,
+           deps.steadyStateHandshakeDelay > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(deps.steadyStateHandshakeDelay * 1_000_000_000))
         }
         let (nodeDirectory, nodeReason) = await deps.nodeDirectory()
         guard let nodeDirectory else {
