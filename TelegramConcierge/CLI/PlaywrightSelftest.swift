@@ -685,7 +685,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
               "started=\(slowStarted) status=\(status17) slowPid=\(slow) gone=\(slowGone)")
         await MCPRegistry.shared.shutdownAll()
 
-        // MARK: 18. Poisoned staging: identity-checked records (Codex round 2 #1)
+        // MARK: 18. Unconfirmed process group → permanent parking (Codex rounds 2–3)
 
         // A sacrificial process stands in for a surviving npm descendant: the
         // enumeration override reports it (by its REAL identity) as the only
@@ -697,7 +697,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             try proc.run()
             var identity: ManagedPlaywright.ProcessGroups.Identity? = nil
             for _ in 0..<50 {
-                if let m = ManagedPlaywright.ProcessGroups.members(of: proc.processIdentifier).first(where: { $0.identity.pid == proc.processIdentifier }) {
+                if let m = ManagedPlaywright.ProcessGroups.members(of: proc.processIdentifier)?.first(where: { $0.identity.pid == proc.processIdentifier }) {
                     identity = m.identity; break
                 }
                 try await Task.sleep(nanoseconds: 20_000_000)
@@ -713,125 +713,98 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             for _ in 0..<100 where proc.isRunning { try? await Task.sleep(nanoseconds: 50_000_000) }
         }
         let (sac1, id1) = try await spawnSacrificial()
-        check("18.0 real enumeration: the sacrificial process is found with pid + start time, in its own group",
+        check("18.0 real enumeration: the sacrificial process is found with pid + start time; a wrong start time does not match; our own group reads alive",
               id1.pid == sac1.processIdentifier && id1.startTime > 0
               && ManagedPlaywright.ProcessGroups.stillAlive([id1]) == [id1]
-              && ManagedPlaywright.ProcessGroups.stillAlive([.init(pid: id1.pid, startTime: id1.startTime &+ 1)]).isEmpty)
-        let forcedAlive = SeamState()
-        ManagedPlaywright.ProcessGroups.membersOverride = { _ in
-            (sac1.isRunning || forcedAlive.done) ? [.init(identity: id1, zombie: false)] : []
-        }
+              && ManagedPlaywright.ProcessGroups.stillAlive([.init(pid: id1.pid, startTime: id1.startTime &+ 1)]) == []
+              && ManagedPlaywright.processGroupHasLiveMembers(getpgrp()))
+        ManagedPlaywright.ProcessGroups.membersOverride = { _ in sac1.isRunning ? [.init(identity: id1, zombie: false)] : [] }
         try fx.setControl(["mode": "spawn-child-and-hang", "childPidFile": childPid.path])
         try writeConfig(["mcpServers": ["playwright": managedEntry(token: hC)]])
         let mD = fx.manifests(version: "0.0.83", salt: "DDDD")
         let before18 = readConfigBytes()
-        let poisoned = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag, npmTimeout: 2))
-        var poisonReason = ""
-        if case .failed(let r) = poisoned { poisonReason = r }
+        let parked = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag, npmTimeout: 2))
+        var parkReason = ""
+        if case .failed(let r) = parked { parkReason = r }
         let left18 = layout.leftovers()
-        let record18 = left18.poisoned.first.flatMap { fm.contents(atPath: layout.mcpRoot.appendingPathComponent($0).path) }
-            .flatMap { try? JSONDecoder.iso.decode(ManagedPlaywright.PoisonedRecord.self, from: $0) }
-        check("18.1 timeout with a live member: failed as poisoned, staging KEPT, record v2 names the member's identity and the boot id, config untouched",
-              poisonReason.contains("poisoned") && left18.staging.count == 1 && left18.poisoned.count == 1 && readConfigBytes() == before18
-              && record18?.version == 2 && record18?.members == [id1] && record18?.bootID == ManagedPlaywright.ProcessGroups.bootID()
-              && record18.map { ManagedPlaywright.Layout.isStagingBasename($0.stagingDirectory) } == true,
-              "\(poisoned) \(left18) \(String(describing: record18))")
-        // A member that survives SIGKILL (forced): refuse, touch nothing.
-        forcedAlive.done = true
+        let stem18 = left18.manual.first { !$0.hasSuffix(".json") && !$0.hasSuffix(".hold") } ?? "?"
+        let info18 = fm.contents(atPath: layout.manualInfoURL(stem: stem18).path)
+            .flatMap { try? JSONDecoder.iso.decode(ManagedPlaywright.ManualRecoveryInfo.self, from: $0) }
+        check("18.1 timeout with a live member: staging PARKED as playwright.manual-*, no staging left, information file names the member's identity and the boot id, config untouched",
+              parkReason.contains("parked as playwright.manual-") && left18.staging.isEmpty && left18.manual.count == 2
+              && fm.fileExists(atPath: layout.manualDirectory(stem: stem18).appendingPathComponent("package.json").path)
+              && info18?.members == [id1] && info18?.enumerationFailed == false && info18?.bootID == ManagedPlaywright.ProcessGroups.bootID()
+              && readConfigBytes() == before18, "\(parked) \(left18) \(String(describing: info18))")
         let count18 = fx.npmInvocations().count
-        let refused = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag, npmTimeout: 2))
+        let refused = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
         var refusedOK = false
-        if case .skipped(let r) = refused, r.contains("live member") { refusedOK = true }
+        if case .skipped(let r) = refused, r.contains("manual recovery") { refusedOK = true }
         let doc18 = ManagedPlaywright.doctorFindings(configs: MCPRegistry.loadConfigsFromDisk(), layout: layout, bundledHash: mD.lockfileHash)
-        check("18.2 recorded member still alive after the kill: later bootstraps refuse (nothing staged, no npm), doctor flags the record with the pid",
-              refusedOK && layout.leftovers().staging.count == 1 && fx.npmInvocations().count == count18
-              && doc18.contains { $0.problem && $0.text.contains("poisoned") && ($0.hint ?? "").contains("\(id1.pid)") }, "\(refused) \(doc18.map(\.text))")
-        // Normal case: the recorded member is killed by identity, then released.
-        forcedAlive.done = false
-        try fx.setControl(["mode": "ok"])
-        let released = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
-        let left18b = layout.leftovers()
-        check("18.3 recorded member killed by identity, staging and record released, install proceeds",
-              released == .configured(token: mD.lockfileHash, changed: true) && left18b.staging.isEmpty && left18b.poisoned.isEmpty
-              && !sac1.isRunning, "\(released) \(left18b) running=\(sac1.isRunning)")
-        ManagedPlaywright.ProcessGroups.membersOverride = nil
-        // Stale identity (real enumeration): same pid, wrong start time — the
-        // process is NOT signalled, the record is released.
-        let (sac2, id2) = try await spawnSacrificial()
-        let stagingStale = layout.stagingDirectory()
-        try fm.createDirectory(at: stagingStale, withIntermediateDirectories: true)
-        let stale = ManagedPlaywright.PoisonedRecord(version: 2, stagingDirectory: stagingStale.lastPathComponent, processGroup: id2.pid,
-                                                     members: [.init(pid: id2.pid, startTime: id2.startTime &+ 7)],
-                                                     bootID: ManagedPlaywright.ProcessGroups.bootID(), at: Date(), reason: "fixture")
-        try JSONEncoder.iso.encode(stale).write(to: layout.poisonedRecordURL())
-        let afterStale = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
-        try await Task.sleep(nanoseconds: 300_000_000)
-        check("18.4 record naming a pid whose start time no longer matches: the process is left alone, record and staging released",
-              afterStale == .configured(token: mD.lockfileHash, changed: false) && sac2.isRunning
-              && layout.leftovers().poisoned.isEmpty && !fm.fileExists(atPath: stagingStale.path), "\(afterStale) running=\(sac2.isRunning)")
-        // Another boot: everything recorded is gone by definition.
-        let stagingBoot = layout.stagingDirectory()
-        try fm.createDirectory(at: stagingBoot, withIntermediateDirectories: true)
-        let otherBoot = ManagedPlaywright.PoisonedRecord(version: 2, stagingDirectory: stagingBoot.lastPathComponent, processGroup: id2.pid,
-                                                         members: [id2], bootID: "not-this-boot", at: Date(), reason: "fixture")
-        try JSONEncoder.iso.encode(otherBoot).write(to: layout.poisonedRecordURL())
-        let afterBoot = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
-        check("18.5 record from another boot: nothing signalled even with a matching identity, released",
-              afterBoot == .configured(token: mD.lockfileHash, changed: false) && sac2.isRunning && layout.leftovers().poisoned.isEmpty, "\(afterBoot)")
-        await reap(sac2)
-        // Traversal in the record: fail closed, nothing deleted, orphans untouched.
-        let escape = tempRoot.appendingPathComponent("escape", isDirectory: true)
-        try fm.createDirectory(at: escape, withIntermediateDirectories: true)
-        let orphan18 = layout.stagingDirectory()
-        try fm.createDirectory(at: orphan18, withIntermediateDirectories: true)
-        let traversal = ManagedPlaywright.PoisonedRecord(version: 2, stagingDirectory: "../escape", processGroup: 1, members: [],
-                                                         bootID: ManagedPlaywright.ProcessGroups.bootID(), at: Date(), reason: "fixture")
-        let traversalURL = layout.poisonedRecordURL()
-        try JSONEncoder.iso.encode(traversal).write(to: traversalURL)
-        let trav = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
-        var travOK = false
-        if case .skipped(let r) = trav, r.contains("manual recovery") { travOK = true }
-        check("18.6 record naming '../escape': refused as manual recovery; the target and the orphan staging are untouched",
-              travOK && fm.fileExists(atPath: escape.path) && fm.fileExists(atPath: orphan18.path) && fm.fileExists(atPath: traversalURL.path), "\(trav)")
-        try fm.removeItem(at: traversalURL)
-        // Unreadable record: same.
-        let garbageURL = layout.poisonedRecordURL()
-        try Data("{not json".utf8).write(to: garbageURL)
-        let garbage = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
-        var garbageOK = false
-        if case .skipped(let r) = garbage, r.contains("manual recovery") { garbageOK = true }
+        check("18.2 while parked: later bootstraps refuse (nothing staged, no npm, nothing signalled), doctor flags it with the live pid",
+              refusedOK && sac1.isRunning && fx.npmInvocations().count == count18
+              && doc18.contains { $0.problem && $0.text.contains("manual recovery") && ($0.hint ?? "").contains("\(id1.pid)") }, "\(refused) \(doc18.map(\.text))")
+        await reap(sac1)
+        let stillRefused = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
+        var stillOK = false
+        if case .skipped(let r) = stillRefused, r.contains("manual recovery") { stillOK = true }
         let doc18b = ManagedPlaywright.doctorFindings(configs: MCPRegistry.loadConfigsFromDisk(), layout: layout, bundledHash: mD.lockfileHash)
-        check("18.7 unreadable record: refused as manual recovery, orphan staging untouched, doctor flags it",
-              garbageOK && fm.fileExists(atPath: orphan18.path) && doc18b.contains { $0.problem && $0.text.contains("unreadable") }, "\(garbage)")
-        try fm.removeItem(at: garbageURL)
-        let afterGarbage = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
-        check("18.8 record removed by hand: the next start cleans the orphan and proceeds",
-              afterGarbage == .configured(token: mD.lockfileHash, changed: false) && !fm.fileExists(atPath: orphan18.path), "\(afterGarbage)")
-        // Record cannot be written: the tree is parked for manual recovery.
-        let (sac3, id3) = try await spawnSacrificial()
-        ManagedPlaywright.ProcessGroups.membersOverride = { _ in sac3.isRunning ? [.init(identity: id3, zombie: false)] : [] }
-        ManagedPlaywright.poisonRecordWriteOverride = { _, _ in throw ManagedPlaywright.ManagedError("disk full (fixture)") }
+        check("18.3 recorded process gone: still refused (nothing is automatic), doctor now says none alive",
+              stillOK && layout.leftovers().manual.count == 2 && doc18b.contains { $0.problem && $0.text.contains("none of the 1 recorded") }, "\(stillRefused) \(doc18b.map(\.text))")
+        ManagedPlaywright.ProcessGroups.membersOverride = nil
+        for name in layout.leftovers().manual { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
+        try fx.setControl(["mode": "ok"])
+        let unparked = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
+        check("18.4 removed by hand: the next start installs", unparked == .configured(token: mD.lockfileHash, changed: true), "\(unparked)")
+        // Enumeration failure is "alive": the probe falls back to kill(-pgid, 0),
+        // where only ESRCH means gone; parking records that enumeration failed.
+        ManagedPlaywright.ProcessGroups.membersOverride = { _ in nil }
+        let deadGroup: Int32 = {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sleep"); p.arguments = ["0"]
+            try? p.run(); p.waitUntilExit(); return p.processIdentifier
+        }()
+        let probeStaging = layout.stagingDirectory()
+        try fm.createDirectory(at: probeStaging, withIntermediateDirectories: true)
+        let note18 = ManagedPlaywright.parkStaging(probeStaging, layout: layout, processGroup: getpgrp(), reason: "fixture")
+        let stem18b = layout.leftovers().manual.first { !$0.hasSuffix(".json") && !$0.hasSuffix(".hold") } ?? "?"
+        let info18b = fm.contents(atPath: layout.manualInfoURL(stem: stem18b).path)
+            .flatMap { try? JSONDecoder.iso.decode(ManagedPlaywright.ManualRecoveryInfo.self, from: $0) }
+        check("18.5 enumeration failure: our own group still reads alive (kill probe), a finished group reads gone only through ESRCH; parking records the failed enumeration",
+              ManagedPlaywright.processGroupHasLiveMembers(getpgrp()) && !ManagedPlaywright.processGroupHasLiveMembers(deadGroup)
+              && note18.contains("parked as") && info18b?.enumerationFailed == true && info18b?.members == nil && !fm.fileExists(atPath: probeStaging.path),
+              "\(note18) \(String(describing: info18b))")
+        ManagedPlaywright.ProcessGroups.membersOverride = nil
+        for name in layout.leftovers().manual { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
+        // Park rename fails: a hold marker keeps the staging name out of cleanup and blocks bootstraps.
+        let (sac2, id2) = try await spawnSacrificial()
+        ManagedPlaywright.ProcessGroups.membersOverride = { _ in sac2.isRunning ? [.init(identity: id2, zombie: false)] : [] }
+        ManagedPlaywright.parkRenameOverride = { _, _ in errno = EIO; return -1 }
         try fx.setControl(["mode": "spawn-child-and-hang", "childPidFile": childPid.path])
         let mE = fx.manifests(version: "0.0.84", salt: "EEEE")
-        let parked = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag, npmTimeout: 2))
-        var parkedReason = ""
-        if case .failed(let r) = parked { parkedReason = r }
+        let held = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag, npmTimeout: 2))
+        ManagedPlaywright.parkRenameOverride = nil
+        var heldReason = ""
+        if case .failed(let r) = held { heldReason = r }
         let left18c = layout.leftovers()
-        check("18.9 safety record cannot be written: staging parked as playwright.manual-*, no poisoned record, no staging, failure names manual recovery",
-              parkedReason.contains("manual recovery") && left18c.manual.count == 1 && left18c.poisoned.isEmpty && left18c.staging.isEmpty, "\(parked) \(left18c)")
-        ManagedPlaywright.poisonRecordWriteOverride = nil
-        ManagedPlaywright.ProcessGroups.membersOverride = nil
-        await reap(sac3)
-        try fx.setControl(["mode": "ok"])
-        let blocked = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
-        var blockedOK = false
-        if case .skipped(let r) = blocked, r.contains("manual recovery") { blockedOK = true }
+        let heldNames = layout.heldStagingNames()
+        _ = ManagedPlaywright.removeLeftovers(layout: layout)
+        check("18.6 park rename fails: hold marker written, staging kept and excluded from cleanup, bootstraps refuse",
+              heldReason.contains("hold marker") && left18c.staging.count == 1 && heldNames == Set(left18c.staging)
+              && left18c.manual.contains { $0.hasSuffix(".hold") } && fm.fileExists(atPath: layout.mcpRoot.appendingPathComponent(left18c.staging[0]).path),
+              "\(held) \(left18c) held=\(heldNames)")
+        let heldRefused = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
+        var heldRefusedOK = false
+        if case .skipped(let r) = heldRefused, r.contains("manual recovery") { heldRefusedOK = true }
         let doc18c = ManagedPlaywright.doctorFindings(configs: MCPRegistry.loadConfigsFromDisk(), layout: layout, bundledHash: mE.lockfileHash)
-        check("18.10 while parked: bootstraps refuse, doctor flags it; removed by hand → next start installs",
-              blockedOK && doc18c.contains { $0.problem && $0.text.contains("manual") }, "\(blocked)")
-        for name in layout.leftovers().manual { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
-        let unparked = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
-        check("18.11 after manual removal the install proceeds", unparked == .configured(token: mE.lockfileHash, changed: true), "\(unparked)")
+        check("18.7 while held: refused, doctor flags the hold marker",
+              heldRefusedOK && fm.fileExists(atPath: layout.mcpRoot.appendingPathComponent(left18c.staging[0]).path)
+              && doc18c.contains { $0.problem && $0.text.contains("holds a staging directory") }, "\(heldRefused)")
+        ManagedPlaywright.ProcessGroups.membersOverride = nil
+        ManagedPlaywright.heldInProcess.removeAll()
+        await reap(sac2)
+        for name in layout.leftovers().manual + layout.leftovers().staging { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
+        try fx.setControl(["mode": "ok"])
+        let unheld = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
+        check("18.8 after manual removal the install proceeds", unheld == .configured(token: mE.lockfileHash, changed: true), "\(unheld)")
         let hE = mE.lockfileHash
 
         // MARK: 19. Quarantine re-checks the configuration under the lock (Codex round 2 #2)
@@ -874,6 +847,34 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         check("19.4 next start repairs it: the valid replacement is reused, the entry switched, the old tree quarantined",
               heal19 == .configured(token: newE, changed: true) && !fm.fileExists(atPath: layout.versionDirectory(token: hE).path)
               && layout.leftovers().corrupt.count == 1, "\(heal19)")
+
+        // Fail-closed quarantine (Codex round 3 #2): uncertainty keeps the tree.
+        let qTok = hE + "-rfeed0000"
+        let qDir = layout.versionDirectory(token: qTok)
+        func plantQ() throws {
+            try? fm.removeItem(at: qDir)
+            try fm.createDirectory(at: qDir, withIntermediateDirectories: true)
+            try Data((hE + "\n").utf8).write(to: qDir.appendingPathComponent(ManagedPlaywright.completionMarkerName))
+        }
+        try plantQ()
+        try Data("{not json".utf8).write(to: fx.configFile)
+        let qMalformed = ManagedPlaywright.quarantineIfUnreferenced(token: qTok, layout: layout)
+        var qMalformedOK = false
+        if case .failed(let r) = qMalformed, r.contains("cannot be read or parsed") { qMalformedOK = true }
+        check("19.5 malformed mcp.json: not quarantined, failure names the reason", qMalformedOK && fm.fileExists(atPath: qDir.path), "\(qMalformed)")
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: qTok, extra: ["args": [layout.cliPath(token: qTok), "--headless"]])]])
+        check("19.6 managed marker with edited args: referenced, kept",
+              ManagedPlaywright.quarantineIfUnreferenced(token: qTok, layout: layout) == .referenced && fm.fileExists(atPath: qDir.path))
+        try writeConfig(["mcpServers": ["playwright": ["command": "/usr/bin/env", "args": ["node", layout.cliPath(token: qTok)]]]])
+        check("19.7 user-authored entry naming the installation path: referenced, kept",
+              ManagedPlaywright.quarantineIfUnreferenced(token: qTok, layout: layout) == .referenced && fm.fileExists(atPath: qDir.path))
+        try writeConfig(["mcpServers": ["playwright": legacyEntry(), "mirror": ["command": layout.versionDirectory(token: qTok).appendingPathComponent("node_modules/.bin/playwright-mcp").path, "args": []]]])
+        check("19.8 another server whose command lives under the installation: referenced, kept",
+              ManagedPlaywright.quarantineIfUnreferenced(token: qTok, layout: layout) == .referenced && fm.fileExists(atPath: qDir.path))
+        try fm.removeItem(at: fx.configFile)
+        check("19.9 no mcp.json at all: provably unreferenced, quarantined",
+              ManagedPlaywright.quarantineIfUnreferenced(token: qTok, layout: layout) == .quarantined && !fm.fileExists(atPath: qDir.path))
+        for name in layout.leftovers().corrupt { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
 
         // MARK: 20. Repaired same-token install reloads the registry (Codex round 2 additional)
 
