@@ -307,25 +307,54 @@ enum MCPAgentRouting {
         StoragePaths.configRoot.appendingPathComponent("mcp-routing.lock")
     }
 
+    /// Same sidecar discipline for `mcp.json`: the managed-Playwright switch
+    /// (`MCPRegistry.updateManagedPlaywrightEntry`) reads, decides and writes
+    /// under it, and the file tools take it around their writes of that
+    /// file, so an agent edit can never land between the switch's snapshot
+    /// and its write (Codex, Release C round 1 #4).
+    static func configLockURL() -> URL {
+        StoragePaths.configRoot.appendingPathComponent("mcp-config.lock")
+    }
+
     /// True when `path` denotes the routing file (symlinks resolved on both
     /// sides). The model-facing file tools take the routing lock around
     /// their write of this one file, so an agent edit and the per-turn
     /// migration can never interleave between the migration's byte check
     /// and its replacement.
     static func isRoutingFile(_ path: String) -> Bool {
-        let candidate = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
-        let routing = routingURL().resolvingSymlinksInPath().standardizedFileURL.path
-        return candidate == routing
+        samePath(path, routingURL())
     }
 
-    /// Run `body` under the routing lock when `path` is the routing file;
-    /// plain call otherwise.
+    private static func samePath(_ path: String, _ target: URL) -> Bool {
+        let candidate = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        return candidate == target.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    /// The sidecar lock that guards `path`, when it is one of the two
+    /// harness-written config files (`mcp-routing.json`, `mcp.json`).
+    static func lockURL(forConfigFile path: String) -> URL? {
+        if isRoutingFile(path) { return routingLockURL() }
+        if samePath(path, MCPRegistry.configFileURL) { return configLockURL() }
+        return nil
+    }
+
+    /// Run `body` under the sidecar lock of `path` when it is `mcp-routing.json`
+    /// or `mcp.json`; plain call otherwise. (Name kept from the routing-only
+    /// version; every file-tool write site calls this.)
     static func withLockIfRoutingFile<T>(_ path: String, _ body: () throws -> T) throws -> T {
-        isRoutingFile(path) ? try withRoutingLock(body) : try body()
+        if let lock = lockURL(forConfigFile: path) { return try withFileLock(lock, body) }
+        return try body()
     }
 
     static func withRoutingLock<T>(_ body: () throws -> T) throws -> T {
-        let url = routingLockURL()
+        try withFileLock(routingLockURL(), body)
+    }
+
+    static func withConfigLock<T>(_ body: () throws -> T) throws -> T {
+        try withFileLock(configLockURL(), body)
+    }
+
+    static func withFileLock<T>(_ url: URL, _ body: () throws -> T) throws -> T {
         try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
         let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         guard fd >= 0 else {

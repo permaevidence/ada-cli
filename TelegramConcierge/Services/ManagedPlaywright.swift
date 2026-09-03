@@ -48,6 +48,20 @@ import Glibc
 /// of `mcp.json` (the agent through file tools, or a human) may reference any
 /// of them at any time. `doctor` lists unreferenced versions.
 ///
+/// Version TOKENS: a directory is `playwright-<lockfileHash>` or, when a
+/// replacement had to be built while the plain name was still referenced,
+/// `playwright-<lockfileHash>-r<8 hex>`. The install REFERENCED by the
+/// current configuration is never renamed before the switch: a tree that
+/// fails verification is left in place, the replacement is built under a
+/// fresh token, the configuration is switched to it, and only then is the
+/// old tree quarantined (`quarantineAfterSwitch`). So `mcp.json` never
+/// references a directory that this code removed, whatever fails or crashes.
+///
+/// A timed-out `npm ci` whose process group cannot be confirmed gone leaves a
+/// POISONED record (`playwright.poisoned-<uuid>.json`, holding the group id)
+/// and keeps its staging directory; every later bootstrap re-kills the group
+/// and refuses to proceed until it is gone, then removes both.
+///
 /// The Playwright BROWSER is not part of the pinned tree: it lives in
 /// Playwright's own cache and is installed by the server's `browser_install`
 /// tool on first use, exactly as before.
@@ -155,11 +169,11 @@ enum ManagedPlaywright {
         }
         var installLock: URL { mcpRoot.appendingPathComponent("playwright-install.lock") }
         var statusFile: URL { mcpRoot.appendingPathComponent("playwright-bootstrap.json") }
-        func versionDirectory(hash: String) -> URL {
-            mcpRoot.appendingPathComponent("playwright-\(hash)", isDirectory: true)
+        func versionDirectory(token: String) -> URL {
+            mcpRoot.appendingPathComponent("playwright-\(token)", isDirectory: true)
         }
-        func cliPath(hash: String) -> String {
-            versionDirectory(hash: hash).appendingPathComponent(cliRelativePath).path
+        func cliPath(token: String) -> String {
+            versionDirectory(token: token).appendingPathComponent(cliRelativePath).path
         }
         func stagingDirectory() -> URL {
             mcpRoot.appendingPathComponent("playwright.staging-\(UUID().uuidString.lowercased())", isDirectory: true)
@@ -167,22 +181,43 @@ enum ManagedPlaywright {
         func corruptDirectory() -> URL {
             mcpRoot.appendingPathComponent("playwright.corrupt-\(UUID().uuidString.lowercased())", isDirectory: true)
         }
-        /// `playwright-<16 hex>` → the hash; nil for anything else.
-        static func hash(fromDirectoryName name: String) -> String? {
+        func poisonedRecordURL() -> URL {
+            mcpRoot.appendingPathComponent("playwright.poisoned-\(UUID().uuidString.lowercased()).json")
+        }
+        /// A token not yet present for `hash`: the plain hash when free, else
+        /// `<hash>-r<8 hex>`.
+        func freeToken(hash: String) -> String {
+            if !FileManager.default.fileExists(atPath: versionDirectory(token: hash).path) { return hash }
+            while true {
+                let token = hash + "-r" + String(UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "").prefix(8))
+                if !FileManager.default.fileExists(atPath: versionDirectory(token: token).path) { return token }
+            }
+        }
+        /// `playwright-<token>` → the token; nil for anything else.
+        static func token(fromDirectoryName name: String) -> String? {
             guard name.hasPrefix("playwright-") else { return nil }
-            let hash = String(name.dropFirst("playwright-".count))
-            guard hash.count == 16, hash.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { return nil }
-            return hash
+            let token = String(name.dropFirst("playwright-".count))
+            return isValidToken(token) ? token : nil
         }
+        /// `<16 hex>` or `<16 hex>-r<8 hex>`, lowercase.
+        static func isValidToken(_ token: String) -> Bool {
+            func hex(_ s: Substring) -> Bool { !s.isEmpty && s.allSatisfy { $0.isHexDigit && !$0.isUppercase } }
+            if token.count == 16 { return hex(token[...]) }
+            guard token.count == 26 else { return false }
+            let hash = token.prefix(16), rest = token.dropFirst(16)
+            return hex(hash) && rest.hasPrefix("-r") && hex(rest.dropFirst(2))
+        }
+        static func lockfileHash(ofToken token: String) -> String { String(token.prefix(16)) }
         /// Every immutable version directory present (verified or not).
-        func installedHashes() -> [String] {
+        func installedTokens() -> [String] {
             ((try? FileManager.default.contentsOfDirectory(atPath: mcpRoot.path)) ?? [])
-                .compactMap(Layout.hash(fromDirectoryName:)).sorted()
+                .compactMap(Layout.token(fromDirectoryName:)).sorted()
         }
-        func leftovers() -> (staging: [String], corrupt: [String]) {
+        func leftovers() -> (staging: [String], corrupt: [String], poisoned: [String]) {
             let names = (try? FileManager.default.contentsOfDirectory(atPath: mcpRoot.path)) ?? []
             return (names.filter { $0.hasPrefix("playwright.staging-") }.sorted(),
-                    names.filter { $0.hasPrefix("playwright.corrupt-") }.sorted())
+                    names.filter { $0.hasPrefix("playwright.corrupt-") }.sorted(),
+                    names.filter { $0.hasPrefix("playwright.poisoned-") && $0.hasSuffix(".json") }.sorted())
         }
     }
 
@@ -196,7 +231,7 @@ enum ManagedPlaywright {
         /// enabled: switched to the managed install once one is verified.
         case legacyAuto
         /// A managed entry whose command/args match its marker exactly.
-        case managed(hash: String)
+        case managed(token: String)
         /// Carries a managed marker but the command/args were edited by hand
         /// (or the marker is malformed): left alone, reported by doctor.
         case managedEdited
@@ -206,31 +241,30 @@ enum ManagedPlaywright {
         case disabled
     }
 
-    static func managedMarker(hash: String) -> String { markerPrefix + hash }
+    static func managedMarker(token: String) -> String { markerPrefix + token }
 
-    static func hash(fromMarker marker: String) -> String? {
+    static func token(fromMarker marker: String) -> String? {
         guard marker.hasPrefix(markerPrefix) else { return nil }
-        let hash = String(marker.dropFirst(markerPrefix.count))
-        guard hash.count == 16, hash.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { return nil }
-        return hash
+        let token = String(marker.dropFirst(markerPrefix.count))
+        return Layout.isValidToken(token) ? token : nil
     }
 
     /// The exact command/args of a managed entry: `node <cli.js>`. `node` is
     /// deliberately bare — resolved through the augmented MCP PATH at spawn
     /// time (`~/.local/bin` first, where `NodeInstaller` links its copy) —
     /// so a Node reinstall or a Homebrew upgrade never strands the entry.
-    static func managedInvocation(hash: String, layout: Layout) -> (command: String, arguments: [String]) {
-        ("node", [layout.cliPath(hash: hash)])
+    static func managedInvocation(token: String, layout: Layout) -> (command: String, arguments: [String]) {
+        ("node", [layout.cliPath(token: token)])
     }
 
     static func shape(of config: MCPServerConfig?, layout: Layout) -> EntryShape {
         guard let config else { return .absent }
         if config.disabled { return .disabled }
         if let marker = config.managed {
-            guard let hash = hash(fromMarker: marker) else { return .managedEdited }
-            let expected = managedInvocation(hash: hash, layout: layout)
+            guard let token = token(fromMarker: marker) else { return .managedEdited }
+            let expected = managedInvocation(token: token, layout: layout)
             if config.command == expected.command && config.arguments == expected.arguments {
-                return .managed(hash: hash)
+                return .managed(token: token)
             }
             return .managedEdited
         }
@@ -243,8 +277,8 @@ enum ManagedPlaywright {
     /// A managed entry for `hash`, keeping everything the existing entry
     /// carried that is not the invocation (env, secretRefs, description,
     /// disabled flag).
-    static func managedConfig(hash: String, layout: Layout, basedOn existing: MCPServerConfig?) -> MCPServerConfig {
-        let invocation = managedInvocation(hash: hash, layout: layout)
+    static func managedConfig(token: String, layout: Layout, basedOn existing: MCPServerConfig?) -> MCPServerConfig {
+        let invocation = managedInvocation(token: token, layout: layout)
         return MCPServerConfig(
             name: serverName,
             command: invocation.command,
@@ -253,27 +287,11 @@ enum ManagedPlaywright {
             disabled: existing?.disabled ?? false,
             secretRefs: existing?.secretRefs ?? [],
             description: existing?.description ?? defaultDescription,
-            managed: managedMarker(hash: hash)
+            managed: managedMarker(token: token)
         )
     }
 
     static let defaultDescription = "Browser automation (drives a local browser for the Browse subagent)"
-
-    /// The legacy auto-registered entry (what pre-0.2.6 fresh installs wrote).
-    /// Written today only by profile import for a managed marker that has no
-    /// local installation yet — the next start switches it.
-    static func legacyConfig(basedOn existing: MCPServerConfig?) -> MCPServerConfig {
-        MCPServerConfig(
-            name: serverName,
-            command: legacyCommand,
-            arguments: legacyArguments,
-            environment: existing?.environment ?? [:],
-            disabled: existing?.disabled ?? false,
-            secretRefs: existing?.secretRefs ?? [],
-            description: existing?.description ?? defaultDescription,
-            managed: nil
-        )
-    }
 
     // MARK: - Context (production values; the selftest substitutes fakes)
 
@@ -296,6 +314,9 @@ enum ManagedPlaywright {
         var npmTimeout: TimeInterval = ManagedPlaywright.npmTimeout
         var handshakeTimeout: TimeInterval = 30
         var crashPoint: CrashPoint? = nil
+        /// The token the current configuration references (managed shape),
+        /// if any: that tree is never renamed before the switch.
+        var referencedToken: String? = nil
         var log: @Sendable (String) -> Void = { NSLog("ManagedPlaywright: %@", $0) }
 
         static func environment(nodeDirectory: String, base: [String: String]) -> [String: String] {
@@ -348,9 +369,14 @@ enum ManagedPlaywright {
     // MARK: - Install transaction
 
     enum InstallOutcome: Equatable, Sendable {
-        /// `playwright-<hash>` is verified (freshly installed or reused).
-        case ready(hash: String, reused: Bool)
-        /// Another live process holds the installation lock; nothing was done.
+        /// `playwright-<token>` is verified (freshly installed or reused).
+        /// `quarantineAfterSwitch` names a tree of the same lockfile that
+        /// failed verification while being referenced by the configuration:
+        /// the caller quarantines it only AFTER the configuration references
+        /// `token`.
+        case ready(token: String, reused: Bool, quarantineAfterSwitch: String?)
+        /// Another live process holds the installation lock, or a poisoned
+        /// process group is still alive; nothing was done.
         case skipped(String)
         /// The install could not be completed; the previous state is intact.
         case failed(String)
@@ -377,31 +403,54 @@ enum ManagedPlaywright {
         }
         defer { lock.release() }
 
-        // Orphans: with the lock held for the whole bootstrap, any staging
-        // directory belongs to a dead holder; corrupt directories were
-        // quarantined by an earlier start. Neither is ever referenced.
+        // Poisoned staging first: a timed-out npm whose group could not be
+        // confirmed gone. Re-kill; refuse to proceed while it lives.
+        if let poison = settlePoisoned(layout: layout, log: context.log) {
+            return .skipped(poison)
+        }
+        // Orphans: with the lock held for the whole bootstrap, any remaining
+        // staging directory belongs to a dead holder; corrupt directories
+        // were quarantined by an earlier start. Neither is ever referenced.
         for name in removeLeftovers(layout: layout) { context.log("removed leftover \(name)") }
 
         crash(.beforeInstall, if: context)
 
-        // Reuse rule: an existing version directory is verified, never rebuilt.
-        let versionDir = layout.versionDirectory(hash: hash)
-        if FileManager.default.fileExists(atPath: versionDir.path) {
-            if let problem = await verify(directory: versionDir, expectedHash: hash, context: context) {
-                context.log("existing \(versionDir.lastPathComponent) failed verification (\(problem)) — quarantining")
-                let corrupt = layout.corruptDirectory()
-                guard rename(versionDir.path, corrupt.path) == 0 else {
-                    return .failed("cannot quarantine \(versionDir.lastPathComponent): \(String(cString: strerror(errno)))")
+        // Reuse rule: every present tree of this lockfile is a candidate, the
+        // referenced one first. The first that verifies is reused. Invalid
+        // candidates: unreferenced ones are quarantined now (nothing points
+        // at them); the referenced one is NEVER renamed here — it is handed
+        // back for quarantine after the switch.
+        var candidates = layout.installedTokens().filter { Layout.lockfileHash(ofToken: $0) == hash }
+        if let referenced = context.referencedToken, let index = candidates.firstIndex(of: referenced) {
+            candidates.remove(at: index)
+            candidates.insert(referenced, at: 0)
+        }
+        var quarantineAfterSwitch: String? = nil
+        var chosen: String? = nil
+        for token in candidates {
+            let dir = layout.versionDirectory(token: token)
+            // Full verification (handshake) only until one tree is chosen;
+            // the remaining unreferenced trees get the static checks so an
+            // invalid leftover is still quarantined without a spawn each.
+            if let problem = await verify(directory: dir, expectedHash: hash, context: context, handshake: chosen == nil) {
+                if token == context.referencedToken {
+                    context.log("referenced \(dir.lastPathComponent) failed verification (\(problem)) — kept in place until a replacement is switched in")
+                    quarantineAfterSwitch = token
+                } else {
+                    context.log("\(dir.lastPathComponent) failed verification (\(problem)) — quarantining")
+                    if let failure = quarantine(token: token, layout: layout) { return .failed(failure) }
                 }
-                do { try PrivateStorage.fsyncDirectory(layout.mcpRoot.path) } catch {
-                    return .failed("fsync after quarantine: \(error)")
-                }
-            } else {
-                return .ready(hash: hash, reused: true)
+                continue
             }
+            if chosen == nil { chosen = token }
+        }
+        if let chosen {
+            return .ready(token: chosen, reused: true, quarantineAfterSwitch: quarantineAfterSwitch)
         }
 
-        // Staging build.
+        // Staging build under a token that is not present yet.
+        let token = layout.freeToken(hash: hash)
+        let versionDir = layout.versionDirectory(token: token)
         let staging = layout.stagingDirectory()
         func abandon(_ reason: String) -> InstallOutcome {
             try? FileManager.default.removeItem(at: staging)
@@ -429,8 +478,18 @@ enum ManagedPlaywright {
         guard run.exitCode == 0 else {
             let tail = run.output.split(separator: "\n").suffix(6).joined(separator: " | ")
             let detail = run.exitCode == 124 ? "npm ci timed out after \(Int(context.npmTimeout))s" : "npm ci exited \(run.exitCode)"
-            let group = run.processGroupVerifiedGone == false ? " (process group could not be confirmed gone)" : ""
-            return abandon("\(detail)\(group): \(tail)")
+            if run.processGroupVerifiedGone == false, let pgid = run.processGroupID {
+                // Descendants may still be alive and writing into staging:
+                // keep the directory, record the group, refuse later
+                // bootstraps until it is gone (settlePoisoned).
+                let record = PoisonedRecord(stagingDirectory: staging.lastPathComponent, processGroup: pgid,
+                                            at: Date(), reason: detail)
+                if let data = try? JSONEncoder.iso.encode(record) {
+                    try? PrivateStorage.writeAtomically(data, to: layout.poisonedRecordURL())
+                }
+                return .failed("\(detail); process group \(pgid) still has live members — staging kept as poisoned, later starts refuse until the group is gone: \(tail)")
+            }
+            return abandon("\(detail): \(tail)")
         }
         if let problem = await verify(directory: staging, expectedHash: nil, context: context) {
             return abandon("staged install failed verification: \(problem)")
@@ -459,11 +518,59 @@ enum ManagedPlaywright {
             return .failed("fsync after publish: \(error)")
         }
         crash(.afterParentFsync, if: context)
-        return .ready(hash: hash, reused: false)
+        return .ready(token: token, reused: false, quarantineAfterSwitch: quarantineAfterSwitch)
     }
 
-    /// Removes orphan staging and quarantined directories (lock must be held).
-    /// Immutable `playwright-<hash>` directories are never touched.
+    /// Renames `playwright-<token>` to `playwright.corrupt-<uuid>` (parent
+    /// fsynced). Nil on success, else the reason. Callers guarantee the
+    /// configuration does not reference the token.
+    static func quarantine(token: String, layout: Layout) -> String? {
+        let dir = layout.versionDirectory(token: token)
+        let corrupt = layout.corruptDirectory()
+        guard rename(dir.path, corrupt.path) == 0 else {
+            return "cannot quarantine \(dir.lastPathComponent): \(String(cString: strerror(errno)))"
+        }
+        do { try PrivateStorage.fsyncDirectory(layout.mcpRoot.path) } catch {
+            return "fsync after quarantine: \(error)"
+        }
+        return nil
+    }
+
+    struct PoisonedRecord: Codable, Equatable {
+        var stagingDirectory: String
+        var processGroup: Int32
+        var at: Date
+        var reason: String
+    }
+
+    /// Poisoned records (lock must be held): re-kill each recorded group; a
+    /// group still alive blocks this start (returns the reason); one that is
+    /// gone releases its staging directory and record.
+    static func settlePoisoned(layout: Layout, log: @Sendable (String) -> Void) -> String? {
+        let fm = FileManager.default
+        for name in layout.leftovers().poisoned {
+            let url = layout.mcpRoot.appendingPathComponent(name)
+            guard let data = fm.contents(atPath: url.path),
+                  let record = try? JSONDecoder.iso.decode(PoisonedRecord.self, from: data) else {
+                try? fm.removeItem(at: url)     // unreadable record: nothing to wait for
+                continue
+            }
+            if processGroupHasLiveMembers(record.processGroup) {
+                kill(-record.processGroup, SIGKILL)
+                if processGroupHasLiveMembers(record.processGroup) {
+                    return "process group \(record.processGroup) from a timed-out npm ci (\(record.reason)) is still alive — nothing installed this start"
+                }
+            }
+            try? fm.removeItem(at: layout.mcpRoot.appendingPathComponent(record.stagingDirectory))
+            try? fm.removeItem(at: url)
+            log("poisoned staging \(record.stagingDirectory) released (group \(record.processGroup) gone)")
+        }
+        return nil
+    }
+
+    /// Removes orphan staging and quarantined directories (lock must be
+    /// held; poisoned staging is settled before this runs). Immutable
+    /// `playwright-<token>` directories are never touched.
     @discardableResult
     static func removeLeftovers(layout: Layout) -> [String] {
         let leftovers = layout.leftovers()
@@ -482,7 +589,7 @@ enum ManagedPlaywright {
     /// the pinned package present at the pinned version, the executable
     /// present, and a live `initialize` handshake whose `tools/list` includes
     /// `browser_navigate`. Otherwise the reason.
-    static func verify(directory: URL, expectedHash: String?, context: Context) async -> String? {
+    static func verify(directory: URL, expectedHash: String?, context: Context, handshake: Bool = true) async -> String? {
         let fm = FileManager.default
         if let expectedHash {
             let marker = directory.appendingPathComponent(completionMarkerName)
@@ -503,6 +610,7 @@ enum ManagedPlaywright {
             }
             guard version == pinned else { return "installed @playwright/mcp \(version) is not the pinned \(pinned)" }
         }
+        guard handshake else { return nil }
         let config = MCPServerConfig(name: "playwright-verify", command: context.nodeDirectory + "/node", arguments: [cli])
         let client = MCPClient(config: config, resolvedEnvironment: context.environment)
         do {
@@ -592,9 +700,12 @@ enum ManagedPlaywright {
         let exitCode: Int32
         let output: String
         /// After a timeout: whether the child's process group was confirmed
-        /// gone (`kill(-pgid, 0)` → ESRCH) before the runner returned. Nil
-        /// when no timeout occurred.
+        /// gone (no live member) before the runner returned. Nil when no
+        /// timeout occurred.
         let processGroupVerifiedGone: Bool?
+        /// The group that was signalled (the detached leader), for the
+        /// poisoned record when it could not be confirmed gone.
+        var processGroupID: Int32? = nil
     }
 
     /// Runs `executable` through the `__setsid-exec` trampoline so the whole
@@ -652,10 +763,10 @@ enum ManagedPlaywright {
             if process.isRunning { signalTree(SIGKILL) }
             process.waitUntilExit()
             signalTree(SIGKILL)
-            let groupDeadline = Date().addingTimeInterval(5)
+            let groupDeadline = Date().addingTimeInterval(20)
             var gone = groupGone()
             while !gone && Date() < groupDeadline {
-                Thread.sleep(forTimeInterval: 0.05)
+                Thread.sleep(forTimeInterval: 0.1)
                 signalTree(SIGKILL)
                 gone = groupGone()
             }
@@ -665,7 +776,7 @@ enum ManagedPlaywright {
                 ? "(output unavailable — a straggler still holds the pipe)"
                 : (String(data: data, encoding: .utf8) ?? "")
             return RunResult(exitCode: 124, output: "timed out after \(Int(timeout))s\n" + captured,
-                             processGroupVerifiedGone: gone)
+                             processGroupVerifiedGone: gone, processGroupID: leaderPid() ?? pid)
         }
         // Leader exited: bounded wait for the pipe (a detached child could
         // hold it), then kill whatever is left in the group.
@@ -685,14 +796,14 @@ enum ManagedPlaywright {
         process.waitUntilExit()
         if reader.isExecuting {
             return RunResult(exitCode: 124, output: "the command exited but a detached descendant still holds its output pipe — process group killed, output unavailable",
-                             processGroupVerifiedGone: groupGone())
+                             processGroupVerifiedGone: groupGone(), processGroupID: leaderPid() ?? pid)
         }
         let text = String(data: data, encoding: .utf8) ?? ""
         if stragglers {
             let status = process.terminationStatus
             return RunResult(exitCode: status == 0 ? 124 : status,
                              output: text + "\n(detached descendant processes outlived the command and were killed — treated as failure)",
-                             processGroupVerifiedGone: groupGone())
+                             processGroupVerifiedGone: groupGone(), processGroupID: leaderPid() ?? pid)
         }
         return RunResult(exitCode: process.terminationStatus, output: text, processGroupVerifiedGone: nil)
     }
@@ -702,7 +813,11 @@ enum ManagedPlaywright {
     /// (GitHub's Swift container), a killed grandchild of npm stays a zombie
     /// forever and the group would never read as gone. On Linux `/proc` gives
     /// the state; elsewhere launchd reaps orphans and the kill probe suffices.
+    /// Selftest seam: pretend a group is (or is not) alive.
+    nonisolated(unsafe) static var liveGroupProbeOverride: ((Int32) -> Bool)?
+
     static func processGroupHasLiveMembers(_ pgid: Int32) -> Bool {
+        if let liveGroupProbeOverride { return liveGroupProbeOverride(pgid) }
         #if os(Linux)
         if let names = try? FileManager.default.contentsOfDirectory(atPath: "/proc") {
             var scanned = false
@@ -727,24 +842,19 @@ enum ManagedPlaywright {
         var at: Date
         /// `ready` | `skipped` | `failed` | `left-alone`
         var outcome: String
-        var hash: String?
+        var token: String?
         var reason: String?
     }
 
     static func recordStatus(_ status: BootstrapStatus, layout: Layout) {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(status) else { return }
+        guard let data = try? JSONEncoder.iso.encode(status) else { return }
         try? PrivateStorage.ensureDirectory(layout.mcpRoot)
         try? PrivateStorage.writeAtomically(data, to: layout.statusFile)
     }
 
     static func readStatus(layout: Layout) -> BootstrapStatus? {
         guard let data = FileManager.default.contents(atPath: layout.statusFile.path) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(BootstrapStatus.self, from: data)
+        return try? JSONDecoder.iso.decode(BootstrapStatus.self, from: data)
     }
 
     // MARK: - Doctor
@@ -762,7 +872,7 @@ enum ManagedPlaywright {
                                bundledHash: String?) -> [Finding] {
         var out: [Finding] = []
         let entry = configs.first { $0.name == serverName }
-        let installed = layout.installedHashes()
+        let installed = layout.installedTokens()
         var referenced: String? = nil
         switch shape(of: entry, layout: layout) {
         case .absent:
@@ -770,14 +880,15 @@ enum ManagedPlaywright {
         case .legacyAuto:
             out.append(Finding(text: "playwright: legacy `npx @playwright/mcp@latest` entry — switched to the pinned managed install at the next successful start",
                                problem: false, hint: nil))
-        case .managed(let hash):
-            referenced = hash
-            let marker = layout.versionDirectory(hash: hash).appendingPathComponent(completionMarkerName)
+        case .managed(let token):
+            referenced = token
+            let marker = layout.versionDirectory(token: token).appendingPathComponent(completionMarkerName)
+            let hash = Layout.lockfileHash(ofToken: token)
             let ok = (try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == hash
             let current = bundledHash == nil || bundledHash == hash
-            out.append(Finding(text: "playwright: managed install playwright-\(hash)\(current ? "" : " (this build pins \(bundledHash ?? "?") — updated at the next successful start)")",
+            out.append(Finding(text: "playwright: managed install playwright-\(token)\(current ? "" : " (this build pins \(bundledHash ?? "?") — updated at the next successful start)")",
                                problem: !ok,
-                               hint: ok ? nil : "the referenced directory is missing or incomplete — start briglia once, the bootstrap rebuilds or re-points it"))
+                               hint: ok ? nil : "the referenced directory is missing or incomplete — start briglia once, the bootstrap installs a replacement and re-points the entry"))
         case .managedEdited:
             out.append(Finding(text: "playwright: managed marker present but command/args were edited by hand — left alone (remove the `managed` field to make that permanent)", problem: false, hint: nil))
         case .userAuthored:
@@ -795,6 +906,14 @@ enum ManagedPlaywright {
             out.append(Finding(text: "leftover directories removed at the next start: \((leftovers.staging + leftovers.corrupt).joined(separator: ", "))",
                                problem: false, hint: nil))
         }
+        for name in leftovers.poisoned {
+            let url = layout.mcpRoot.appendingPathComponent(name)
+            let record = FileManager.default.contents(atPath: url.path).flatMap { try? JSONDecoder.iso.decode(PoisonedRecord.self, from: $0) }
+            let group = record.map { "process group \($0.processGroup)" } ?? "unreadable record"
+            out.append(Finding(text: "poisoned staging from a timed-out npm ci (\(group)): bootstraps refuse until the group is gone",
+                               problem: true,
+                               hint: "check for surviving npm/node processes (ps -o pid,pgid,comm) and end them; the next start then cleans up"))
+        }
         if let status = readStatus(layout: layout) {
             let fmt = ISO8601DateFormatter()
             let reason = status.reason.map { " — \($0)" } ?? ""
@@ -803,5 +922,23 @@ enum ManagedPlaywright {
                                hint: status.outcome == "failed" ? "the previous entry keeps working; the next start retries" : nil))
         }
         return out
+    }
+}
+
+extension JSONEncoder {
+    /// ISO-8601 dates, stable key order (the small state files under mcp/).
+    static var iso: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
+    }
+}
+
+extension JSONDecoder {
+    static var iso: JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
     }
 }

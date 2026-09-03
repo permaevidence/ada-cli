@@ -42,6 +42,12 @@ actor MCPRegistry {
     private var entries: [String: Entry] = [:]   // key = server name
     private var bootstrapTask: Task<Void, Never>?
     private var didBootstrap: Bool = false
+    /// Bumped by every teardown (`reloadFromDisk`, `shutdownAll`). A
+    /// bootstrap publishes its clients only if the generation it started in
+    /// is still current; otherwise it shuts them down (Codex, Release C
+    /// round 1 #1: a reload during an in-flight bootstrap must not let the
+    /// stale bootstrap repopulate `entries` or leak a client process).
+    private var generation = 0
 
     /// Canonical accepted-tool registry (`MCPToolSurface`), rebuilt from the
     /// connected clients' tool lists on every `allToolDefinitions()` call
@@ -198,20 +204,27 @@ actor MCPRegistry {
 
     /// Kill every spawned server. Called on app termination.
     func shutdownAll() async {
-        for entry in entries.values {
-            await entry.client.shutdown()
-        }
-        entries.removeAll()
-        didBootstrap = false
-        bootstrapTask = nil
-        surface = .empty
-        surfaceBuilt = false
+        await teardown()
     }
 
     /// Tear down every running client and re-bootstrap from the current
-    /// on-disk config. Called by Settings UI after mcp.json is rewritten so
-    /// changes take effect without requiring an app restart.
+    /// on-disk config. Called after mcp.json is rewritten (managed Playwright
+    /// switch, profile import) so changes take effect without a restart.
     func reloadFromDisk() async {
+        await teardown()
+        loggedRefusalServers.removeAll()
+        await ensureBootstrapped()
+        await rebuildSurface()
+    }
+
+    /// Invalidate the current generation, let an in-flight bootstrap finish
+    /// (it will shut its clients down instead of publishing them), then
+    /// shut down and forget every published client.
+    private func teardown() async {
+        generation += 1
+        if let inFlight = bootstrapTask {
+            await inFlight.value
+        }
         for entry in entries.values {
             await entry.client.shutdown()
         }
@@ -220,9 +233,6 @@ actor MCPRegistry {
         bootstrapTask = nil
         surface = .empty
         surfaceBuilt = false
-        loggedRefusalServers.removeAll()
-        await ensureBootstrapped()
-        await rebuildSurface()
     }
 
     // MARK: - Config persistence (for Settings UI)
@@ -274,7 +284,7 @@ actor MCPRegistry {
     }
 
     enum ManagedEntryUpdate: Equatable {
-        /// The playwright entry now references `playwright-<hash>`.
+        /// The playwright entry now references `playwright-<token>`.
         case switched(from: ManagedPlaywright.EntryShape)
         /// It already did.
         case alreadyCurrent
@@ -285,58 +295,71 @@ actor MCPRegistry {
         case failed(String)
     }
 
-    /// The switch (plan §H4.4 item 5): re-read `mcp.json` as raw JSON, change
-    /// ONLY the playwright entry's `command`/`args`/`managed` (every other key
-    /// of that entry and every other server survive exactly as parsed —
-    /// including keys this build does not know), write atomically. Refuses
-    /// to reference a directory without its completion marker (managed-entry
-    /// verification). Does not restart clients — the caller reloads.
-    func updateManagedPlaywrightEntry(hash: String, layout: ManagedPlaywright.Layout,
+    /// Selftest seam: runs inside the config lock, after the decision and
+    /// before the write.
+    nonisolated(unsafe) static var testHookBeforeManagedConfigWrite: (() -> Void)?
+
+    /// The switch (plan §H4.4 item 5), under the `mcp-config.lock` sidecar
+    /// shared with the file tools: ONE raw-JSON snapshot of `mcp.json` is
+    /// read, the playwright entry's shape is decided from that same
+    /// snapshot, and only its `command`/`args`/`managed` change — every other
+    /// key of that entry and every other server survive exactly as parsed
+    /// (including keys this build does not know). Refuses to reference a
+    /// directory without its completion marker (managed-entry verification).
+    /// Does not restart clients — the caller reloads.
+    func updateManagedPlaywrightEntry(token: String, layout: ManagedPlaywright.Layout,
                                       addIfAbsent: Bool,
                                       crashAfterWrite: Bool = false) -> ManagedEntryUpdate {
-        let marker = layout.versionDirectory(hash: hash).appendingPathComponent(ManagedPlaywright.completionMarkerName)
+        let marker = layout.versionDirectory(token: token).appendingPathComponent(ManagedPlaywright.completionMarkerName)
         guard (try? String(contentsOf: marker, encoding: .utf8))?
-                .trimmingCharacters(in: .whitespacesAndNewlines) == hash else {
-            return .failed("playwright-\(hash) has no valid completion marker — not referencing it")
+                .trimmingCharacters(in: .whitespacesAndNewlines) == ManagedPlaywright.Layout.lockfileHash(ofToken: token) else {
+            return .failed("playwright-\(token) has no valid completion marker — not referencing it")
         }
         let url = Self.mcpConfigURL()
-        var root: [String: Any] = [:]
-        if let data = FileManager.default.contents(atPath: url.path) {
-            guard let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return .failed("mcp.json is not a JSON object — left untouched")
-            }
-            root = parsed
-        }
-        var servers = (root["mcpServers"] as? [String: Any]) ?? [:]
-        let rawEntry = servers[ManagedPlaywright.serverName] as? [String: Any]
-        let current = Self.loadConfigs().first { $0.name == ManagedPlaywright.serverName }
-        let shape = ManagedPlaywright.shape(of: current, layout: layout)
-        switch shape {
-        case .managed(let existing) where existing == hash:
-            return .alreadyCurrent
-        case .managed, .legacyAuto:
-            break
-        case .absent:
-            guard addIfAbsent else { return .absent }
-        case .managedEdited, .userAuthored, .disabled:
-            return .leftAlone(shape)
-        }
-        let invocation = ManagedPlaywright.managedInvocation(hash: hash, layout: layout)
-        var entry = rawEntry ?? ["description": ManagedPlaywright.defaultDescription]
-        entry["command"] = invocation.command
-        entry["args"] = invocation.arguments
-        entry["managed"] = ManagedPlaywright.managedMarker(hash: hash)
-        servers[ManagedPlaywright.serverName] = entry
-        root["mcpServers"] = servers
         do {
-            try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
-            let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-            try PrivateStorage.writeAtomically(data, to: url, mode: 0o600)
+            return try MCPAgentRouting.withConfigLock {
+                var root: [String: Any] = [:]
+                if let data = FileManager.default.contents(atPath: url.path) {
+                    guard let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        return .failed("mcp.json is not a JSON object — left untouched")
+                    }
+                    root = parsed
+                }
+                var servers = (root["mcpServers"] as? [String: Any]) ?? [:]
+                let rawEntry = servers[ManagedPlaywright.serverName] as? [String: Any]
+                let current = rawEntry.flatMap { Self.parseConfig(name: ManagedPlaywright.serverName, dict: $0) }
+                let shape = ManagedPlaywright.shape(of: current, layout: layout)
+                switch shape {
+                case .managed(let existing) where existing == token:
+                    return .alreadyCurrent
+                case .managed, .legacyAuto:
+                    break
+                case .absent:
+                    guard addIfAbsent else { return .absent }
+                case .managedEdited, .userAuthored, .disabled:
+                    return .leftAlone(shape)
+                }
+                let invocation = ManagedPlaywright.managedInvocation(token: token, layout: layout)
+                var entry = rawEntry ?? ["description": ManagedPlaywright.defaultDescription]
+                entry["command"] = invocation.command
+                entry["args"] = invocation.arguments
+                entry["managed"] = ManagedPlaywright.managedMarker(token: token)
+                servers[ManagedPlaywright.serverName] = entry
+                root["mcpServers"] = servers
+                Self.testHookBeforeManagedConfigWrite?()
+                do {
+                    try PrivateStorage.ensureDirectory(url.deletingLastPathComponent())
+                    let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+                    try PrivateStorage.writeAtomically(data, to: url, mode: 0o600)
+                } catch {
+                    return .failed("could not write mcp.json: \(error)")
+                }
+                if crashAfterWrite { _exit(137) }
+                return .switched(from: shape)
+            }
         } catch {
-            return .failed("could not write mcp.json: \(error)")
+            return .failed("config lock: \(error)")
         }
-        if crashAfterWrite { _exit(137) }
-        return .switched(from: shape)
     }
 
     // MARK: - Bootstrap
@@ -353,16 +376,21 @@ actor MCPRegistry {
     }
 
     private func bootstrap() async {
+        let startedIn = generation
         defer {
-            didBootstrap = true
-            bootstrapTask = nil
+            if startedIn == generation {
+                didBootstrap = true
+                bootstrapTask = nil
+            }
         }
         let configs = Self.loadConfigs()
         guard !configs.isEmpty else { return }
 
         // Spawn in parallel so one slow server (npx cold start) doesn't block
-        // the others. Each task populates a local entry on success or a
-        // failure marker on error.
+        // the others. Each task yields a local entry on success or a
+        // failure marker on error; nothing is published until every spawn
+        // has settled, and only if no teardown happened meanwhile.
+        var spawned: [String: Entry] = [:]
         await withTaskGroup(of: (String, Entry).self) { group in
             for cfg in configs {
                 group.addTask {
@@ -370,8 +398,13 @@ actor MCPRegistry {
                 }
             }
             for await (name, entry) in group {
-                entries[name] = entry
+                spawned[name] = entry
             }
+        }
+        if startedIn == generation {
+            entries = spawned
+        } else {
+            for entry in spawned.values { await entry.client.shutdown() }
         }
     }
 
@@ -424,26 +457,27 @@ actor MCPRegistry {
 
         var out: [MCPServerConfig] = []
         for (name, raw) in servers {
-            guard let dict = raw as? [String: Any],
-                  let command = dict["command"] as? String else { continue }
-            let args = (dict["args"] as? [String]) ?? []
-            let env = (dict["env"] as? [String: String]) ?? [:]
-            let disabled = (dict["disabled"] as? Bool) ?? false
-            let secretRefs = (dict["secretRefs"] as? [String]) ?? []
-            let desc = dict["description"] as? String
-            let managed = dict["managed"] as? String
-            out.append(MCPServerConfig(
-                name: name,
-                command: command,
-                arguments: args,
-                environment: env,
-                disabled: disabled,
-                secretRefs: secretRefs,
-                description: desc,
-                managed: managed
-            ))
+            guard let dict = raw as? [String: Any], let cfg = parseConfig(name: name, dict: dict) else { continue }
+            out.append(cfg)
         }
         return out.sorted { $0.name < $1.name }
+    }
+
+    /// One server entry of `mcpServers` → config (nil without a command).
+    /// Shared by the loader and the managed switch so both decide from the
+    /// same parse.
+    nonisolated static func parseConfig(name: String, dict: [String: Any]) -> MCPServerConfig? {
+        guard let command = dict["command"] as? String else { return nil }
+        return MCPServerConfig(
+            name: name,
+            command: command,
+            arguments: (dict["args"] as? [String]) ?? [],
+            environment: (dict["env"] as? [String: String]) ?? [:],
+            disabled: (dict["disabled"] as? Bool) ?? false,
+            secretRefs: (dict["secretRefs"] as? [String]) ?? [],
+            description: dict["description"] as? String,
+            managed: dict["managed"] as? String
+        )
     }
 
     private static func mcpConfigURL() -> URL {
@@ -767,9 +801,9 @@ enum BrowserAutomationBootstrap {
     }
 
     enum Outcome: Equatable {
-        /// The entry references the verified `playwright-<hash>`; `changed`
+        /// The entry references the verified `playwright-<token>`; `changed`
         /// says whether this run wrote it.
-        case configured(hash: String, changed: Bool)
+        case configured(token: String, changed: Bool)
         case leftAlone(ManagedPlaywright.EntryShape)
         /// Deliberately removed earlier: nothing to do.
         case notWanted
@@ -784,9 +818,9 @@ enum BrowserAutomationBootstrap {
     @discardableResult
     static func ensureConfigured(dependencies deps: Dependencies) async -> Outcome {
         let layout = deps.layout
-        func record(_ outcome: String, hash: String? = nil, reason: String? = nil) {
+        func record(_ outcome: String, token: String? = nil, reason: String? = nil) {
             ManagedPlaywright.recordStatus(
-                ManagedPlaywright.BootstrapStatus(at: Date(), outcome: outcome, hash: hash, reason: reason),
+                ManagedPlaywright.BootstrapStatus(at: Date(), outcome: outcome, token: token, reason: reason),
                 layout: layout)
         }
         let entry = MCPRegistry.loadConfigsFromDisk().first { $0.name == ManagedPlaywright.serverName }
@@ -805,11 +839,14 @@ enum BrowserAutomationBootstrap {
         if entry != nil { deps.flag.set() }
 
         let shape = ManagedPlaywright.shape(of: entry, layout: layout)
+        var referencedToken: String? = nil
         switch shape {
         case .absent:
             guard !deps.flag.isSet() else { return .notWanted }
-        case .legacyAuto, .managed:
+        case .legacyAuto:
             break
+        case .managed(let token):
+            referencedToken = token
         case .managedEdited, .userAuthored, .disabled:
             record("left-alone", reason: "\(shape)")
             return .leftAlone(shape)
@@ -828,48 +865,61 @@ enum BrowserAutomationBootstrap {
         guard let nodeDirectory else {
             let reason = "Node.js unavailable: \(nodeReason ?? "unknown")"
             deps.log(reason)
-            record("failed", hash: manifests.lockfileHash, reason: reason)
+            record("failed", reason: reason)
             return .failed(reason)
         }
         let context = ManagedPlaywright.Context(
             layout: layout, manifests: manifests, nodeDirectory: nodeDirectory,
             environment: ManagedPlaywright.Context.environment(nodeDirectory: nodeDirectory, base: deps.baseEnvironment),
             npmTimeout: deps.npmTimeout, handshakeTimeout: deps.handshakeTimeout,
-            crashPoint: deps.crashPoint, log: deps.log)
+            crashPoint: deps.crashPoint, referencedToken: referencedToken, log: deps.log)
         switch await ManagedPlaywright.ensureInstalled(context: context) {
         case .skipped(let reason):
             deps.log("skipped: \(reason)")
-            record("skipped", hash: manifests.lockfileHash, reason: reason)
+            record("skipped", reason: reason)
             return .skipped(reason)
         case .failed(let reason):
             deps.log("install failed: \(reason)")
-            record("failed", hash: manifests.lockfileHash, reason: reason)
+            record("failed", reason: reason)
             return .failed(reason)
-        case .ready(let hash, let reused):
+        case .ready(let token, let reused, let quarantineAfterSwitch):
             let update = await MCPRegistry.shared.updateManagedPlaywrightEntry(
-                hash: hash, layout: layout, addIfAbsent: shape == .absent,
+                token: token, layout: layout, addIfAbsent: shape == .absent,
                 crashAfterWrite: deps.crashPoint == .afterConfigWrite)
+            // A referenced tree that failed verification is quarantined only
+            // now that the configuration no longer points at it; if the
+            // switch did not happen (left alone), it stays where it is.
+            func quarantineOldIfSafe() {
+                guard let old = quarantineAfterSwitch, old != token else { return }
+                if let failure = ManagedPlaywright.quarantine(token: old, layout: layout) {
+                    deps.log("could not quarantine playwright-\(old): \(failure)")
+                } else {
+                    deps.log("quarantined playwright-\(old) (failed verification; no longer referenced)")
+                }
+            }
             switch update {
             case .switched(let from):
                 deps.flag.set()
-                deps.log("playwright entry now references playwright-\(hash) (was \(from); install \(reused ? "reused" : "fresh"))")
-                record("ready", hash: hash)
+                deps.log("playwright entry now references playwright-\(token) (was \(from); install \(reused ? "reused" : "fresh"))")
+                quarantineOldIfSafe()
+                record("ready", token: token)
                 if deps.reloadRegistry {
                     await MCPRegistry.shared.reloadFromDisk()
                     await MCPAgentRouting.refreshFromRegistry()
                 }
-                return .configured(hash: hash, changed: true)
+                return .configured(token: token, changed: true)
             case .alreadyCurrent:
-                record("ready", hash: hash)
-                return .configured(hash: hash, changed: false)
+                quarantineOldIfSafe()
+                record("ready", token: token)
+                return .configured(token: token, changed: false)
             case .leftAlone(let current):
-                record("left-alone", hash: hash, reason: "\(current)")
+                record("left-alone", token: token, reason: "\(current)")
                 return .leftAlone(current)
             case .absent:
                 return .notWanted
             case .failed(let reason):
                 deps.log("switch failed: \(reason)")
-                record("failed", hash: hash, reason: reason)
+                record("failed", token: token, reason: reason)
                 return .failed(reason)
             }
         }

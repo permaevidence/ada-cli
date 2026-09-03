@@ -46,10 +46,10 @@ enum ProfileBundle {
         var mcpServers: [String: Any] = [:]
         for cfg in servers {
             var dict: [String: Any]
-            if case .managed(let hash) = ManagedPlaywright.shape(of: cfg, layout: layout) {
+            if case .managed(let token) = ManagedPlaywright.shape(of: cfg, layout: layout) {
                 // Logical representation (plan §H4.4 item 6): the managed
                 // marker only — never this machine's installation path.
-                dict = ["managed": ManagedPlaywright.managedMarker(hash: hash)]
+                dict = ["managed": ManagedPlaywright.managedMarker(token: token)]
             } else {
                 dict = [
                     "command": cfg.command,
@@ -157,6 +157,7 @@ enum ProfileBundle {
                                                   disabled: disabled, secretRefs: secretRefs, description: desc)
                     let (resolved, warning) = resolveManagedPlaywright(marker: marker, layout: layout, basedOn: carried)
                     if let warning { warnings.append(warning) }
+                    guard let resolved else { continue }   // skipped: the local entry (if any) stays as it is
                     cfg = resolved
                 } else {
                     guard let command = dict["command"] as? String else {
@@ -251,25 +252,33 @@ enum ProfileBundle {
 
     /// The local counterpart of an exported managed marker: the same
     /// version if it is installed here (marker present), else this build's
-    /// pinned version if installed, else the legacy auto shape — which the
-    /// next start switches once the managed install exists.
+    /// pinned version if installed (warning), else NOTHING — the entry is
+    /// skipped with a warning and the local one, if any, stays. An importer
+    /// never writes `npx @playwright/mcp@latest` (Codex, Release C round 1
+    /// #3): the next daemon start installs the pinned version and registers
+    /// it when no entry exists.
     static func resolveManagedPlaywright(marker: String, layout: ManagedPlaywright.Layout,
                                          basedOn carried: MCPServerConfig?,
                                          bundledHash: String? = (try? ManagedPlaywright.Manifests.bundled())?.lockfileHash)
-        -> (MCPServerConfig, String?) {
-        func installed(_ hash: String) -> Bool {
-            let marker = layout.versionDirectory(hash: hash).appendingPathComponent(ManagedPlaywright.completionMarkerName)
-            return (try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == hash
+        -> (MCPServerConfig?, String?) {
+        func installed(_ token: String) -> Bool {
+            let marker = layout.versionDirectory(token: token).appendingPathComponent(ManagedPlaywright.completionMarkerName)
+            return (try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+                == ManagedPlaywright.Layout.lockfileHash(ofToken: token)
         }
-        if let hash = ManagedPlaywright.hash(fromMarker: marker), installed(hash) {
-            return (ManagedPlaywright.managedConfig(hash: hash, layout: layout, basedOn: carried), nil)
+        if let token = ManagedPlaywright.token(fromMarker: marker), installed(token) {
+            return (ManagedPlaywright.managedConfig(token: token, layout: layout, basedOn: carried), nil)
         }
-        if let bundledHash, installed(bundledHash) {
-            return (ManagedPlaywright.managedConfig(hash: bundledHash, layout: layout, basedOn: carried),
-                    "playwright: the bundle's managed version is not installed here — resolved to this build's pinned version (playwright-\(bundledHash)).")
+        if let bundledHash {
+            let local = layout.installedTokens().filter {
+                ManagedPlaywright.Layout.lockfileHash(ofToken: $0) == bundledHash && installed($0)
+            }
+            if let token = local.first {
+                return (ManagedPlaywright.managedConfig(token: token, layout: layout, basedOn: carried),
+                        "playwright: the bundle's managed version is not installed here — resolved to this build's pinned version (playwright-\(token)).")
+            }
         }
-        return (ManagedPlaywright.legacyConfig(basedOn: carried),
-                "playwright: managed Playwright is not installed on this machine yet — the next start installs the pinned version and switches the entry.")
+        return (nil, "playwright: managed Playwright is not installed on this machine yet — entry skipped; the next start installs the pinned version and registers it if no entry exists.")
     }
 
     // MARK: - Helpers

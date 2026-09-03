@@ -191,14 +191,14 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             for (k, v) in extra { e[k] = v }
             return e
         }
-        func managedEntry(hash: String, extra: [String: Any] = [:]) -> [String: Any] {
-            let inv = ManagedPlaywright.managedInvocation(hash: hash, layout: layout)
-            var e: [String: Any] = ["command": inv.command, "args": inv.arguments, "managed": ManagedPlaywright.managedMarker(hash: hash)]
+        func managedEntry(token hash: String, extra: [String: Any] = [:]) -> [String: Any] {
+            let inv = ManagedPlaywright.managedInvocation(token: hash, layout: layout)
+            var e: [String: Any] = ["command": inv.command, "args": inv.arguments, "managed": ManagedPlaywright.managedMarker(token: hash)]
             for (k, v) in extra { e[k] = v }
             return e
         }
-        func markerText(_ hash: String) -> String? {
-            (try? String(contentsOf: layout.versionDirectory(hash: hash).appendingPathComponent(ManagedPlaywright.completionMarkerName), encoding: .utf8))?
+        func markerText(_ token: String) -> String? {
+            (try? String(contentsOf: layout.versionDirectory(token: token).appendingPathComponent(ManagedPlaywright.completionMarkerName), encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         func wideEntries(under dir: URL) -> [String] {
@@ -237,21 +237,25 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         func cfg(_ command: String, _ args: [String], managed: String? = nil, disabled: Bool = false) -> MCPServerConfig {
             MCPServerConfig(name: "playwright", command: command, arguments: args, disabled: disabled, managed: managed)
         }
-        let inv = ManagedPlaywright.managedInvocation(hash: hA, layout: layout)
+        let inv = ManagedPlaywright.managedInvocation(token: hA, layout: layout)
         check("1.4 shape table: absent / legacy / managed / edited / malformed marker / user / disabled",
               ManagedPlaywright.shape(of: nil, layout: layout) == .absent
               && ManagedPlaywright.shape(of: cfg("npx", ["@playwright/mcp@latest"]), layout: layout) == .legacyAuto
-              && ManagedPlaywright.shape(of: cfg(inv.command, inv.arguments, managed: "playwright@\(hA)"), layout: layout) == .managed(hash: hA)
+              && ManagedPlaywright.shape(of: cfg(inv.command, inv.arguments, managed: "playwright@\(hA)"), layout: layout) == .managed(token: hA)
               && ManagedPlaywright.shape(of: cfg(inv.command, inv.arguments + ["--headless"], managed: "playwright@\(hA)"), layout: layout) == .managedEdited
               && ManagedPlaywright.shape(of: cfg(inv.command, inv.arguments, managed: "playwright@nothex"), layout: layout) == .managedEdited
               && ManagedPlaywright.shape(of: cfg("npx", ["@playwright/mcp@latest", "--headless"]), layout: layout) == .userAuthored
               && ManagedPlaywright.shape(of: cfg("npx", ["@playwright/mcp@latest"], disabled: true), layout: layout) == .disabled)
-        check("1.5 directory-name parser accepts playwright-<16 hex> only",
-              ManagedPlaywright.Layout.hash(fromDirectoryName: "playwright-\(hA)") == hA
-              && ManagedPlaywright.Layout.hash(fromDirectoryName: "playwright-install.lock") == nil
-              && ManagedPlaywright.Layout.hash(fromDirectoryName: "playwright.staging-x") == nil
-              && ManagedPlaywright.Layout.hash(fromDirectoryName: "playwright-\(hA.uppercased())") == nil)
-        let kept = ManagedPlaywright.managedConfig(hash: hA, layout: layout, basedOn: MCPServerConfig(
+        check("1.5 directory-name parser accepts playwright-<16 hex> and playwright-<16 hex>-r<8 hex> only",
+              ManagedPlaywright.Layout.token(fromDirectoryName: "playwright-\(hA)") == hA
+              && ManagedPlaywright.Layout.token(fromDirectoryName: "playwright-\(hA)-rdeadbeef") == "\(hA)-rdeadbeef"
+              && ManagedPlaywright.Layout.lockfileHash(ofToken: "\(hA)-rdeadbeef") == hA
+              && ManagedPlaywright.Layout.token(fromDirectoryName: "playwright-\(hA)-rdeadbee") == nil
+              && ManagedPlaywright.Layout.token(fromDirectoryName: "playwright-\(hA)-xdeadbeef") == nil
+              && ManagedPlaywright.Layout.token(fromDirectoryName: "playwright-install.lock") == nil
+              && ManagedPlaywright.Layout.token(fromDirectoryName: "playwright.staging-x") == nil
+              && ManagedPlaywright.Layout.token(fromDirectoryName: "playwright-\(hA.uppercased())") == nil)
+        let kept = ManagedPlaywright.managedConfig(token: hA, layout: layout, basedOn: MCPServerConfig(
             name: "playwright", command: "npx", environment: ["FOO": "bar"], secretRefs: ["TOKEN"], description: "custom"))
         check("1.6 managedConfig keeps env, secretRefs and description of the previous entry",
               kept.environment == ["FOO": "bar"] && kept.secretRefs == ["TOKEN"] && kept.description == "custom"
@@ -261,15 +265,15 @@ struct PlaywrightSelftest: AsyncParsableCommand {
 
         try fx.setControl(["mode": "ok"])
         let fresh = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mA, flag: flag))
-        check("2.1 fresh install (no mcp.json): configured + changed", fresh == .configured(hash: hA, changed: true), "\(fresh)")
+        check("2.1 fresh install (no mcp.json): configured + changed", fresh == .configured(token: hA, changed: true), "\(fresh)")
         let e2 = playwrightEntry()
         check("2.2 entry is `node <cli.js>` with the managed marker and the default description",
               (e2?["command"] as? String) == "node"
-              && (e2?["args"] as? [String]) == [layout.cliPath(hash: hA)]
+              && (e2?["args"] as? [String]) == [layout.cliPath(token: hA)]
               && (e2?["managed"] as? String) == "playwright@\(hA)"
               && (e2?["description"] as? String) == ManagedPlaywright.defaultDescription, "\(e2 ?? [:])")
         check("2.3 version directory carries the marker with the hash and the executable",
-              markerText(hA) == hA && fm.fileExists(atPath: layout.cliPath(hash: hA)))
+              markerText(hA) == hA && fm.fileExists(atPath: layout.cliPath(token: hA)))
         let inv1 = fx.npmInvocations()
         check("2.4 npm ci ran once, in a staging directory holding both manifests, with --ignore-scripts, under umask 077",
               inv1.count == 1
@@ -287,7 +291,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         check("2.6 auto-configured flag set; status file says ready",
               fm.fileExists(atPath: flag.path)
               && ManagedPlaywright.readStatus(layout: layout)?.outcome == "ready"
-              && ManagedPlaywright.readStatus(layout: layout)?.hash == hA)
+              && ManagedPlaywright.readStatus(layout: layout)?.token == hA)
         check("2.7 startup sweep finds nothing to tighten under the roots after the install",
               PrivateStorage.sweep(apply: true).tightened == 0)
 
@@ -296,7 +300,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let before3 = readConfigBytes()
         let again = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mA, flag: flag))
         check("3.1 second start: verified and reused, config untouched, npm not run again",
-              again == .configured(hash: hA, changed: false) && readConfigBytes() == before3 && fx.npmInvocations().count == 1, "\(again)")
+              again == .configured(token: hA, changed: false) && readConfigBytes() == before3 && fx.npmInvocations().count == 1, "\(again)")
 
         // MARK: 4. Legacy switch preserves everything else
 
@@ -312,7 +316,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let e4 = playwrightEntry()
         let other4 = (root4["mcpServers"] as? [String: Any])?["other"] as? [String: Any]
         check("4.1 legacy `npx @playwright/mcp@latest` entry switched to the managed invocation",
-              switched == .configured(hash: hA, changed: true)
+              switched == .configured(token: hA, changed: true)
               && (e4?["command"] as? String) == "node" && (e4?["managed"] as? String) == "playwright@\(hA)", "\(switched)")
         check("4.2 env, description, secretRefs and an unknown key of the entry survive; other servers and top-level keys untouched",
               (e4?["env"] as? [String: String]) == ["FOO": "bar"] && (e4?["description"] as? String) == "custom"
@@ -326,7 +330,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
 
         for (label, entry, expected) in [
             ("5.1 user-authored entry (own args)", legacyEntry(extra: ["args": ["@playwright/mcp@latest", "--headless"]]), BrowserAutomationBootstrap.Outcome.leftAlone(.userAuthored)),
-            ("5.2 managed marker with edited args", managedEntry(hash: hA, extra: ["args": [layout.cliPath(hash: hA), "--headless"]]), .leftAlone(.managedEdited)),
+            ("5.2 managed marker with edited args", managedEntry(token: hA, extra: ["args": [layout.cliPath(token: hA), "--headless"]]), .leftAlone(.managedEdited)),
             ("5.3 disabled legacy entry", legacyEntry(extra: ["disabled": true]), .leftAlone(.disabled)),
         ] {
             try writeConfig(["mcpServers": ["playwright": entry]])
@@ -335,7 +339,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             let outcome = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
             check("\(label): left alone, file byte-identical, no install attempted",
                   outcome == expected && readConfigBytes() == bytes && fx.npmInvocations().count == count
-                  && !fm.fileExists(atPath: layout.versionDirectory(hash: hB).path), "\(outcome)")
+                  && !fm.fileExists(atPath: layout.versionDirectory(token: hB).path), "\(outcome)")
         }
         try? fm.removeItem(at: fx.configFile)
         try "1".write(to: flag, atomically: true, encoding: .utf8)
@@ -349,10 +353,10 @@ struct PlaywrightSelftest: AsyncParsableCommand {
 
         // MARK: 6. Version bump keeps the old install
 
-        try writeConfig(["mcpServers": ["playwright": managedEntry(hash: hA)]])
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: hA)]])
         let bump = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
         check("6.1 a build that pins another lockfile installs it and re-points the entry",
-              bump == .configured(hash: hB, changed: true) && (playwrightEntry()?["managed"] as? String) == "playwright@\(hB)"
+              bump == .configured(token: hB, changed: true) && (playwrightEntry()?["managed"] as? String) == "playwright@\(hB)"
               && markerText(hB) == hB && fx.npmInvocations().count == 2, "\(bump)")
         check("6.2 the previous immutable install is kept (never auto-deleted)", markerText(hA) == hA)
         let doc6 = ManagedPlaywright.doctorFindings(configs: MCPRegistry.loadConfigsFromDisk(), layout: layout, bundledHash: hB)
@@ -360,30 +364,75 @@ struct PlaywrightSelftest: AsyncParsableCommand {
               doc6.contains { $0.text.contains("unreferenced") && $0.text.contains("playwright-\(hA)") }
               && doc6.contains { $0.text.contains("managed install playwright-\(hB)") && !$0.problem }, doc6.map(\.text).joined(separator: " | "))
 
-        // MARK: 7. Corrupt install: quarantined, rebuilt, never referenced
+        // MARK: 7. Invalid installs: the referenced tree is never renamed before the switch
 
-        try fm.removeItem(atPath: layout.cliPath(hash: hB))
-        let rebuilt = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
-        let corrupt7 = layout.leftovers().corrupt
-        check("7.1 missing executable: directory quarantined as playwright.corrupt-*, rebuilt, entry still points at playwright-\(hB)",
-              rebuilt == .configured(hash: hB, changed: false) && corrupt7.count == 1 && markerText(hB) == hB
-              && (playwrightEntry()?["args"] as? [String]) == [layout.cliPath(hash: hB)] && fx.npmInvocations().count == 3, "\(rebuilt) \(corrupt7)")
+        func referencedToken() -> String? {
+            (playwrightEntry()?["managed"] as? String).flatMap(ManagedPlaywright.token(fromMarker:))
+        }
+        var tB = hB
+        try fm.removeItem(atPath: layout.cliPath(token: tB))
+        let repaired = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
+        let t7 = referencedToken() ?? "?"
+        check("7.1 referenced install missing its executable: replacement built under playwright-<hash>-r…, entry switched to it, old tree quarantined AFTER the switch",
+              repaired == .configured(token: t7, changed: true) && t7.hasPrefix(hB + "-r") && markerText(t7) == hB
+              && (playwrightEntry()?["args"] as? [String]) == [layout.cliPath(token: t7)]
+              && !fm.fileExists(atPath: layout.versionDirectory(token: tB).path) && layout.leftovers().corrupt.count == 1
+              && fx.npmInvocations().count == 3, "\(repaired) token=\(t7) corrupt=\(layout.leftovers().corrupt)")
+        tB = t7
         let cleaned = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
-        check("7.2 the following start removes the quarantined directory and reuses the rebuilt install",
-              cleaned == .configured(hash: hB, changed: false) && layout.leftovers().corrupt.isEmpty && fx.npmInvocations().count == 3)
+        check("7.2 the following start removes the quarantined directory and reuses the replacement",
+              cleaned == .configured(token: tB, changed: false) && layout.leftovers().corrupt.isEmpty && fx.npmInvocations().count == 3, "\(cleaned)")
         // Marker naming another lockfile.
-        try Data((hA + "\n").utf8).write(to: layout.versionDirectory(hash: hB).appendingPathComponent(ManagedPlaywright.completionMarkerName))
+        try Data((hA + "\n").utf8).write(to: layout.versionDirectory(token: tB).appendingPathComponent(ManagedPlaywright.completionMarkerName))
         let remarked = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
-        check("7.3 marker naming another lockfile: quarantined and rebuilt",
-              remarked == .configured(hash: hB, changed: false) && markerText(hB) == hB && fx.npmInvocations().count == 4
+        let t73 = referencedToken() ?? "?"
+        check("7.3 marker naming another lockfile: replacement built, switched, old quarantined",
+              remarked == .configured(token: t73, changed: true) && t73 != tB && markerText(t73) == hB && fx.npmInvocations().count == 4
               && layout.leftovers().corrupt.count == 1, "\(remarked)")
+        tB = t73
         _ = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
         // Executable present but the server does not answer.
-        try fm.removeItem(atPath: layout.cliPath(hash: hB))
-        try fm.copyItem(at: fx.brokenCli, to: URL(fileURLWithPath: layout.cliPath(hash: hB)))
+        try fm.removeItem(atPath: layout.cliPath(token: tB))
+        try fm.copyItem(at: fx.brokenCli, to: URL(fileURLWithPath: layout.cliPath(token: tB)))
         let dead = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
-        check("7.4 executable that fails the handshake: quarantined and rebuilt",
-              dead == .configured(hash: hB, changed: false) && fx.npmInvocations().count == 5 && layout.leftovers().corrupt.count == 1, "\(dead)")
+        let t74 = referencedToken() ?? "?"
+        check("7.4 executable that fails the handshake: replacement built, switched, old quarantined",
+              dead == .configured(token: t74, changed: true) && t74 != tB && fx.npmInvocations().count == 5 && layout.leftovers().corrupt.count == 1, "\(dead)")
+        tB = t74
+        _ = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
+        // Codex round 1 #2: the referenced tree is invalid AND the rebuild
+        // fails — the configuration must still point at the (invalid but
+        // present) tree, nothing renamed, nothing dangling.
+        try fm.removeItem(atPath: layout.cliPath(token: tB))
+        try fx.setControl(["mode": "fail"])
+        let before75 = readConfigBytes()
+        let stuck = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
+        var stuckReason = ""
+        if case .failed(let r) = stuck { stuckReason = r }
+        check("7.5 referenced tree invalid + rebuild fails: failed, config byte-identical, the referenced directory still present (not quarantined), no corrupt, no staging",
+              stuckReason.contains("npm ci exited 1") && readConfigBytes() == before75
+              && fm.fileExists(atPath: layout.versionDirectory(token: tB).path) && layout.leftovers().corrupt.isEmpty
+              && layout.leftovers().staging.isEmpty && fx.npmInvocations().count == 6, "\(stuck)")
+        try fx.setControl(["mode": "ok"])
+        let healed = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
+        let t76 = referencedToken() ?? "?"
+        check("7.6 next start with npm working: replacement built, switched, old quarantined",
+              healed == .configured(token: t76, changed: true) && t76 != tB && markerText(t76) == hB
+              && !fm.fileExists(atPath: layout.versionDirectory(token: tB).path) && layout.leftovers().corrupt.count == 1, "\(healed)")
+        tB = t76
+        _ = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
+        // Crash between switch and quarantine, simulated: an invalid
+        // UNREFERENCED tree of the same lockfile is quarantined at the next
+        // start; a VALID unreferenced one of the same lockfile is kept.
+        let staleInvalid = layout.versionDirectory(token: hB + "-rdead0000")
+        try fm.createDirectory(at: staleInvalid, withIntermediateDirectories: true)
+        try Data((hB + "\n").utf8).write(to: staleInvalid.appendingPathComponent(ManagedPlaywright.completionMarkerName))
+        let staleValid = layout.versionDirectory(token: hB + "-rcafe0000")
+        try fm.copyItem(at: layout.versionDirectory(token: tB), to: staleValid)
+        let settled = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
+        check("7.7 unreferenced trees of the current lockfile: the invalid one is quarantined, the valid one kept, the referenced one reused",
+              settled == .configured(token: tB, changed: false) && !fm.fileExists(atPath: staleInvalid.path)
+              && fm.fileExists(atPath: staleValid.path) && layout.leftovers().corrupt.count == 1 && fx.npmInvocations().count == 7, "\(settled)")
         _ = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
 
         // MARK: 8. Failed builds leave the previous state intact
@@ -398,9 +447,9 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             let outcome = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mC, flag: flag))
             var reason = ""
             if case .failed(let r) = outcome { reason = r }
-            check("\(label): failed with the reason, previous entry byte-identical, playwright-\(hB) intact, no staging or version dir left",
-                  reason.contains(needle) && readConfigBytes() == before8 && markerText(hB) == hB
-                  && layout.leftovers().staging.isEmpty && !fm.fileExists(atPath: layout.versionDirectory(hash: hC).path)
+            check("\(label): failed with the reason, previous entry byte-identical, playwright-\(tB) intact, no staging or version dir left",
+                  reason.contains(needle) && readConfigBytes() == before8 && markerText(tB) == hB
+                  && layout.leftovers().staging.isEmpty && !fm.fileExists(atPath: layout.versionDirectory(token: hC).path)
                   && ManagedPlaywright.readStatus(layout: layout)?.outcome == "failed", "\(outcome)")
         }
 
@@ -459,18 +508,18 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let after11 = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
         check("11.1 orphan staging and corrupt directories: listed by doctor, removed by the next start, install reused",
               doc11.contains { $0.text.contains("leftover") && $0.text.contains("playwright.staging-deadbeef") }
-              && after11 == .configured(hash: hB, changed: false)
+              && after11 == .configured(token: tB, changed: false)
               && !fm.fileExists(atPath: orphanStaging.path) && !fm.fileExists(atPath: orphanCorrupt.path), "\(after11)")
 
         // MARK: 12. Hand-written reference to a missing managed directory
 
-        try writeConfig(["mcpServers": ["playwright": managedEntry(hash: "0123456789abcdef")]])
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: "0123456789abcdef")]])
         let repointed = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
         check("12.1 managed entry naming a directory that does not exist: re-pointed to the verified install, nothing deleted",
-              repointed == .configured(hash: hB, changed: true) && (playwrightEntry()?["managed"] as? String) == "playwright@\(hB)"
-              && markerText(hA) == hA && markerText(hB) == hB, "\(repointed)")
+              repointed == .configured(token: tB, changed: true) && (playwrightEntry()?["managed"] as? String) == "playwright@\(tB)"
+              && markerText(hA) == hA && markerText(tB) == hB, "\(repointed)")
         let docMissing = ManagedPlaywright.doctorFindings(
-            configs: [MCPServerConfig(name: "playwright", command: "node", arguments: [layout.cliPath(hash: "0123456789abcdef")], managed: "playwright@0123456789abcdef")],
+            configs: [MCPServerConfig(name: "playwright", command: "node", arguments: [layout.cliPath(token: "0123456789abcdef")], managed: "playwright@0123456789abcdef")],
             layout: layout, bundledHash: hB)
         check("12.2 doctor flags a managed entry whose directory is missing", docMissing.contains { $0.problem && $0.text.contains("0123456789abcdef") })
 
@@ -479,7 +528,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let started = tempRoot.appendingPathComponent("npm-started")
         let proceed = tempRoot.appendingPathComponent("npm-proceed")
         try fx.setControl(["mode": "wait-for", "startedFile": started.path, "waitFor": proceed.path])
-        try writeConfig(["mcpServers": ["playwright": managedEntry(hash: hB)]])
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: tB)]])
         let depsC = fx.dependencies(manifests: mC, flag: flag)
         let task = Task { await BrowserAutomationBootstrap.ensureConfigured(dependencies: depsC) }
         var sawStart = false
@@ -490,7 +539,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         // The agent (file tools) or a human edits mcp.json mid-install: adds a
         // server and points playwright at the OLDER immutable version A.
         try writeConfig(["mcpServers": [
-            "playwright": managedEntry(hash: hA, extra: ["description": "edited mid-install"]),
+            "playwright": managedEntry(token: hA, extra: ["description": "edited mid-install"]),
             "added": ["command": "uvx", "args": ["mid"]],
         ]])
         try Data("go".utf8).write(to: proceed)
@@ -498,15 +547,15 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let root13 = readConfigJSON()
         let e13 = playwrightEntry()
         check("13.1 bootstrap re-reads at the switch: the mid-install edit survives (added server, description), entry moves A → C, A and B kept",
-              sawStart && mid == .configured(hash: hC, changed: true)
+              sawStart && mid == .configured(token: hC, changed: true)
               && ((root13["mcpServers"] as? [String: Any])?["added"] as? [String: Any])?["command"] as? String == "uvx"
               && (e13?["description"] as? String) == "edited mid-install" && (e13?["managed"] as? String) == "playwright@\(hC)"
-              && markerText(hA) == hA && markerText(hB) == hB && markerText(hC) == hC, "\(mid) \(root13)")
+              && markerText(hA) == hA && markerText(tB) == hB && markerText(hC) == hC, "\(mid) \(root13)")
         try? fm.removeItem(at: started); try? fm.removeItem(at: proceed)
         // Edited to a user-authored shape mid-install: the bootstrap leaves it alone.
         try fx.setControl(["mode": "wait-for", "startedFile": started.path, "waitFor": proceed.path])
-        try writeConfig(["mcpServers": ["playwright": managedEntry(hash: hA)]])
-        try fm.removeItem(at: layout.versionDirectory(hash: hC))
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: hA)]])
+        try fm.removeItem(at: layout.versionDirectory(token: hC))
         let depsC2 = fx.dependencies(manifests: mC, flag: flag)
         let task2 = Task { await BrowserAutomationBootstrap.ensureConfigured(dependencies: depsC2) }
         for _ in 0..<200 {
@@ -520,10 +569,46 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         check("13.2 edited to a user-authored entry mid-install: install completes, entry left byte-identical",
               mid2 == .leftAlone(.userAuthored) && readConfigBytes() == bytes13 && markerText(hC) == hC, "\(mid2)")
 
+        // Codex round 1 #4: an agent file-tool edit between the switch's
+        // decision and its write. The file tools take the config lock, so
+        // the edit BLOCKS until the switch has written, then lands on top.
+        try fx.setControl(["mode": "ok"])
+        try writeConfig(["mcpServers": ["playwright": legacyEntry()]])
+        let seamState = SeamState()
+        MCPRegistry.testHookBeforeManagedConfigWrite = {
+            let thread = Thread {
+                let path = fx.configFile.path
+                _ = try? MCPAgentRouting.withLockIfRoutingFile(path) {
+                    seamState.enteredLock = Date()
+                    // What edit_file does inside the lock: read, modify, write.
+                    var root = (try? JSONSerialization.jsonObject(with: Data(contentsOf: fx.configFile)) as? [String: Any]) ?? [:]
+                    var servers = (root["mcpServers"] as? [String: Any]) ?? [:]
+                    servers["seam"] = ["command": "uvx", "args": ["seam"]]
+                    root["mcpServers"] = servers
+                    let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+                    try PrivateStorage.writeAtomically(data, to: fx.configFile)
+                }
+                seamState.done = true
+            }
+            thread.start()
+            Thread.sleep(forTimeInterval: 0.7)
+            seamState.hookLeft = Date()
+        }
+        let seamOutcome = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mC, flag: flag))
+        MCPRegistry.testHookBeforeManagedConfigWrite = nil
+        for _ in 0..<100 where !seamState.done { try await Task.sleep(nanoseconds: 50_000_000) }
+        let root133 = readConfigJSON()
+        check("13.3 injected file-tool edit between decision and write: blocked by the config lock until the switch landed, then applied on top — both survive",
+              seamOutcome == .configured(token: hC, changed: true) && seamState.done
+              && seamState.enteredLock != nil && seamState.hookLeft != nil && seamState.enteredLock! >= seamState.hookLeft!
+              && (playwrightEntry()?["managed"] as? String) == "playwright@\(hC)"
+              && ((root133["mcpServers"] as? [String: Any])?["seam"] as? [String: Any])?["command"] as? String == "uvx",
+              "\(seamOutcome) entered=\(String(describing: seamState.enteredLock)) left=\(String(describing: seamState.hookLeft)) \(root133)")
+
         // MARK: 14. Profile bundle: logical representation
 
         try fx.setControl(["mode": "ok"])
-        try writeConfig(["mcpServers": ["playwright": managedEntry(hash: hC, extra: ["env": ["FOO": "bar"]]), "other": ["command": "uvx", "args": ["x"]]]])
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: hC, extra: ["env": ["FOO": "bar"]]), "other": ["command": "uvx", "args": ["x"]]]])
         let exported = try ProfileBundle.exportData()
         let exportedText = String(data: exported, encoding: .utf8) ?? ""
         let exportedRoot = try JSONSerialization.jsonObject(with: exported) as? [String: Any]
@@ -536,17 +621,26 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let e14 = playwrightEntry()
         check("14.2 import on a machine that has that version resolves to the concrete managed entry",
               imported.mcpServersAdded.contains("playwright") && (e14?["command"] as? String) == "node"
-              && (e14?["args"] as? [String]) == [layout.cliPath(hash: hC)] && (e14?["managed"] as? String) == "playwright@\(hC)"
+              && (e14?["args"] as? [String]) == [layout.cliPath(token: hC)] && (e14?["managed"] as? String) == "playwright@\(hC)"
               && (e14?["env"] as? [String: String]) == ["FOO": "bar"] && imported.warnings.isEmpty, "\(e14 ?? [:]) \(imported.warnings)")
         let (fallbackBundled, warnB) = ProfileBundle.resolveManagedPlaywright(
             marker: "playwright@0123456789abcdef", layout: layout, basedOn: nil, bundledHash: hC)
         check("14.3 unknown version but this build's pinned version installed: resolves to it with a warning",
-              fallbackBundled.managed == "playwright@\(hC)" && warnB != nil, "\(fallbackBundled) \(warnB ?? "")")
+              fallbackBundled?.managed == "playwright@\(hC)" && warnB != nil, "\(String(describing: fallbackBundled)) \(warnB ?? "")")
         let emptyLayout = ManagedPlaywright.Layout(dataRoot: tempRoot.appendingPathComponent("nowhere"))
-        let (fallbackLegacy, warnL) = ProfileBundle.resolveManagedPlaywright(
+        let (fallbackNone, warnL) = ProfileBundle.resolveManagedPlaywright(
             marker: "playwright@\(hC)", layout: emptyLayout, basedOn: nil, bundledHash: hC)
-        check("14.4 nothing installed locally: legacy auto shape (switched at the next start) with a warning — never a path that does not exist",
-              fallbackLegacy.command == "npx" && fallbackLegacy.arguments == ["@playwright/mcp@latest"] && fallbackLegacy.managed == nil && warnL != nil)
+        check("14.4 nothing installed locally: the entry is skipped with a warning — an importer never writes @latest",
+              fallbackNone == nil && (warnL ?? "").contains("skipped"))
+        // Through importData with the real bundle hash (not installed in this root): skipped, no @latest anywhere.
+        try writeConfig(["mcpServers": ["other": ["command": "uvx", "args": ["x"]]]])
+        let foreignBundle = try JSONSerialization.data(withJSONObject: [
+            "version": ProfileBundle.currentVersion, "mcpServers": ["playwright": ["managed": "playwright@0123456789abcdef"]]])
+        let importedNone = try await ProfileBundle.importData(foreignBundle)
+        let text145 = String(data: readConfigBytes(), encoding: .utf8) ?? ""
+        check("14.5 importData with no local install: playwright entry absent, warning present, file free of @latest",
+              playwrightEntry() == nil && importedNone.warnings.contains { $0.contains("skipped") } && !text145.contains("@latest")
+              && !importedNone.mcpServersAdded.contains("playwright"), "\(importedNone.warnings) \(text145)")
 
         // MARK: 15. Registry reload after the switch
 
@@ -555,10 +649,68 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let status15 = await MCPRegistry.shared.status()
         let tools15 = await MCPRegistry.shared.allToolDefinitions().map { $0.function.name }
         check("15.1 after the switch the registry runs the managed server: connected, mcp__playwright__browser_navigate available",
-              live15 == .configured(hash: hC, changed: true)
+              live15 == .configured(token: hC, changed: true)
               && status15.contains { $0.name == "playwright" && $0.connected && !$0.failed }
               && tools15.contains("mcp__playwright__browser_navigate"), "\(live15) \(status15) \(tools15)")
         await MCPRegistry.shared.shutdownAll()
+
+        // MARK: 17. Registry reload during an in-flight bootstrap (Codex round 1 #1)
+
+        let slowPid = tempRoot.appendingPathComponent("slow.pid")
+        try writeConfig(["mcpServers": ["slowpoke": [
+            "command": "node", "args": [fx.goodCli.path],
+            "env": ["FAKE_MCP_DELAY": "3", "FAKE_MCP_PIDFILE": slowPid.path]]]])
+        let inFlight = Task { await MCPRegistry.shared.allToolDefinitions() }
+        var slowStarted = false
+        for _ in 0..<100 {
+            if fm.fileExists(atPath: slowPid.path) { slowStarted = true; break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        try writeConfig(["mcpServers": ["fast": ["command": "node", "args": [fx.goodCli.path]]]])
+        await MCPRegistry.shared.reloadFromDisk()
+        _ = await inFlight.value
+        let status17 = await MCPRegistry.shared.status()
+        let slow = Int32((try? String(contentsOf: slowPid, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? -1
+        var slowGone = false
+        for _ in 0..<100 {
+            if slow > 0 && kill(slow, 0) == -1 && errno == ESRCH { slowGone = true; break }
+            if let st = try? String(contentsOfFile: "/proc/\(slow)/status", encoding: .utf8), st.contains("State:\tZ") { slowGone = true; break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        check("17.1 reload while a bootstrap is mid-handshake: the stale bootstrap publishes nothing, its server is shut down, only the new generation is registered",
+              slowStarted && status17.map(\.name) == ["fast"] && status17.allSatisfy { $0.connected && !$0.failed } && slowGone,
+              "started=\(slowStarted) status=\(status17) slowPid=\(slow) gone=\(slowGone)")
+        await MCPRegistry.shared.shutdownAll()
+
+        // MARK: 18. Poisoned staging: a timed-out group that cannot be confirmed gone
+
+        try fx.setControl(["mode": "spawn-child-and-hang", "childPidFile": childPid.path])
+        try writeConfig(["mcpServers": ["playwright": managedEntry(token: hC)]])
+        let mD = fx.manifests(version: "0.0.83", salt: "DDDD")
+        let before18 = readConfigBytes()
+        ManagedPlaywright.liveGroupProbeOverride = { _ in true }
+        let poisoned = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag, npmTimeout: 2))
+        var poisonReason = ""
+        if case .failed(let r) = poisoned { poisonReason = r }
+        let left18 = layout.leftovers()
+        check("18.1 timeout with the group still alive: failed as poisoned, staging KEPT with a record naming the group, config untouched",
+              poisonReason.contains("poisoned") && left18.staging.count == 1 && left18.poisoned.count == 1 && readConfigBytes() == before18,
+              "\(poisoned) \(left18)")
+        let count18 = fx.npmInvocations().count
+        let refused = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag, npmTimeout: 2))
+        var refusedOK = false
+        if case .skipped(let r) = refused, r.contains("still alive") { refusedOK = true }
+        let doc18 = ManagedPlaywright.doctorFindings(configs: MCPRegistry.loadConfigsFromDisk(), layout: layout, bundledHash: mD.lockfileHash)
+        check("18.2 while the group lives: later bootstraps refuse (nothing staged, no npm), doctor flags the poisoned record as a problem",
+              refusedOK && layout.leftovers().staging.count == 1 && fx.npmInvocations().count == count18
+              && doc18.contains { $0.problem && $0.text.contains("poisoned") }, "\(refused)")
+        ManagedPlaywright.liveGroupProbeOverride = nil
+        try fx.setControl(["mode": "ok"])
+        let released = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
+        let left18b = layout.leftovers()
+        check("18.3 group gone: staging and record released, install proceeds",
+              released == .configured(token: mD.lockfileHash, changed: true) && left18b.staging.isEmpty && left18b.poisoned.isEmpty,
+              "\(released) \(left18b)")
 
         // MARK: 16. Crash injection (development builds only)
 
@@ -611,9 +763,9 @@ struct PlaywrightSelftest: AsyncParsableCommand {
                     return (root["mcpServers"] as? [String: Any])?["playwright"] as? [String: Any]
                 }
                 func referencedDirValid() -> Bool {
-                    guard let marker = entry()?["managed"] as? String, let hash = ManagedPlaywright.hash(fromMarker: marker) else { return false }
-                    let text = try? String(contentsOf: caseLayout.versionDirectory(hash: hash).appendingPathComponent(ManagedPlaywright.completionMarkerName), encoding: .utf8)
-                    return text?.trimmingCharacters(in: .whitespacesAndNewlines) == hash
+                    guard let marker = entry()?["managed"] as? String, let token = ManagedPlaywright.token(fromMarker: marker) else { return false }
+                    let text = try? String(contentsOf: caseLayout.versionDirectory(token: token).appendingPathComponent(ManagedPlaywright.completionMarkerName), encoding: .utf8)
+                    return text?.trimmingCharacters(in: .whitespacesAndNewlines) == ManagedPlaywright.Layout.lockfileHash(ofToken: token)
                 }
                 let (crashStatus, crashOut) = runChild(crash: point)
                 let isLegacy = (entry()?["command"] as? String) == "npx"
@@ -684,7 +836,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         deps.log = { print("log: \($0)") }
         let outcome = await BrowserAutomationBootstrap.ensureConfigured(dependencies: deps)
         switch outcome {
-        case .configured(let hash, let changed): print("OUTCOME: configured hash: \(hash) changed: \(changed)")
+        case .configured(let token, let changed): print("OUTCOME: configured token: \(token) changed: \(changed)")
         default: print("OUTCOME: \(outcome)")
         }
     }
@@ -709,14 +861,20 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let outcome = await BrowserAutomationBootstrap.ensureConfigured(dependencies: deps)
         let layout = ManagedPlaywright.Layout()
         let hash = manifests.lockfileHash
-        let pkg = layout.versionDirectory(hash: hash).appendingPathComponent(ManagedPlaywright.packageRelativePath)
+        let pkg = layout.versionDirectory(token: hash).appendingPathComponent(ManagedPlaywright.packageRelativePath)
         let installedVersion = (try? JSONSerialization.jsonObject(with: Data(contentsOf: pkg)) as? [String: Any])?["version"] as? String
         check("live.1 real npm ci against the committed lockfile + real handshake: configured in \(Int(Date().timeIntervalSince(t0)))s",
-              outcome == .configured(hash: hash, changed: true), "\(outcome)")
+              outcome == .configured(token: hash, changed: true), "\(outcome)")
         check("live.2 installed @playwright/mcp is the pinned version", installedVersion == manifests.pinnedVersion, "\(installedVersion ?? "nil")")
         check("live.3 nothing group/other-readable under mcp/", PrivateStorage.sweep(apply: false).tightened == 0)
         let again = await BrowserAutomationBootstrap.ensureConfigured(dependencies: deps)
-        check("live.4 second start reuses without npm", again == .configured(hash: hash, changed: false), "\(again)")
+        check("live.4 second start reuses without npm", again == .configured(token: hash, changed: false), "\(again)")
+    }
+
+    final class SeamState: @unchecked Sendable {
+        var enteredLock: Date?
+        var hookLeft: Date?
+        var done = false
     }
 
     // MARK: - Fake npm
@@ -765,7 +923,11 @@ struct PlaywrightSelftest: AsyncParsableCommand {
     /// Minimal stdio MCP server standing in for `@playwright/mcp`'s cli.js
     /// (run as `node cli.js` — `node` is the python shim).
     static let fakeServerSource = """
-    import json, sys
+    import json, os, sys, time
+    if os.environ.get("FAKE_MCP_PIDFILE"):
+        with open(os.environ["FAKE_MCP_PIDFILE"], "w") as f:
+            f.write(str(os.getpid()))
+    delay = float(os.environ.get("FAKE_MCP_DELAY", "0"))
     tools = [
         {"name": "browser_navigate", "description": "Navigate to a URL", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}}},
         {"name": "browser_click", "description": "Click", "inputSchema": {"type": "object", "properties": {"ref": {"type": "string"}}}},
@@ -783,6 +945,8 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             continue
         method = msg.get("method")
         if method == "initialize":
+            if delay:
+                time.sleep(delay)
             res = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-playwright", "version": "0"}}
         elif method == "tools/list":
             res = {"tools": tools}
