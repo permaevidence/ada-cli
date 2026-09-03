@@ -156,7 +156,7 @@ extension PlaywrightSelftest {
         check("18.8 rename works again: parked with an information file (no process group known), still refused",
               parkedLaterOK && layout.leftovers().staging.isEmpty && layout.leftovers().manual.count == 2, "\(parkedLater) \(layout.leftovers())")
         ManagedPlaywright.ProcessGroups.membersOverride = nil
-        await reap(sacProbe)
+        await reap(sac2)
         for name in layout.leftovers().manual + layout.leftovers().staging { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
         try fx.setControl(["mode": "ok"])
         let unheld = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
