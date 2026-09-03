@@ -104,19 +104,20 @@ extension PlaywrightSelftest {
         check("18.4 removed by hand: the next start installs", unparked == .configured(token: mD.lockfileHash, changed: true), "\(unparked)")
         // Enumeration failure is "alive": the probe falls back to kill(-pgid, 0),
         // where only ESRCH means gone; parking records that enumeration failed.
-        ManagedPlaywright.ProcessGroups.membersOverride = { _ in nil }
-        let deadGroup: Int32 = {
-            let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sleep"); p.arguments = ["0"]
-            try? p.run(); p.waitUntilExit(); return p.processIdentifier
-        }()
         // The live probe uses a sacrificial child's own group (Foundation puts
         // children in a group of their own, pgid == pid), never getpgrp(): inside
         // a container the selftest itself can run in group 1, and kill(-1, 0)
         // means "every process" — it reads ESRCH whenever no fixture child
-        // happens to be alive at that instant (seen flaky 1 in 3 there).
+        // happens to be alive at that instant (seen flaky 1 in 3 there). The
+        // child is spawned (and enumerated) BEFORE the enumeration seam is armed.
         let (sacProbe, _) = try await spawnSacrificial()
+        ManagedPlaywright.ProcessGroups.membersOverride = { _ in nil }
         let liveGroupReadsAlive = ManagedPlaywright.processGroupHasLiveMembers(sacProbe.processIdentifier)
         await reap(sacProbe)
+        let deadGroup: Int32 = {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sleep"); p.arguments = ["0"]
+            try? p.run(); p.waitUntilExit(); return p.processIdentifier
+        }()
         let probeStaging = layout.stagingDirectory()
         try fm.createDirectory(at: probeStaging, withIntermediateDirectories: true)
         let note18 = ManagedPlaywright.parkStaging(probeStaging, layout: layout, processGroup: getpgrp(), reason: "fixture")
