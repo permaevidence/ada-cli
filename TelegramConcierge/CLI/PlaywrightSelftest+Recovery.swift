@@ -114,9 +114,9 @@ extension PlaywrightSelftest {
         // a container the selftest itself can run in group 1, and kill(-1, 0)
         // means "every process" — it reads ESRCH whenever no fixture child
         // happens to be alive at that instant (seen flaky 1 in 3 there).
-        let (sac2, _) = try await spawnSacrificial()
-        let liveGroupReadsAlive = ManagedPlaywright.processGroupHasLiveMembers(sac2.processIdentifier)
-        await reap(sac2)
+        let (sacProbe, _) = try await spawnSacrificial()
+        let liveGroupReadsAlive = ManagedPlaywright.processGroupHasLiveMembers(sacProbe.processIdentifier)
+        await reap(sacProbe)
         let probeStaging = layout.stagingDirectory()
         try fm.createDirectory(at: probeStaging, withIntermediateDirectories: true)
         let note18 = ManagedPlaywright.parkStaging(probeStaging, layout: layout, processGroup: getpgrp(), reason: "fixture")
@@ -156,7 +156,7 @@ extension PlaywrightSelftest {
         check("18.8 rename works again: parked with an information file (no process group known), still refused",
               parkedLaterOK && layout.leftovers().staging.isEmpty && layout.leftovers().manual.count == 2, "\(parkedLater) \(layout.leftovers())")
         ManagedPlaywright.ProcessGroups.membersOverride = nil
-        await reap(sac2)
+        await reap(sacProbe)
         for name in layout.leftovers().manual + layout.leftovers().staging { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
         try fx.setControl(["mode": "ok"])
         let unheld = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
