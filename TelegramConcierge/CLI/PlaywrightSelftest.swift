@@ -500,19 +500,27 @@ struct PlaywrightSelftest: AsyncParsableCommand {
               && ManagedPlaywright.readStatus(layout: layout)?.outcome == "skipped", "\(skipped)")
         holder?.release()
 
-        // MARK: 11. Orphans removed at the next start
+        // MARK: 11. A pre-existing staging tree is parked, never deleted (Codex round 4)
 
-        let orphanStaging = layout.mcpRoot.appendingPathComponent("playwright.staging-deadbeef")
+        let orphanStaging = layout.stagingDirectory()
         let orphanCorrupt = layout.mcpRoot.appendingPathComponent("playwright.corrupt-cafebabe")
         try fm.createDirectory(at: orphanStaging, withIntermediateDirectories: true)
         try fm.createDirectory(at: orphanCorrupt, withIntermediateDirectories: true)
         try Data("x".utf8).write(to: orphanStaging.appendingPathComponent("file"))
         let doc11 = ManagedPlaywright.doctorFindings(configs: MCPRegistry.loadConfigsFromDisk(), layout: layout, bundledHash: hB)
         let after11 = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
-        check("11.1 orphan staging and corrupt directories: listed by doctor, removed by the next start, install reused",
-              doc11.contains { $0.text.contains("leftover") && $0.text.contains("playwright.staging-deadbeef") }
-              && after11 == .configured(token: tB, changed: false)
-              && !fm.fileExists(atPath: orphanStaging.path) && !fm.fileExists(atPath: orphanCorrupt.path), "\(after11)")
+        var after11OK = false
+        if case .skipped(let r) = after11, r.contains("interrupted install") { after11OK = true }
+        let manual11 = layout.leftovers().manual.first { !$0.hasSuffix(".json") } ?? "?"
+        check("11.1 orphan staging found at start: doctor flags it, the start parks it (contents intact) and refuses; the quarantined directory is left for later",
+              doc11.contains { $0.problem && $0.text.contains(orphanStaging.lastPathComponent) }
+              && after11OK && !fm.fileExists(atPath: orphanStaging.path)
+              && fm.fileExists(atPath: layout.manualDirectory(stem: manual11).appendingPathComponent("file").path)
+              && fm.fileExists(atPath: orphanCorrupt.path), "\(after11) \(layout.leftovers())")
+        for name in layout.leftovers().manual { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
+        let after11b = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mB, flag: flag))
+        check("11.2 after manual removal: the quarantined directory is removed, the install reused",
+              after11b == .configured(token: tB, changed: false) && !fm.fileExists(atPath: orphanCorrupt.path), "\(after11b)")
 
         // MARK: 12. Hand-written reference to a missing managed directory
 
@@ -774,37 +782,38 @@ struct PlaywrightSelftest: AsyncParsableCommand {
               "\(note18) \(String(describing: info18b))")
         ManagedPlaywright.ProcessGroups.membersOverride = nil
         for name in layout.leftovers().manual { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
-        // Park rename fails: a hold marker keeps the staging name out of cleanup and blocks bootstraps.
+        // Park rename fails: the tree stays in place and still blocks; a later
+        // start parks it once the rename works again.
         let (sac2, id2) = try await spawnSacrificial()
         ManagedPlaywright.ProcessGroups.membersOverride = { _ in sac2.isRunning ? [.init(identity: id2, zombie: false)] : [] }
         ManagedPlaywright.parkRenameOverride = { _, _ in errno = EIO; return -1 }
         try fx.setControl(["mode": "spawn-child-and-hang", "childPidFile": childPid.path])
         let mE = fx.manifests(version: "0.0.84", salt: "EEEE")
         let held = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag, npmTimeout: 2))
-        ManagedPlaywright.parkRenameOverride = nil
         var heldReason = ""
         if case .failed(let r) = held { heldReason = r }
         let left18c = layout.leftovers()
-        let heldNames = layout.heldStagingNames()
         _ = ManagedPlaywright.removeLeftovers(layout: layout)
-        check("18.6 park rename fails: hold marker written, staging kept and excluded from cleanup, bootstraps refuse",
-              heldReason.contains("hold marker") && left18c.staging.count == 1 && heldNames == Set(left18c.staging)
-              && left18c.manual.contains { $0.hasSuffix(".hold") } && fm.fileExists(atPath: layout.mcpRoot.appendingPathComponent(left18c.staging[0]).path),
-              "\(held) \(left18c) held=\(heldNames)")
+        check("18.6 park rename fails: the staging tree stays in place (nothing else written), cleanup leaves it alone",
+              heldReason.contains("stays in place") && left18c.staging.count == 1 && left18c.manual.isEmpty
+              && fm.fileExists(atPath: layout.mcpRoot.appendingPathComponent(left18c.staging[0]).path), "\(held) \(left18c)")
         let heldRefused = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
         var heldRefusedOK = false
-        if case .skipped(let r) = heldRefused, r.contains("manual recovery") { heldRefusedOK = true }
-        let doc18c = ManagedPlaywright.doctorFindings(configs: MCPRegistry.loadConfigsFromDisk(), layout: layout, bundledHash: mE.lockfileHash)
-        check("18.7 while held: refused, doctor flags the hold marker",
-              heldRefusedOK && fm.fileExists(atPath: layout.mcpRoot.appendingPathComponent(left18c.staging[0]).path)
-              && doc18c.contains { $0.problem && $0.text.contains("holds a staging directory") }, "\(heldRefused)")
+        if case .skipped(let r) = heldRefused, r.contains("interrupted install") && r.contains("stays in place") { heldRefusedOK = true }
+        check("18.7 next start (rename still failing): refused as an interrupted install, tree still in place",
+              heldRefusedOK && fm.fileExists(atPath: layout.mcpRoot.appendingPathComponent(left18c.staging[0]).path), "\(heldRefused)")
+        ManagedPlaywright.parkRenameOverride = nil
+        let parkedLater = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
+        var parkedLaterOK = false
+        if case .skipped(let r) = parkedLater, r.contains("interrupted install") && r.contains("parked as") { parkedLaterOK = true }
+        check("18.8 rename works again: parked with an information file (no process group known), still refused",
+              parkedLaterOK && layout.leftovers().staging.isEmpty && layout.leftovers().manual.count == 2, "\(parkedLater) \(layout.leftovers())")
         ManagedPlaywright.ProcessGroups.membersOverride = nil
-        ManagedPlaywright.heldInProcess.removeAll()
         await reap(sac2)
         for name in layout.leftovers().manual + layout.leftovers().staging { try fm.removeItem(at: layout.mcpRoot.appendingPathComponent(name)) }
         try fx.setControl(["mode": "ok"])
         let unheld = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
-        check("18.8 after manual removal the install proceeds", unheld == .configured(token: mE.lockfileHash, changed: true), "\(unheld)")
+        check("18.9 after manual removal the install proceeds", unheld == .configured(token: mE.lockfileHash, changed: true), "\(unheld)")
         let hE = mE.lockfileHash
 
         // MARK: 19. Quarantine re-checks the configuration under the lock (Codex round 2 #2)
@@ -978,6 +987,15 @@ struct PlaywrightSelftest: AsyncParsableCommand {
                 let isLegacy = (entry()?["command"] as? String) == "npx"
                 let invariant = isLegacy || referencedDirValid()
                 let stagingAfterCrash = caseLayout.leftovers().staging.count
+                var parkedOK = true
+                if point == .afterInstall {
+                    // The interrupted staging is parked and the start refused;
+                    // a human removes it, then the next start converges.
+                    let (parkStatus, parkOut) = runChild(crash: nil)
+                    parkedOK = parkStatus == 0 && parkOut.contains("OUTCOME: skipped") && parkOut.contains("interrupted install")
+                        && caseLayout.leftovers().staging.isEmpty && caseLayout.leftovers().manual.count == 2
+                    for name in caseLayout.leftovers().manual { try? fm.removeItem(at: caseLayout.mcpRoot.appendingPathComponent(name)) }
+                }
                 let (status, out) = runChild(crash: nil)
                 let npmRuns = ((try? String(contentsOf: caseLog, encoding: .utf8)) ?? "").split(separator: "\n").count
                 let converged = out.contains("OUTCOME: configured") && referencedDirValid()
@@ -992,11 +1010,66 @@ struct PlaywrightSelftest: AsyncParsableCommand {
                 case .afterConfigWrite: expectedRuns = 1; expectedChanged = false  // already switched
                 }
                 let changedOK = out.contains("changed: \(expectedChanged)")
-                check("16.\(point.rawValue): crash exits 137, config never dangles (legacy or verified), next start converges (npm runs \(expectedRuns), changed \(expectedChanged))",
-                      crashStatus == 137 && invariant && status == 0 && converged && npmRuns == expectedRuns && changedOK
+                check("16.\(point.rawValue): crash exits 137, config never dangles (legacy or verified), \(point == .afterInstall ? "the interrupted staging is parked and refused, then after manual removal " : "")next start converges (npm runs \(expectedRuns), changed \(expectedChanged))",
+                      crashStatus == 137 && invariant && status == 0 && converged && npmRuns == expectedRuns && changedOK && parkedOK
                       && (point != .afterInstall || stagingAfterCrash == 1),
                       "crash=\(crashStatus) legacy=\(isLegacy) valid=\(referencedDirValid()) staging=\(stagingAfterCrash) run=\(status) npm=\(npmRuns) out=\(out.suffix(200)) crashOut=\(crashOut.suffix(120))")
             }
+
+            // MARK: 22. Crash DURING npm ci with a live descendant (Codex round 4)
+
+            let caseRoot = tempRoot.appendingPathComponent("crash-during-npm", isDirectory: true)
+            let caseConfigRoot = caseRoot.appendingPathComponent("briglia", isDirectory: true)
+            try fm.createDirectory(at: caseConfigRoot, withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: ["mcpServers": ["playwright": legacyEntry()]], options: [.sortedKeys])
+                .write(to: caseConfigRoot.appendingPathComponent("mcp.json"))
+            let caseLayout = ManagedPlaywright.Layout(dataRoot: caseConfigRoot)
+            let caseLog = caseRoot.appendingPathComponent("npm-log.jsonl")
+            let caseControl = caseRoot.appendingPathComponent("npm-control.json")
+            let survivorPid = caseRoot.appendingPathComponent("survivor.pid")
+            try JSONSerialization.data(withJSONObject: ["mode": "kill-parent-and-hang", "childPidFile": survivorPid.path,
+                                                        "log": caseLog.path, "cliSource": fx.goodCli.path]).write(to: caseControl)
+            let spec = caseRoot.appendingPathComponent("spec.json")
+            try JSONSerialization.data(withJSONObject: [
+                "manifestsDir": manifestsDir.path, "nodeDir": fx.nodeDir.path,
+                "controlFile": caseControl.path, "flagFile": caseRoot.appendingPathComponent("flag").path,
+            ]).write(to: spec)
+            func runCase() -> (Int32, Bool, String) {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: selfPath)
+                p.arguments = ["__playwright-selftest", "--child-run", spec.path]
+                var env = ProcessInfo.processInfo.environment
+                env["XDG_CONFIG_HOME"] = caseRoot.path
+                env["XDG_DATA_HOME"] = caseRoot.path
+                env["TMPDIR"] = caseRoot.path + "/"
+                p.environment = env
+                let pipe = Pipe()
+                p.standardOutput = pipe; p.standardError = pipe
+                do { try p.run() } catch { return (-1, false, "\(error)") }
+                let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                p.waitUntilExit()
+                return (p.terminationStatus, p.terminationReason == .uncaughtSignal, out)
+            }
+            let (killedStatus, killedBySignal, _) = runCase()
+            let survivor = Int32((try? String(contentsOf: survivorPid, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? -1
+            let survivorAlive = survivor > 0 && kill(survivor, 0) == 0
+            let stagingLeft = caseLayout.leftovers().staging
+            check("22.1 parent killed while npm's descendant lives: the staging tree survives on disk, the descendant is still running",
+                  killedBySignal && killedStatus == SIGKILL && stagingLeft.count == 1 && survivorAlive,
+                  "status=\(killedStatus) signal=\(killedBySignal) staging=\(stagingLeft) survivor=\(survivor) alive=\(survivorAlive)")
+            try JSONSerialization.data(withJSONObject: ["mode": "ok", "log": caseLog.path, "cliSource": fx.goodCli.path]).write(to: caseControl)
+            let (restartStatus, _, restartOut) = runCase()
+            let survivorStillAlive = survivor > 0 && kill(survivor, 0) == 0
+            let manualAfter = caseLayout.leftovers().manual
+            check("22.2 restart: the tree is parked (never deleted), the start refuses, the descendant is not signalled",
+                  restartStatus == 0 && restartOut.contains("OUTCOME: skipped") && restartOut.contains("interrupted install")
+                  && caseLayout.leftovers().staging.isEmpty && manualAfter.count == 2 && survivorStillAlive
+                  && fm.fileExists(atPath: caseLayout.manualDirectory(stem: manualAfter.first { !$0.hasSuffix(".json") } ?? "?").appendingPathComponent("package.json").path),
+                  "status=\(restartStatus) out=\(restartOut.suffix(300)) manual=\(manualAfter) alive=\(survivorStillAlive)")
+            if survivor > 0 { kill(survivor, SIGKILL) }
+            for name in caseLayout.leftovers().manual { try? fm.removeItem(at: caseLayout.mcpRoot.appendingPathComponent(name)) }
+            let (healStatus, _, healOut) = runCase()
+            check("22.3 after manual removal: the next start installs", healStatus == 0 && healOut.contains("OUTCOME: configured"), healOut.suffix(200).description)
         } else {
             print("· 16 crash injection skipped (release build refuses --child-run)")
             let (refusal, text) = await Self.probeChildRefusal()
@@ -1035,6 +1108,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         deps.nodeDirectory = { (nodeDir, nil) }
         var env = ProcessInfo.processInfo.environment
         env["FAKE_NPM_CONTROL"] = controlFile
+        env["FAKE_NPM_PARENT_PID"] = String(getpid())
         env["PATH"] = nodeDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         deps.baseEnvironment = env
         deps.handshakeTimeout = 8
@@ -1104,6 +1178,12 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         child = subprocess.Popen(["sleep", "600"])
         with open(ctl["childPidFile"], "w") as f:
             f.write(str(child.pid))
+        time.sleep(600)
+    if mode == "kill-parent-and-hang":
+        child = subprocess.Popen(["sleep", "600"])
+        with open(ctl["childPidFile"], "w") as f:
+            f.write(str(child.pid))
+        os.kill(int(os.environ["FAKE_NPM_PARENT_PID"]), 9)
         time.sleep(600)
     if mode == "wait-for":
         with open(ctl["startedFile"], "w") as f:

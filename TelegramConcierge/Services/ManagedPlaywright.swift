@@ -57,15 +57,18 @@ import Glibc
 /// old tree quarantined (`quarantineAfterSwitch`). So `mcp.json` never
 /// references a directory that this code removed, whatever fails or crashes.
 ///
-/// A timed-out `npm ci` whose process group cannot be confirmed gone (or
-/// whose processes cannot be enumerated at all — treated as alive) has its
-/// staging tree PARKED permanently as `playwright.manual-<uuid>/`, with a
-/// best-effort information file beside it naming the processes that were
-/// alive (pid + kernel start time + boot id, for a human with `ps`). No later
-/// start signals, cleans or reuses anything from it; every bootstrap refuses
-/// while a manual-recovery leftover exists, until a human removes it. If even
-/// the park rename fails, a hold marker keeps the staging name out of the
-/// orphan cleanup and blocks bootstraps the same way.
+/// A staging tree is never deleted unless the bootstrap that created it
+/// saw its `npm ci` finish and its process group confirmed gone. A timed-out
+/// `npm ci` whose group cannot be confirmed gone (or whose processes cannot
+/// be enumerated — treated as alive), and ANY `playwright.staging-*` found
+/// already present when a bootstrap starts (a previous Briglia crashed or
+/// lost power mid-install; whether its npm survived cannot be known), is
+/// PARKED as `playwright.manual-<uuid>/` with a best-effort information file
+/// beside it (processes alive at that moment by pid + kernel start time +
+/// boot id, for a human with `ps`). If even the park rename fails, the tree
+/// stays where it is. Every bootstrap refuses while a parked tree, an
+/// information file or a pre-existing staging tree exists, until a human
+/// removes them; nothing automatic ever signals, cleans or reuses them.
 enum ManagedPlaywright {
     static let serverName = "playwright"
     static let legacyCommand = "npx"
@@ -183,12 +186,10 @@ enum ManagedPlaywright {
             mcpRoot.appendingPathComponent("playwright.corrupt-\(UUID().uuidString.lowercased())", isDirectory: true)
         }
         /// A parked staging tree: a name no automatic path ever touches.
-        /// The same stem with `.json` holds the information file, with
-        /// `.hold` the marker used when the park rename itself failed.
+        /// The same stem with `.json` holds the information file.
         func manualStem() -> String { "playwright.manual-\(UUID().uuidString.lowercased())" }
         func manualDirectory(stem: String) -> URL { mcpRoot.appendingPathComponent(stem, isDirectory: true) }
         func manualInfoURL(stem: String) -> URL { mcpRoot.appendingPathComponent(stem + ".json") }
-        func manualHoldURL(stem: String) -> URL { mcpRoot.appendingPathComponent(stem + ".hold") }
         /// Exactly `playwright.staging-<uuid>`: one path component, no
         /// separators, no traversal — the only shape a poison record may name.
         static func isStagingBasename(_ name: String) -> Bool {
@@ -232,18 +233,6 @@ enum ManagedPlaywright {
             return (names.filter { $0.hasPrefix("playwright.staging-") }.sorted(),
                     names.filter { $0.hasPrefix("playwright.corrupt-") }.sorted(),
                     names.filter { $0.hasPrefix("playwright.manual-") }.sorted())
-        }
-        /// Staging directories named by hold markers (park rename failed):
-        /// never cleaned automatically.
-        func heldStagingNames() -> Set<String> {
-            var held: Set<String> = []
-            for name in leftovers().manual where name.hasSuffix(".hold") {
-                if let text = try? String(contentsOf: mcpRoot.appendingPathComponent(name), encoding: .utf8) {
-                    let staging = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if Layout.isStagingBasename(staging) { held.insert(staging) }
-                }
-            }
-            return held
         }
     }
 
@@ -435,14 +424,19 @@ enum ManagedPlaywright {
         defer { if !keepLock { lock.release() } }
 
         // Manual-recovery leftovers first: refuse to proceed (and to clean
-        // anything) while a parked tree, its information file or a hold
-        // marker exists — a human removes them.
+        // anything) while a parked tree or its information file exists — a
+        // human removes them.
         if let block = manualRecoveryBlock(layout: layout) {
             return (.skipped(block), nil)
         }
-        // Orphans: with the lock held for the whole bootstrap, any remaining
-        // staging directory belongs to a dead holder; corrupt directories
-        // were quarantined by an earlier start. Neither is ever referenced.
+        // A staging tree already present belongs to a bootstrap that did not
+        // finish (crash, power loss): whether its npm survived cannot be
+        // known, so it is parked, never deleted (Codex, round 4). Refuse.
+        if let block = parkPreexistingStaging(layout: layout, log: context.log) {
+            return (.skipped(block), nil)
+        }
+        // Quarantined trees were renamed by an earlier start after failing
+        // verification; nothing references or writes them.
         for name in removeLeftovers(layout: layout) { context.log("removed leftover \(name)") }
 
         crash(.beforeInstall, if: context)
@@ -565,48 +559,50 @@ enum ManagedPlaywright {
 
     /// Parks a staging tree whose writers may still be alive: rename to
     /// `playwright.manual-<uuid>/` (parent fsync checked), best-effort
-    /// information file beside it. If the rename fails, a hold marker
-    /// naming the staging directory is written instead so the orphan
-    /// cleanup never touches it; if that fails too, the failure is reported
-    /// and this process refuses every later cleanup (`heldInProcess`).
+    /// information file beside it. If the rename fails, the tree stays
+    /// under its staging name — which blocks every later bootstrap just the
+    /// same (`parkPreexistingStaging` finds it again and retries the park).
     /// Returns the sentence for the failure message.
-    static func parkStaging(_ staging: URL, layout: Layout, processGroup: Int32, reason: String) -> String {
+    static func parkStaging(_ staging: URL, layout: Layout, processGroup: Int32?, reason: String) -> String {
         let stem = layout.manualStem()
         let manual = layout.manualDirectory(stem: stem)
-        let members = ProcessGroups.members(of: processGroup)?.filter { !$0.zombie }.map(\.identity)
+        let members = processGroup.flatMap { ProcessGroups.members(of: $0)?.filter { !$0.zombie }.map(\.identity) }
         let info = ManualRecoveryInfo(stagingDirectory: staging.lastPathComponent, parkedAs: stem, processGroup: processGroup,
-                                      members: members, enumerationFailed: members == nil,
+                                      members: members, enumerationFailed: processGroup != nil && members == nil,
                                       bootID: ProcessGroups.bootID(), at: Date(), reason: reason)
         let renameResult = parkRenameOverride?(staging.path, manual.path) ?? rename(staging.path, manual.path)
-        if renameResult == 0 {
-            var note = "staging parked as \(stem) for manual recovery (bootstraps refuse until it is removed by hand)"
-            do { try PrivateStorage.fsyncDirectory(layout.mcpRoot.path) } catch { note += "; parent fsync failed: \(error)" }
-            if let data = try? JSONEncoder.iso.encode(info) {
-                try? PrivateStorage.writeAtomically(data, to: layout.manualInfoURL(stem: stem))
-            }
-            return note
+        guard renameResult == 0 else {
+            let renameError = String(cString: strerror(errno))
+            return "\(staging.lastPathComponent) could not be parked (\(renameError)); it stays in place and blocks bootstraps until it is removed by hand"
         }
-        let renameError = String(cString: strerror(errno))
-        heldInProcess.insert(staging.lastPathComponent)
-        do {
-            try PrivateStorage.writeAtomically(Data((staging.lastPathComponent + "\n").utf8), to: layout.manualHoldURL(stem: stem))
-            if let data = try? JSONEncoder.iso.encode(info) {
-                try? PrivateStorage.writeAtomically(data, to: layout.manualInfoURL(stem: stem))
-            }
-            return "staging could not be parked (\(renameError)); a hold marker \(stem).hold now keeps \(staging.lastPathComponent) out of every automatic cleanup (bootstraps refuse until both are removed by hand)"
-        } catch {
-            return "staging could not be parked (\(renameError)) and no hold marker could be written (\(error)); \(staging.lastPathComponent) is held only for the lifetime of this process — inspect \(layout.mcpRoot.path) by hand before restarting"
+        var note = "staging parked as \(stem) for manual recovery (bootstraps refuse until it is removed by hand)"
+        do { try PrivateStorage.fsyncDirectory(layout.mcpRoot.path) } catch { note += "; parent fsync failed: \(error)" }
+        if let data = try? JSONEncoder.iso.encode(info) {
+            try? PrivateStorage.writeAtomically(data, to: layout.manualInfoURL(stem: stem))
         }
+        return note
     }
 
-    /// Staging names this process must never clean (park and hold both
-    /// failed); process-local last resort.
-    nonisolated(unsafe) static var heldInProcess: Set<String> = []
+    /// Parks every `playwright.staging-*` already present (lock held; ours is
+    /// created only afterwards). Returns the refusal, or nil when none.
+    static func parkPreexistingStaging(layout: Layout, log: @Sendable (String) -> Void) -> String? {
+        let staging = layout.leftovers().staging
+        guard !staging.isEmpty else { return nil }
+        var notes: [String] = []
+        for name in staging {
+            let note = parkStaging(layout.mcpRoot.appendingPathComponent(name, isDirectory: true), layout: layout,
+                                   processGroup: nil, reason: "found at start: a previous install was interrupted (crash or power loss); whether its npm survived cannot be known")
+            log("pre-existing \(name): \(note)")
+            notes.append(note)
+        }
+        return "an interrupted install was found — \(notes.joined(separator: "; ")); end any npm/node from it (ps -o pid,pgid,etime,args), then remove every playwright.manual-* entry under \(layout.mcpRoot.path) by hand; nothing installed this start"
+    }
 
     struct ManualRecoveryInfo: Codable, Equatable {
         var stagingDirectory: String
         var parkedAs: String
-        var processGroup: Int32
+        /// Nil when the tree was found already present at a later start.
+        var processGroup: Int32?
         /// Processes alive in the group when parked (nil: enumeration failed).
         var members: [ProcessGroups.Identity]?
         var enumerationFailed: Bool
@@ -683,18 +679,17 @@ enum ManagedPlaywright {
     static func manualRecoveryBlock(layout: Layout) -> String? {
         let manual = layout.leftovers().manual
         guard let first = manual.first else { return nil }
-        return "\(first) is parked for manual recovery (a timed-out npm ci whose processes could not be confirmed gone) — end any npm/node from it (ps -o pid,pgid,etime,args), then remove every playwright.manual-* entry under \(layout.mcpRoot.path) by hand; nothing installed this start"
+        return "\(first) is parked for manual recovery (an install whose processes could not be confirmed gone) — end any npm/node from it (ps -o pid,pgid,etime,args), then remove every playwright.manual-* entry under \(layout.mcpRoot.path) by hand; nothing installed this start"
     }
 
-    /// Removes orphan staging and quarantined directories (lock must be
-    /// held; poisoned staging is settled before this runs). Immutable
-    /// `playwright-<token>` directories are never touched.
+    /// Removes quarantined directories (lock must be held). Staging trees are
+    /// never removed here — a pre-existing one is parked before this runs —
+    /// and immutable `playwright-<token>` directories are never touched.
     @discardableResult
     static func removeLeftovers(layout: Layout) -> [String] {
         let leftovers = layout.leftovers()
-        let held = layout.heldStagingNames().union(heldInProcess)
         var removed: [String] = []
-        for name in leftovers.staging.filter({ !held.contains($0) }) + leftovers.corrupt {
+        for name in leftovers.corrupt {
             let url = layout.mcpRoot.appendingPathComponent(name)
             if (try? FileManager.default.removeItem(at: url)) != nil { removed.append(name) }
         }
@@ -1100,19 +1095,20 @@ enum ManagedPlaywright {
                                problem: false, hint: nil))
         }
         let leftovers = layout.leftovers()
-        if !leftovers.staging.isEmpty || !leftovers.corrupt.isEmpty {
-            out.append(Finding(text: "leftover directories removed at the next start: \((leftovers.staging + leftovers.corrupt).joined(separator: ", "))",
+        if !leftovers.corrupt.isEmpty {
+            out.append(Finding(text: "quarantined directories removed at the next start: \(leftovers.corrupt.joined(separator: ", "))",
                                problem: false, hint: nil))
         }
-        for name in leftovers.manual where !name.hasSuffix(".json") && !name.hasSuffix(".hold") || name.hasSuffix(".hold") {
-            let stem = name.hasSuffix(".hold") ? String(name.dropLast(5)) : name
-            let info = FileManager.default.contents(atPath: layout.manualInfoURL(stem: stem).path)
+        for name in leftovers.manual where !name.hasSuffix(".json") {
+            let info = FileManager.default.contents(atPath: layout.manualInfoURL(stem: name).path)
                 .flatMap { try? JSONDecoder.iso.decode(ManualRecoveryInfo.self, from: $0) }
-            var detail = "timed-out npm ci whose processes could not be confirmed gone"
+            var detail = "an install whose processes could not be confirmed gone"
             var hint = "make sure no npm/node from it is still running (ps -o pid,pgid,etime,args), then remove every playwright.manual-* entry under \(layout.mcpRoot.path)"
             if let info {
-                if info.enumerationFailed {
-                    detail += "; process enumeration failed when it was parked (group \(info.processGroup))"
+                if info.processGroup == nil {
+                    detail = "found already present at a later start: a previous install was interrupted"
+                } else if info.enumerationFailed {
+                    detail += "; process enumeration failed when it was parked (group \(info.processGroup ?? 0))"
                 } else if let members = info.members {
                     let alive = info.bootID == ProcessGroups.bootID() ? ProcessGroups.stillAlive(members) : []
                     if let alive, !alive.isEmpty {
@@ -1125,8 +1121,12 @@ enum ManagedPlaywright {
                     }
                 }
             }
-            out.append(Finding(text: "\(name)\(name.hasSuffix(".hold") ? " holds a staging directory" : " is parked") for manual recovery (\(detail)): bootstraps refuse",
-                               problem: true, hint: hint))
+            out.append(Finding(text: "\(name) is parked for manual recovery (\(detail)): bootstraps refuse", problem: true, hint: hint))
+        }
+        for name in leftovers.staging {
+            out.append(Finding(text: "\(name): an interrupted install (parked for manual recovery at the next start; never deleted automatically)",
+                               problem: true,
+                               hint: "make sure no npm/node from it is still running, then remove it under \(layout.mcpRoot.path)"))
         }
         if let status = readStatus(layout: layout) {
             let fmt = ISO8601DateFormatter()
