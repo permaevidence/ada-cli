@@ -109,14 +109,22 @@ extension PlaywrightSelftest {
             let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sleep"); p.arguments = ["0"]
             try? p.run(); p.waitUntilExit(); return p.processIdentifier
         }()
+        // The live probe uses a sacrificial child's own group (Foundation puts
+        // children in a group of their own, pgid == pid), never getpgrp(): inside
+        // a container the selftest itself can run in group 1, and kill(-1, 0)
+        // means "every process" — it reads ESRCH whenever no fixture child
+        // happens to be alive at that instant (seen flaky 1 in 3 there).
+        let (sac2, _) = try await spawnSacrificial()
+        let liveGroupReadsAlive = ManagedPlaywright.processGroupHasLiveMembers(sac2.processIdentifier)
+        await reap(sac2)
         let probeStaging = layout.stagingDirectory()
         try fm.createDirectory(at: probeStaging, withIntermediateDirectories: true)
         let note18 = ManagedPlaywright.parkStaging(probeStaging, layout: layout, processGroup: getpgrp(), reason: "fixture")
         let stem18b = layout.leftovers().manual.first { !$0.hasSuffix(".json") && !$0.hasSuffix(".hold") } ?? "?"
         let info18b = fm.contents(atPath: layout.manualInfoURL(stem: stem18b).path)
             .flatMap { try? JSONDecoder.iso.decode(ManagedPlaywright.ManualRecoveryInfo.self, from: $0) }
-        check("18.5 enumeration failure: our own group still reads alive (kill probe), a finished group reads gone only through ESRCH; parking records the failed enumeration",
-              ManagedPlaywright.processGroupHasLiveMembers(getpgrp()) && !ManagedPlaywright.processGroupHasLiveMembers(deadGroup)
+        check("18.5 enumeration failure: a live group still reads alive (kill probe), a finished group reads gone only through ESRCH; parking records the failed enumeration",
+              liveGroupReadsAlive && !ManagedPlaywright.processGroupHasLiveMembers(deadGroup)
               && note18.contains("parked as") && info18b?.enumerationFailed == true && info18b?.members == nil && !fm.fileExists(atPath: probeStaging.path),
               "\(note18) \(String(describing: info18b))")
         ManagedPlaywright.ProcessGroups.membersOverride = nil
