@@ -46,6 +46,9 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             try await Self.runChild(specPath: childRun)
             return
         }
+        // Line-buffered stdout even when redirected (CI logs show the last
+        // completed check if the battery ever stalls).
+        setvbuf(stdout, nil, _IOLBF, 0)
         // Isolate BEFORE anything touches StoragePaths.
         let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("briglia-playwright-\(UUID().uuidString)", isDirectory: true)
@@ -702,6 +705,13 @@ struct PlaywrightSelftest: AsyncParsableCommand {
             guard let identity else { throw ManagedPlaywright.ManagedError("could not enumerate the sacrificial process") }
             return (proc, identity)
         }
+        // corelibs Foundation's `terminate()`/`waitUntilExit()` can hang on
+        // Linux for a child it no longer tracks cleanly; end the sacrificial
+        // processes with a direct SIGKILL and a bounded poll instead.
+        func reap(_ proc: Process) async {
+            kill(proc.processIdentifier, SIGKILL)
+            for _ in 0..<100 where proc.isRunning { try? await Task.sleep(nanoseconds: 50_000_000) }
+        }
         let (sac1, id1) = try await spawnSacrificial()
         check("18.0 real enumeration: the sacrificial process is found with pid + start time, in its own group",
               id1.pid == sac1.processIdentifier && id1.startTime > 0
@@ -768,7 +778,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
         let afterBoot = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mD, flag: flag))
         check("18.5 record from another boot: nothing signalled even with a matching identity, released",
               afterBoot == .configured(token: mD.lockfileHash, changed: false) && sac2.isRunning && layout.leftovers().poisoned.isEmpty, "\(afterBoot)")
-        sac2.terminate(); sac2.waitUntilExit()
+        await reap(sac2)
         // Traversal in the record: fail closed, nothing deleted, orphans untouched.
         let escape = tempRoot.appendingPathComponent("escape", isDirectory: true)
         try fm.createDirectory(at: escape, withIntermediateDirectories: true)
@@ -811,7 +821,7 @@ struct PlaywrightSelftest: AsyncParsableCommand {
               parkedReason.contains("manual recovery") && left18c.manual.count == 1 && left18c.poisoned.isEmpty && left18c.staging.isEmpty, "\(parked) \(left18c)")
         ManagedPlaywright.poisonRecordWriteOverride = nil
         ManagedPlaywright.ProcessGroups.membersOverride = nil
-        sac3.terminate(); sac3.waitUntilExit()
+        await reap(sac3)
         try fx.setControl(["mode": "ok"])
         let blocked = await BrowserAutomationBootstrap.ensureConfigured(dependencies: fx.dependencies(manifests: mE, flag: flag))
         var blockedOK = false
