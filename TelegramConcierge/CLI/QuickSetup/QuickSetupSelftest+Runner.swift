@@ -106,19 +106,10 @@ extension SelftestContext {
         do {
             let marker = tempDir("die").appendingPathComponent("marker").path
             let jpath = tempDir("die").appendingPathComponent("journal.json").path
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: selfPath)
-            p.arguments = ["__quicksetup-selftest", "--job-then-die"]
-            var env = ProcessInfo.processInfo.environment
-            env["BRIGLIA_SELFTEST_MARKER"] = marker
-            env["BRIGLIA_SELFTEST_JOURNAL"] = jpath
-            p.environment = env
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            try p.run()
-            p.waitUntilExit()
+            let status1 = spawnAndWait([selfPath, "__quicksetup-selftest", "--job-then-die"],
+                                       env: ["BRIGLIA_SELFTEST_MARKER": marker, "BRIGLIA_SELFTEST_JOURNAL": jpath])
             try? await Task.sleep(nanoseconds: 800_000_000)
-            check("parent died before RELEASE → child exits without executing (marker absent)", p.terminationStatus != 0 && !FileManager.default.fileExists(atPath: marker), "status \(p.terminationStatus)")
+            check("parent died before RELEASE → child exits without executing (marker absent)", status1 != 0 && !FileManager.default.fileExists(atPath: marker), "status \(status1)")
             // The journal names a pid that is gone → preflight clears it.
             SetupJobRunner.journalURLOverride = URL(fileURLWithPath: jpath)
             let r = fresh()
@@ -129,19 +120,18 @@ extension SelftestContext {
         // Parent SIGKILLed mid-job (child alive) → next preflight poisoned; child killed → re-check clears.
         do {
             let jpath = tempDir("die2").appendingPathComponent("journal.json").path
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: selfPath)
-            p.arguments = ["__quicksetup-selftest", "--job-then-die"]
-            var env = ProcessInfo.processInfo.environment
-            env["BRIGLIA_SELFTEST_JOURNAL"] = jpath
-            env["BRIGLIA_SELFTEST_DIE_AFTER_RELEASE"] = "1"
-            p.environment = env
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            try p.run()
-            p.waitUntilExit()
+            let status2 = spawnAndWait([selfPath, "__quicksetup-selftest", "--job-then-die"],
+                                       env: ["BRIGLIA_SELFTEST_JOURNAL": jpath, "BRIGLIA_SELFTEST_DIE_AFTER_RELEASE": "1"])
             SetupJobRunner.journalURLOverride = URL(fileURLWithPath: jpath)
             let r = fresh()
+            if ProcessInfo.processInfo.environment["BRIGLIA_SELFTEST_DEBUG"] == "1",
+               let data = try? Data(contentsOf: URL(fileURLWithPath: jpath)),
+               let j = try? JSONDecoder.iso.decode(SetupJobRunner.Journal.self, from: data) {
+                print("DEBUG journal pid=\(j.pid) pgid=\(j.pgid) start=\(j.startTime) boot=\(j.bootID ?? "nil") now=\(ManagedPlaywright.ProcessGroups.bootID() ?? "nil")")
+                print("DEBUG members=\(String(describing: ManagedPlaywright.ProcessGroups.members(of: j.pgid)))")
+                print("DEBUG stillAlive=\(String(describing: ManagedPlaywright.ProcessGroups.stillAlive([.init(pid: j.pid, startTime: j.startTime)])))")
+                print("DEBUG subprocess status=\(status2)")
+            }
             let poison = SetupJobRunner.inheritLeftoverJournal(into: r)
             check("parent killed mid-job → journal survives, child alive → poisoned", poison != nil && !(poison?.survivors.isEmpty ?? true), "\(String(describing: poison))")
             if let poison {
@@ -331,5 +321,36 @@ enum SelftestSubprocess {
             Foundation.exit(1)
         }
         print("OK")
+    }
+}
+
+extension SelftestContext {
+    /// Spawn `argv` with `env` through posix_spawn and wait for it. Returns
+    /// the raw wait status. Foundation `Process` is avoided on purpose: on
+    /// Linux (corelibs) a child that dies by signal did not leave its own
+    /// detached descendants running the way a shell-launched one does,
+    /// which is exactly the situation the crash tests must reproduce.
+    func spawnAndWait(_ argv: [String], env extra: [String: String]) -> Int32 {
+        var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
+        cargs.append(nil)
+        var env = ProcessInfo.processInfo.environment
+        for (k, v) in extra { env[k] = v }
+        var cenv: [UnsafeMutablePointer<CChar>?] = env.map { strdup("\($0.key)=\($0.value)") }
+        cenv.append(nil)
+        defer { for p in cargs { free(p) }; for p in cenv { free(p) } }
+        #if os(Linux)
+        var actions = posix_spawn_file_actions_t()
+        #else
+        var actions: posix_spawn_file_actions_t? = nil
+        #endif
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+        var pid: pid_t = 0
+        guard posix_spawn(&pid, argv[0], &actions, nil, cargs, cenv) == 0 else { return -1 }
+        var status: Int32 = 0
+        while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+        return status
     }
 }
