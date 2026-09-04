@@ -159,6 +159,20 @@ enum ToolchainService {
         return out
     }
 
+    /// Does this pip accept `--break-system-packages` (pip ≥ 23.1)? Ubuntu
+    /// 22.04's pip 22.0 rejects the option with a usage error, so the flag
+    /// is passed only where `pip install --help` lists it. Cached per python.
+    nonisolated(unsafe) private static var pipFlagCache: [String: Bool] = [:]
+    private static let pipFlagLock = NSLock()
+    static func pipBreakSystemPackagesSupported(python: String) -> Bool {
+        pipFlagLock.lock(); defer { pipFlagLock.unlock() }
+        if let cached = pipFlagCache[python] { return cached }
+        let r = QuickSetupEvidence.quietRun(python, ["-m", "pip", "install", "--help"], timeoutSeconds: 20)
+        let supported = (r?.status == 0) && (r?.stdout.contains("--break-system-packages") ?? false)
+        pipFlagCache[python] = supported
+        return supported
+    }
+
     /// Whether plain `pip install` works (PEP 668 check), probed the same way
     /// pip itself decides: the EXTERNALLY-MANAGED marker file next to stdlib.
     static func pipStatus() -> PipStatus {
@@ -262,7 +276,7 @@ enum ToolchainService {
         case "pip":
             guard let python = python3Path() else { return "python3 non trovato" }
             var args = ["-m", "pip", "install", spec.package]
-            if pipBreakSystemPackages { args.append("--break-system-packages") }
+            if pipBreakSystemPackages, pipBreakSystemPackagesSupported(python: python) { args.append("--break-system-packages") }
             let result = await GoogleWorkspaceService.runProcessAsync(
                 executable: python, args: args, timeoutSeconds: spec.timeoutSeconds
             )

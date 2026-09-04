@@ -93,6 +93,9 @@ enum QuickSetupPreflight {
         }
         // Disk floors on every destination filesystem.
         let checks = diskChecks(isLinux: isLinux)
+        if let unreadable = checks.first(where: { $0.unreadable }) {
+            throw Refusal("Quick setup cannot read the free space on \(unreadable.path) — a destination it must install into; check that the path exists and is readable, then run `briglia quicksetup` again.")
+        }
         if let bad = checks.first(where: { !$0.ok }) {
             throw Refusal("Quick setup needs \(QuickSetupEvidence.formatGB(bad.floorBytes)) free on \(bad.mount); \(QuickSetupEvidence.formatGB(bad.freeBytes)) available.")
         }
@@ -167,8 +170,8 @@ final class QuickSetupRouter: @unchecked Sendable {
             ])
         }
         if request.query != nil { return .status(400) }
-        guard await workflow.authorized(cookie: request.cookieBQS) else { return .status(404) }
-        let g = await workflow.generation
+        // One actor call: the cookie check and the generation it authorizes.
+        guard let g = await workflow.authorizedGeneration(cookie: request.cookieBQS) else { return .status(404) }
 
         switch (request.method, request.path) {
         case ("GET", "/"): return staticFile("index.html", type: "text/html; charset=utf-8")
@@ -370,7 +373,7 @@ enum QuickSetupSession {
             throw ExitCode(2)
         }
         defer { close(sessionLockFD) }
-        KeepAwake.holdForProcessLifetime(reason: "Briglia quick setup")
+        KeepAwake.holdForProcessLifetime()   // the shared reason the keep-awake row verifies
 
         let runner = SetupJobRunner(secrets: [:])
         runner.onLine = { print("  │ \($0)") }
@@ -413,7 +416,7 @@ enum QuickSetupSession {
         sigSource.setEventHandler {
             print("\nStopping quick setup… (what was verified and saved is kept)")
             Task {
-                _ = await workflow.rotate()
+                _ = await workflow.rotate()   // revoke + cancel + reap before teardown
                 server.stop()
                 listener.stop()
                 leaseBox.release()
@@ -485,6 +488,10 @@ enum QuickSetupSession {
 
     static func printLink(workflow: QuickSetupWorkflow, port: UInt16, open: Bool) async {
         let token = await workflow.launchToken
+        guard !token.isEmpty else {
+            print("✖ Cannot generate a secure link on this system — the previous link is revoked and no new one can be issued. Stop with Ctrl-C and run `briglia quicksetup` again.")
+            return
+        }
         let url = "http://127.0.0.1:\(port)/start?t=\(token)"
         print("""
 
@@ -500,7 +507,8 @@ enum QuickSetupSession {
         if await workflow.consumedByOther {
             print("⚠ that link was already used by something else on this machine — the old session is revoked now.")
         }
-        if let poison = await workflow.rotate() { printPoison(poison) }
+        let result = await workflow.rotate()
+        if let poison = result.poison { printPoison(poison) }
         await printLink(workflow: workflow, port: port, open: true)
     }
 

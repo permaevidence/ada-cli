@@ -492,11 +492,57 @@ final class SelftestContext: @unchecked Sendable {
         try? await Task.sleep(nanoseconds: 500_000_000)
         check("job running", runner4.currentJob != nil)
         let before = Date()
-        let poison = await wf4.rotate()
-        check("rotation cancelled and reaped the job before returning (no poison)", poison == nil && runner4.currentJob == nil && Date().timeIntervalSince(before) < 20)
+        let rotation = await wf4.rotate()
+        check("rotation cancelled and reaped the job before returning (no poison)", rotation.poison == nil && !rotation.randomnessFailed && runner4.currentJob == nil && Date().timeIntervalSince(before) < 20)
         let rowsAfter = (await wf4.status())["system_rows"] as? [[String: Any]] ?? []
         check("toolchain row failed under the old generation", rowsAfter.first { $0["id"] as? String == "toolchain" }?["state"] as? String == "failed", "\(rowsAfter)")
         check("no journal left after the cancelled job", !FileManager.default.fileExists(atPath: SetupJobRunner.journalURL.path))
+
+        // Atomic authorization: the cookie check and the generation it
+        // authorizes are one call; after a rotation the old cookie yields
+        // nothing, and the new cookie yields the new generation.
+        let (wf5, _) = try makeWorkflow(env)
+        let c5 = await wf5.exchange(token: await wf5.launchToken)
+        let g5 = await wf5.authorizedGeneration(cookie: c5)
+        _ = await wf5.rotate()
+        let stale5 = await wf5.authorizedGeneration(cookie: c5)
+        let c5b = await wf5.exchange(token: await wf5.launchToken)
+        let g5b = await wf5.authorizedGeneration(cookie: c5b)
+        check("authorizedGeneration: old cookie → nil after rotation; new cookie → new generation", g5 == 1 && stale5 == nil && g5b == 2, "\(String(describing: g5)) \(String(describing: stale5)) \(String(describing: g5b))")
+        // RNG failure during rotation: revoked, nothing issued, nothing reused.
+        QuickSetupWorkflow.randomHexFails = true
+        let failed = await wf5.rotate()
+        QuickSetupWorkflow.randomHexFails = false
+        let tokenAfter = await wf5.launchToken
+        let deadCookie = await wf5.authorizedGeneration(cookie: c5b)
+        let deadExchange = await wf5.exchange(token: "0123456789abcdef0123456789abcdef")
+        check("rotation with failing randomness → revoked, no token issued, old cookie dead", failed.randomnessFailed && tokenAfter.isEmpty && deadCookie == nil && deadExchange == nil)
+        let recovered = await wf5.rotate()
+        let tokenRecovered = await wf5.launchToken
+        check("next rotation issues a fresh link", !recovered.randomnessFailed && !tokenRecovered.isEmpty)
+        // Step-by-step handoff revokes the page's authorization.
+        let (wf6, _) = try makeWorkflow(env)
+        let c6 = await wf6.exchange(token: await wf6.launchToken)
+        let g6 = await wf6.authorizedGeneration(cookie: c6)!
+        let (st6, _) = try await wf6.stepByStep(generation: g6)
+        let wizard6 = await wf6.wizardRequested
+        let revoked6 = await wf6.authorizedGeneration(cookie: c6)
+        check("step-by-step: 200, wizard requested, cookie revoked", st6 == 200 && wizard6 && revoked6 == nil)
+        // In-flight settling: a verify suspended in a probe unwinds before rotate() returns.
+        let gate7 = AsyncGate()
+        var env7 = env
+        let base7 = env.probe
+        env7.probe = { r in if (r["kind"] as? String) == "serper" { await gate7.wait() }; return await base7(r) }
+        let (wf7, _) = try makeWorkflow(env7)
+        let g7 = await wf7.generation
+        let t7 = Task { try await wf7.verify(self.goodRequest(), generation: g7) }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let inFlightBefore = await wf7.inFlightOperations
+        Task { try? await Task.sleep(nanoseconds: 300_000_000); gate7.open() }
+        _ = await wf7.rotate()
+        let inFlightAfter = await wf7.inFlightOperations
+        _ = try? await t7.value
+        check("rotate() waits for the in-flight verify to unwind (in-flight 1 → 0)", inFlightBefore == 1 && inFlightAfter == 0, "\(inFlightBefore) \(inFlightAfter)")
     }
 
     // MARK: 3. Workflow enforcement
@@ -553,6 +599,9 @@ final class SelftestContext: @unchecked Sendable {
         threw = false
         do { _ = try QuickSetupRequest.parse(["name": "x", "opencode": ["kept": true, "value": "a"], "openai": ["value": "a"], "serper": ["value": "a"], "jina": ["value": "a"], "telegram": ["token": "t", "chat_id": "1"]]) } catch { threw = true }
         check("kept must be alone in its object", threw)
+        let parsedCustom = try QuickSetupRequest.parse(["name": "x", "opencode": ["value": "a"], "openai": ["value": "a"], "serper": ["value": "a"], "jina": ["value": "a"], "telegram": ["token": "t", "chat_id": "1"], "custom": ["api_key": "k", "base_url": "u", "model": "m"]])
+        let customPayload = QuickSetupWorkflow.applyPayload(section: "custom", request: parsedCustom)?["provider"] as? [String: Any]
+        check("custom endpoint without the vision checkbox → text_only true (conservative, like the wizard)", customPayload?["text_only"] as? Bool == true)
         // Payload shapes.
         var full = goodRequest()
         full.values[.openrouter] = .key("or-good")
@@ -733,6 +782,8 @@ final class SelftestContext: @unchecked Sendable {
         check("Linux without pip → distribution hint", refusal({ QuickSetupPreflight.pythonOverride = .init(present: true, pipOK: false) }, isLinux: true).contains("python3-pip"))
         check("Linux without a systemd user session → use briglia setup", refusal({ QuickSetupPreflight.systemdSessionOverride = false }, isLinux: true).contains("systemd user service"))
         check("disk below floor → names the mount and the numbers", refusal({ QuickSetupEvidence.statvfsOverride = { _ in (1, "/", 1 * QuickSetupEvidence.gb) } }, isLinux: false).contains("free on /"))
+        check("disk information unreadable for a destination → refusal naming it (never silently omitted)",
+              refusal({ QuickSetupEvidence.statvfsOverride = { path in path.hasPrefix("/private/tmp") ? nil : (1, "/", 100 * QuickSetupEvidence.gb) } }, isLinux: false).contains("cannot read the free space on /private/tmp"))
         check("all clear → no refusal", refusal({}, isLinux: false).isEmpty)
         check("all clear (Linux) → no refusal", refusal({}, isLinux: true).isEmpty)
         // Second instance: the session lock.
@@ -924,9 +975,28 @@ final class SelftestContext: @unchecked Sendable {
         #if os(macOS)
         KeepAwake.holdForProcessLifetime(reason: "Briglia selftest keep-awake")
         check("macOS assertion listed by pmset while held", KeepAwake.assertionListedBySystem(reason: "Briglia selftest keep-awake") == true)
+        check("the keep-awake row's real check rejects an assertion under another reason", !QuickSetupEnvironment().keepAwakeHeld())
         KeepAwake.release()
         check("macOS assertion gone after release", KeepAwake.assertionListedBySystem(reason: "Briglia selftest keep-awake") == false)
+        KeepAwake.holdForProcessLifetime()   // what `briglia quicksetup`, chat and daemon call
+        check("the keep-awake row's real check passes under the shared default reason", QuickSetupEnvironment().keepAwakeHeld())
+        KeepAwake.release()
         #endif
+        // Real pip on the CI distribution (Jammy): feature-detected flag, real install of a missing package.
+        if ProcessInfo.processInfo.environment["BRIGLIA_SELFTEST_REAL_PIP"] == "1", let python = ToolchainService.python3Path() {
+            let helpOut = QuickSetupEvidence.quietRun(python, ["-m", "pip", "install", "--help"], timeoutSeconds: 30)?.stdout ?? ""
+            let supported = ToolchainService.pipBreakSystemPackagesSupported(python: python)
+            check("pip --break-system-packages feature detection matches `pip install --help`", supported == helpOut.contains("--break-system-packages"))
+            let status = ToolchainService.DesktopStatus(doctorRan: true, missing: ["openpyxl"], libreOffice: true, mandatoryMissing: ["openpyxl"])
+            let jobs = QuickSetupEnvironment.defaultToolchainJobs(status).filter { $0.label.hasPrefix("pip install") }
+            check("real pip job built for the missing package", jobs.count == 1 && jobs[0].command.contains("openpyxl") && (jobs[0].command.contains("--break-system-packages") == supported), "\(jobs.map(\.command))")
+            if let job = jobs.first {
+                let r = SetupJobRunner()
+                let result = await r.run(job)
+                let imported = QuickSetupEvidence.quietRun(python, ["-c", "import openpyxl; print(openpyxl.__version__)"], timeoutSeconds: 30)
+                check("real `pip install openpyxl` through the runner succeeds and the package imports", result.ok && imported?.status == 0, "\(result.outcome) \(result.lastLines.suffix(3))")
+            }
+        }
     }
 
     // MARK: 16. Package maps + disk floors

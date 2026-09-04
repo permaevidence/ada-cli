@@ -228,10 +228,72 @@ extension AgentMailService {
         try PrivateStorage.writeAtomically(bytes, to: wrapperURL, mode: mode)
     }
 
-    private static func liveWrapperBytes() -> Data? {
+    /// The live `agentmail` path is absent, a readable regular file, or
+    /// something else (symlink, directory, unreadable) — and the last is
+    /// never treated as "absent": recovery fails closed on it and a new
+    /// installation refuses to overwrite it.
+    enum WrapperState: Equatable {
+        case absent
+        case valid(Data)
+        case invalid(String)
+    }
+
+    static func liveWrapperState() -> WrapperState {
         var st = stat()
-        guard lstat(wrapperURL.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return nil }
-        return try? Data(contentsOf: wrapperURL)
+        guard lstat(wrapperURL.path, &st) == 0 else {
+            return errno == ENOENT ? .absent : .invalid("lstat failed: \(String(cString: strerror(errno)))")
+        }
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            return .invalid("\(wrapperURL.path) exists but is not a regular file (symlink, directory or device)")
+        }
+        guard let data = try? Data(contentsOf: wrapperURL) else { return .invalid("\(wrapperURL.path) exists but cannot be read") }
+        return .valid(data)
+    }
+
+    private static func liveWrapperBytes() -> Data? {
+        if case .valid(let d) = liveWrapperState() { return d }
+        return nil
+    }
+
+    struct CleanupFailure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Selftest seams: cleanup/barrier fault injection.
+    nonisolated(unsafe) static var injectFsyncFailure = false
+    nonisolated(unsafe) static var injectStagingRemovalFailure = false
+
+    /// Post-verification cleanup, every step checked: an unlinked
+    /// transaction file, removed staging and a directory barrier are part
+    /// of "installed"; a failure here is reported as retryable, never as
+    /// success with debris behind.
+    private static func finishCleanup(deletePrevious previous: String?, liveTarget: String?) throws {
+        // Order: everything that could fail runs BEFORE the transaction file
+        // goes, so a failed step leaves the evidence doctor reports and
+        // repair retries from; the metadata is the last thing removed.
+        if let prev = previous {
+            deleteIfUnreferenced(prev, liveTarget: liveTarget)
+        }
+        try removeStagingChecked()
+        func barrier() throws {
+            if injectFsyncFailure { throw CleanupFailure(description: "injected directory fsync failure") }
+            do { try fsyncDir() } catch { throw CleanupFailure(description: "directory barrier failed: \(error)") }
+        }
+        try barrier()
+        if unlink(transactionURL.path) != 0, errno != ENOENT {
+            throw CleanupFailure(description: "could not remove \(transactionFileName): \(String(cString: strerror(errno)))")
+        }
+        try barrier()
+    }
+
+    private static func removeStagingChecked() throws {
+        let fm = FileManager.default
+        for entry in (try? fm.contentsOfDirectory(atPath: installDirectory.path)) ?? [] where entry.hasPrefix(stagingPrefix) {
+            if injectStagingRemovalFailure { throw CleanupFailure(description: "injected staging removal failure (\(entry))") }
+            do { try fm.removeItem(at: installDirectory.appendingPathComponent(entry)) } catch {
+                throw CleanupFailure(description: "could not remove staging \(entry): \(error.localizedDescription)")
+            }
+        }
     }
 
     private static func crashIf(_ point: String) {
@@ -359,7 +421,12 @@ extension AgentMailService {
 
         // 3. Transaction metadata, then publish the binary.
         try checkpoint()
-        let liveWrapper = liveWrapperBytes()
+        let liveWrapper: Data?
+        switch liveWrapperState() {
+        case .absent: liveWrapper = nil
+        case .valid(let d): liveWrapper = d
+        case .invalid(let why): return "refusing to replace the existing agentmail entry: \(why) — remove it by hand if it is not yours"
+        }
         let liveTarget = liveWrapper.flatMap(wrapperTarget)
         var previousBinary: String?
         if let liveTarget {
@@ -415,12 +482,14 @@ extension AgentMailService {
         let smoke = await runner.run([wrapperURL.path, "--version"], 10, "agentmail --version")
         if smoke.ok {
             let liveTarget = liveWrapperBytes().flatMap(wrapperTarget)
-            if let prev = tx.previousBinary, prev != tx.newBinary {
-                deleteIfUnreferenced(prev, liveTarget: liveTarget)
+            let previous = (tx.previousBinary != nil && tx.previousBinary != tx.newBinary) ? tx.previousBinary : nil
+            do {
+                try finishCleanup(deletePrevious: previous, liveTarget: liveTarget)
+            } catch {
+                // The new pair is live and verified, but the transaction is
+                // not settled: retryable, and doctor keeps reporting it.
+                return "installed and verified, but cleanup did not complete (\(error)) — retry, or run `briglia agentmail repair`"
             }
-            unlink(transactionURL.path)
-            removeStaging()
-            try? fsyncDir()
             return nil
         }
         let detail = smoke.detail ?? "unknown error"
@@ -436,7 +505,12 @@ extension AgentMailService {
     /// swap happens only if the live wrapper still hashes to the new one.
     private static func rollbackLocked(_ txIn: Transaction) throws {
         var tx = txIn
-        let live = liveWrapperBytes()
+        let live: Data?
+        switch liveWrapperState() {
+        case .absent: live = nil
+        case .valid(let d): live = d
+        case .invalid(let why): throw CleanupFailure(description: "the live wrapper is invalid (\(why)); nothing rolled back — inspect it by hand")
+        }
         let liveHash = live.map(sha256Hex)
         if liveHash == tx.newWrapperSHA256 {
             // The metadata sits at `committing` through the rollback swap, so
@@ -456,10 +530,7 @@ extension AgentMailService {
         tx.state = "rolled_back"
         try writeTransaction(tx)
         let liveTarget = liveWrapperBytes().flatMap(wrapperTarget)
-        deleteIfUnreferenced(tx.newBinary, liveTarget: liveTarget)
-        unlink(transactionURL.path)
-        removeStaging()
-        try fsyncDir()
+        try finishCleanup(deletePrevious: tx.newBinary, liveTarget: liveTarget)
     }
 
     // MARK: Repair
@@ -488,7 +559,7 @@ extension AgentMailService {
         let tx: Transaction
         do {
             guard let read = try readTransaction() else {
-                removeStaging()
+                do { try removeStagingChecked() } catch { return .failedClosed("leftover staging could not be removed: \(error)") }
                 return .nothingToDo
             }
             tx = read
@@ -498,23 +569,28 @@ extension AgentMailService {
         if let why = validate(tx) {
             return .failedClosed("\(transactionFileName) is invalid (\(why)); nothing was changed — inspect \(installDirectory.path)/agentmail and \(transactionFileName), then delete the metadata to abandon the transaction")
         }
-        let live = liveWrapperBytes()
+        let wrapperState = liveWrapperState()
+        if case .invalid(let why) = wrapperState {
+            return .failedClosed("the AgentMail wrapper path is invalid (\(why)); nothing was changed — inspect \(wrapperURL.path) and \(transactionURL.path), then delete \(transactionFileName) to abandon the transaction or restore the wrapper by hand")
+        }
+        let live: Data? = { if case .valid(let d) = wrapperState { return d }; return nil }()
         let liveHash = live.map(sha256Hex)
         let liveTarget = live.flatMap(wrapperTarget)
         let newBinaryPath = installDirectory.appendingPathComponent(tx.newBinary).path
 
         func cleanPreCommit() -> RepairOutcome {
-            deleteIfUnreferenced(tx.newBinary, liveTarget: liveTarget)
-            unlink(transactionURL.path)
-            removeStaging()
-            try? fsyncDir()
+            do {
+                try finishCleanup(deletePrevious: tx.newBinary, liveTarget: liveTarget)
+            } catch {
+                return .failedClosed("cleanup did not complete: \(error) — retry `briglia agentmail repair`")
+            }
             return .settled("the wrapper was never replaced; the previous installation is live and the new binary was removed")
         }
         func classifyCommitting() -> String {
-            // previous wrapper live (or absent on a fresh install) → pre-commit
+            // previous wrapper live (or ABSENT — never invalid — on a fresh install) → pre-commit
             if let prev = tx.previousWrapper {
                 if liveHash == prev.sha256 { return "pre" }
-            } else if live == nil {
+            } else if wrapperState == .absent {
                 return "pre"
             }
             if liveHash == tx.newWrapperSHA256, liveTarget == newBinaryPath { return "post" }
@@ -554,9 +630,22 @@ extension AgentMailService {
 
     /// Doctor's read-only view: nil when there is nothing to report.
     static func transactionReport() -> String? {
-        if installerLockBusy() { return "AgentMail installation in progress (another process holds the installer lock)" }
+        // Hold the installer lock (non-blocking) through the inspection so a
+        // live installer's half-written metadata is never read as a state
+        // (Codex, round 1). Doctor still never mutates.
+        let fd = open(lockURL.path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+        if fd >= 0 {
+            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                close(fd)
+                return "AgentMail installation in progress (another process holds the installer lock)"
+            }
+        }
+        defer { if fd >= 0 { close(fd) } }
         var st = stat()
-        guard lstat(transactionURL.path, &st) == 0 else { return nil }
+        guard lstat(transactionURL.path, &st) == 0 else {
+            let staging = ((try? FileManager.default.contentsOfDirectory(atPath: installDirectory.path)) ?? []).filter { $0.hasPrefix(stagingPrefix) }
+            return staging.isEmpty ? nil : "AgentMail staging debris left behind (\(staging.joined(separator: ", "))); run `briglia agentmail repair`"
+        }
         do {
             guard let tx = try readTransaction() else { return nil }
             if let why = validate(tx) {

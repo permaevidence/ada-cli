@@ -140,7 +140,23 @@ extension SelftestContext {
                 let after = r.recheckPoison()
                 check("child killed → re-check clears the poison and deletes the journal", after == nil && !FileManager.default.fileExists(atPath: jpath), "\(String(describing: after))")
             }
+            // Leader exits, descendant survives (apt/dpkg after sudo): must fail closed.
+            let jpath3 = tempDir("die3").appendingPathComponent("journal.json").path
+            let status3 = spawnAndWait([selfPath, "__quicksetup-selftest", "--job-then-die"],
+                                       env: ["BRIGLIA_SELFTEST_JOURNAL": jpath3, "BRIGLIA_SELFTEST_DIE_AFTER_RELEASE": "1",
+                                             "BRIGLIA_SELFTEST_DIE_DELAY": "0.3", "BRIGLIA_SELFTEST_JOB_CMD": "sleep 60 & sleep 1; exit 0"])
+            try? await Task.sleep(nanoseconds: 1_800_000_000)   // the leader has exited by now; the sleep lives on
+            SetupJobRunner.journalURLOverride = URL(fileURLWithPath: jpath3)
+            let r3 = fresh()
+            let poison3 = SetupJobRunner.inheritLeftoverJournal(into: r3)
+            check("journaled leader gone but a descendant survives in its group → poisoned (fail closed)", status3 != 0 && poison3 != nil && (poison3?.survivors.contains { $0.note == "group member" } ?? false), "\(String(describing: poison3))")
+            if let poison3 {
+                for s in poison3.survivors { kill(s.pid, SIGKILL) }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                check("descendant killed → re-check clears", r3.recheckPoison() == nil)
+            }
             // Unreadable journal → treated as alive.
+            SetupJobRunner.journalURLOverride = URL(fileURLWithPath: jpath)
             try "not json".write(toFile: jpath, atomically: true, encoding: .utf8)
             let r2 = fresh()
             let unreadable = SetupJobRunner.inheritLeftoverJournal(into: r2)
@@ -287,6 +303,8 @@ enum SelftestSubprocess {
         let marker = env["BRIGLIA_SELFTEST_MARKER"] ?? "/dev/null"
         if let j = env["BRIGLIA_SELFTEST_JOURNAL"] { SetupJobRunner.journalURLOverride = URL(fileURLWithPath: j) }
         let afterRelease = env["BRIGLIA_SELFTEST_DIE_AFTER_RELEASE"] == "1"
+        let delay = Double(env["BRIGLIA_SELFTEST_DIE_DELAY"] ?? "") ?? 0.5
+        let jobCommand = env["BRIGLIA_SELFTEST_JOB_CMD"] ?? (afterRelease ? "sleep 60" : "touch '\(marker)'")
         let runner = SetupJobRunner()
         if !afterRelease {
             // A process-directed SIGKILL may land on another thread first;
@@ -295,10 +313,10 @@ enum SelftestSubprocess {
             SetupJobRunner.onJournalPersisted = { _ in kill(getpid(), SIGKILL); while true { sleep(10) } }
         } else {
             SetupJobRunner.onJournalPersisted = { _ in
-                Thread.detachNewThread { Thread.sleep(forTimeInterval: 0.5); kill(getpid(), SIGKILL) }
+                Thread.detachNewThread { Thread.sleep(forTimeInterval: delay); kill(getpid(), SIGKILL) }
             }
         }
-        _ = await runner.run(.init(row: "t", command: ["/bin/sh", "-c", afterRelease ? "sleep 60" : "touch '\(marker)'"],
+        _ = await runner.run(.init(row: "t", command: ["/bin/sh", "-c", jobCommand],
                                    mode: .detached, timeout: 120, label: "die"))
     }
 

@@ -20,7 +20,8 @@
       { id: 'openrouter', label: 'OpenRouter key', purpose: 'Alternative provider (saved, not active).', url: 'https://openrouter.ai/keys', urlText: 'openrouter.ai' },
       { id: 'custom_key', label: 'Custom endpoint key', purpose: 'Any OpenAI-compatible server. Needs the base URL and model below.' },
       { id: 'custom_base', label: 'Custom endpoint base URL', purpose: 'e.g. https://my-server.example/v1', plain: true },
-      { id: 'custom_model', label: 'Custom endpoint model', purpose: 'The model id the server expects', plain: true }
+      { id: 'custom_model', label: 'Custom endpoint model', purpose: 'The model id the server expects', plain: true },
+      { id: 'custom_vision', label: 'Custom endpoint can see images', purpose: 'Leave off unless you know the model accepts image input (text-only is the safe default).', checkbox: true }
     ]
   };
 
@@ -91,6 +92,14 @@
       wrap.appendChild(row);
       return wrap;
     }
+    if (f.checkbox) {
+      var crow = el('div', 'row');
+      var cb = el('input'); cb.type = 'checkbox'; cb.id = 'f-' + f.id; cb.checked = !!state.values[f.id];
+      cb.addEventListener('change', function () { state.values[f.id] = cb.checked; });
+      crow.appendChild(cb);
+      wrap.appendChild(crow);
+      return wrap;
+    }
     var row2 = el('div', 'row');
     var input = el('input');
     input.type = f.plain ? 'text' : 'password';
@@ -119,7 +128,7 @@
   }
 
   function keptFor(fieldId) {
-    var map = { telegram_token: 'telegram', telegram_chat: 'telegram', custom_key: 'custom', custom_base: 'custom', custom_model: 'custom' };
+    var map = { telegram_token: 'telegram', telegram_chat: 'telegram', custom_key: 'custom', custom_base: 'custom', custom_model: 'custom', custom_vision: 'custom' };
     var k = map[fieldId] || fieldId;
     return state.kept.indexOf(k) >= 0 ? k : null;
   }
@@ -172,7 +181,7 @@
     else {
       var ck = state.values.custom_key || '', cb = state.values.custom_base || '', cm = state.values.custom_model || '';
       if (ck || cb || cm) {
-        if (ck && cb && cm) req.custom = { api_key: ck, base_url: cb, model: cm, vision: true };
+        if (ck && cb && cm) req.custom = { api_key: ck, base_url: cb, model: cm, vision: !!state.values.custom_vision };
         else missing.push('custom endpoint (key, base URL and model together)');
       }
     }

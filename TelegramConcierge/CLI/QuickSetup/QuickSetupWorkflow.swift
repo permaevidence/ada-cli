@@ -92,7 +92,9 @@ struct QuickSetupRequest: Equatable {
                 values[field] = .telegram(token: try str("token"), chatId: try str("chat_id"))
             case .custom:
                 guard keys.isSubset(of: ["api_key", "base_url", "model", "vision"]) else { throw BadRequest(description: "custom: unknown key") }
-                let vision = entry["vision"] as? Bool ?? true
+                // Conservative like the terminal wizard: an unknown endpoint is
+                // text-only unless the page's checkbox says it can see images.
+                let vision = entry["vision"] as? Bool ?? false
                 values[field] = .custom(key: try str("api_key"), baseURL: try str("base_url"), model: try str("model"), vision: vision)
             default:
                 guard keys.isSubset(of: ["value"]) else { throw BadRequest(description: "\(field.rawValue): unknown key") }
@@ -137,7 +139,7 @@ struct QuickSetupEnvironment {
             args: ["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"], timeoutSeconds: 10)
         #endif
     }
-    var keepAwakeHeld: () -> Bool = { KeepAwake.isHeld && (KeepAwake.assertionListedBySystem() ?? true) }
+    var keepAwakeHeld: () -> Bool = { KeepAwake.isHeld && (KeepAwake.assertionListedBySystem(reason: KeepAwake.defaultReason) ?? true) }
     var autoSuspendVerdict: () -> AutoSuspendCensus.Verdict = {
         #if os(Linux)
         return PermissionsService.autoSuspendVerdict()
@@ -173,9 +175,11 @@ struct QuickSetupEnvironment {
     // Linux service
     var installUnit: () throws -> Void = QuickSetupEnvironment.defaultInstallUnit
     var enableService: (SetupJobRunner) async -> String? = QuickSetupEnvironment.defaultEnableService
-    var serviceEvidence: () -> (ok: Bool, linger: Bool, detail: String) = {
+    /// Async so the 20-second stability window never blocks the workflow
+    /// actor (a blocked actor could not observe Enter's revocation).
+    var serviceEvidence: () async -> (ok: Bool, linger: Bool, detail: String) = {
         #if os(Linux)
-        let e = QuickSetupEvidence.serviceEvidence()
+        let e = await QuickSetupEvidence.serviceEvidence()
         return (e.ok, e.linger, e.detail)
         #else
         return (false, false, "no service on macOS")
@@ -203,7 +207,8 @@ struct QuickSetupEnvironment {
         let serviceMarker = StoragePaths.dataRoot.appendingPathComponent(".stub-service-started").path
         let fm = FileManager.default
         env.fullDiskAccessGranted = { ProcessInfo.processInfo.environment["BRIGLIA_DEV_STUB_FDA"] != "0" }
-        env.keepAwakeHeld = { true }
+        // keepAwakeHeld stays REAL: the headless/browser runs prove the
+        // assertion quick setup holds is the one the row verifies (macOS).
         env.autoSuspendVerdict = { .sleepImpossible }
         env.agentMailInstalled = { true }
         env.toolchainStatus = {
@@ -228,6 +233,9 @@ struct QuickSetupEnvironment {
         let missing = Set(status.mandatoryMissing)
         let python = ToolchainService.python3Path()
         let pipPackages = ["python-docx", "python-pptx", "pillow", "pymupdf", "formulas", "openpyxl"].filter { missing.contains($0) }
+        // `--break-system-packages` only where pip knows it (pip ≥ 23.1;
+        // Ubuntu 22.04 ships 22.0 and rejects the option outright).
+        let pipArgs = ["-m", "pip", "install"] + (python.map { ToolchainService.pipBreakSystemPackagesSupported(python: $0) } == true ? ["--break-system-packages"] : [])
         #if os(macOS)
         guard let brew = ToolchainService.brewPath() else { return [] }
         var formulas: [String] = []
@@ -240,7 +248,7 @@ struct QuickSetupEnvironment {
         }
         if let python {
             for p in pipPackages {
-                jobs.append(.init(row: "toolchain", command: [python, "-m", "pip", "install", "--break-system-packages", p],
+                jobs.append(.init(row: "toolchain", command: [python] + pipArgs + [p],
                                   mode: .detached, timeout: 300, label: "pip install \(p)"))
             }
         }
@@ -265,7 +273,7 @@ struct QuickSetupEnvironment {
         }
         if let python {
             for p in pipPackages {
-                jobs.append(.init(row: "toolchain", command: [python, "-m", "pip", "install", "--break-system-packages", p],
+                jobs.append(.init(row: "toolchain", command: [python] + pipArgs + [p],
                                   mode: .detached, timeout: 300, label: "pip install \(p)"))
             }
         }
@@ -336,10 +344,15 @@ actor QuickSetupWorkflow {
 
     // Authorization
     private(set) var generation = 1
-    private var token: String
+    /// nil after a rotation whose randomness failed: nothing can exchange.
+    private var token: String?
     private var tokenIssuedAt = Date()
     private var tokenUsed = false
     private var cookie: String
+    /// Operations of the current generation still executing (verify, save,
+    /// system run, finish): rotation and the wizard handoff wait for them
+    /// to unwind at their next checkpoint before proceeding.
+    private var inFlight = 0
     private(set) var consumedByOther = false
     static let tokenLifetime: TimeInterval = 300
     nonisolated(unsafe) static var clock: () -> Date = { Date() }
@@ -385,7 +398,11 @@ actor QuickSetupWorkflow {
         }
     }
 
+    /// Selftest seam: simulate RNG failure.
+    nonisolated(unsafe) static var randomHexFails = false
+
     static func randomHex() -> String? {
+        if randomHexFails { return nil }
         var bytes = [UInt8](repeating: 0, count: 16)
         #if os(Linux)
         // The Glibc module does not export getrandom(2); /dev/urandom is
@@ -423,12 +440,13 @@ actor QuickSetupWorkflow {
 
     // MARK: Authorization (§5.2)
 
-    var launchToken: String { token }
+    /// The live launch token; empty when none can be issued (RNG failure).
+    var launchToken: String { token ?? "" }
     var currentCookie: String { cookie }
 
     /// `GET /start?t=`: single use, 5-minute lifetime, current generation.
     func exchange(token candidate: String) -> String? {
-        guard !tokenUsed, candidate == token, Self.clock().timeIntervalSince(tokenIssuedAt) <= Self.tokenLifetime else {
+        guard let token, !tokenUsed, candidate == token, Self.clock().timeIntervalSince(tokenIssuedAt) <= Self.tokenLifetime else {
             if candidate == token && tokenUsed { consumedByOther = true }
             return nil
         }
@@ -436,10 +454,31 @@ actor QuickSetupWorkflow {
         return cookie
     }
 
-    func authorized(cookie candidate: String?) -> Bool {
-        guard let candidate else { return false }
-        return candidate == cookie
+    /// Atomic authorization: the cookie check and the generation it
+    /// authorizes are one actor call, so a rotation between "cookie is
+    /// current" and "which generation" cannot hand an old cookie the new
+    /// generation.
+    func authorizedGeneration(cookie candidate: String?) -> Int? {
+        guard let candidate, candidate == cookie else { return nil }
+        return generation
     }
+
+    func authorized(cookie candidate: String?) -> Bool { authorizedGeneration(cookie: candidate) != nil }
+
+    private func beginOperation() { inFlight += 1 }
+    private func endOperation() { inFlight -= 1 }
+
+    /// Wait (bounded) until every operation of the revoked generation has
+    /// unwound at its next checkpoint. Row and finish tasks are awaited by
+    /// the caller separately.
+    private func settleInFlight() async {
+        var waited = 0
+        while inFlight > 0, waited < 600 {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            waited += 1
+        }
+    }
+    var inFlightOperations: Int { inFlight }
 
     func checkpoint(_ g: Int) throws {
         if g != generation { throw Superseded() }
@@ -447,7 +486,14 @@ actor QuickSetupWorkflow {
 
     /// Enter in the terminal: revoke, cancel + reap the running job, mint.
     /// Returns the poison state if reaping could not be confirmed.
-    func rotate() async -> SetupJobRunner.Poison? {
+    struct RotationResult {
+        var poison: SetupJobRunner.Poison?
+        /// Fresh randomness could not be obtained: the old authorization is
+        /// revoked and NO new link exists (the command must report it).
+        var randomnessFailed = false
+    }
+
+    func rotate() async -> RotationResult {
         generation += 1   // (1) revoke: every checkpoint of the old generation now throws
         generationBox.set(generation)
         let hadJob = runner.currentJob != nil
@@ -457,13 +503,20 @@ actor QuickSetupWorkflow {
         let poison = await runner.cancelRunning()  // (2) confirmed reaping or poison
         if let t = rowTask { await t.value }
         if let t = finishTask { await t.value }
-        // (4) mint
-        token = Self.randomHex() ?? token
-        cookie = Self.randomHex() ?? cookie
+        await settleInFlight()                     // (3) suspended operations unwound
+        // (4) mint — or abort: never reuse the revoked token/cookie.
+        guard let newToken = Self.randomHex(), let newCookie = Self.randomHex() else {
+            token = nil
+            cookie = ""
+            tokenUsed = true
+            return RotationResult(poison: poison, randomnessFailed: true)
+        }
+        token = newToken
+        cookie = newCookie
         tokenIssuedAt = Self.clock()
         tokenUsed = false
         consumedByOther = false
-        return poison
+        return RotationResult(poison: poison)
     }
 
     // MARK: Status
@@ -530,6 +583,7 @@ actor QuickSetupWorkflow {
 
     func verify(_ request: QuickSetupRequest, generation g: Int) async throws -> (Int, [String: Any]) {
         try checkpoint(g)
+        beginOperation(); defer { endOperation() }
         guard [.intro, .verified, .verifying].contains(phase) else { return (409, ["error": "phase", "phase": phase.rawValue]) }
         if let why = validateKept(request) { return (409, ["error": "kept", "message": why]) }
         phase = .verifying
@@ -624,6 +678,7 @@ actor QuickSetupWorkflow {
 
     func save(_ request: QuickSetupRequest, generation g: Int) async throws -> (Int, [String: Any]) {
         try checkpoint(g)
+        beginOperation(); defer { endOperation() }
         guard phase == .verified || phase == .saving else { return (409, ["error": "phase", "phase": phase.rawValue]) }
         if let why = validateKept(request) { return (409, ["error": "kept", "message": why]) }
         // Digest equality for every non-kept field.
@@ -988,13 +1043,15 @@ actor QuickSetupWorkflow {
                 if let failure = await env.enableService(runner) { fail(id, failure); return }
                 setStep(id, "ok")
             case "service":
-                let ev = env.serviceEvidence()
+                let ev = await env.serviceEvidence()
+                guard alive() else { return }
                 guard ev.ok else { fail(id, ev.detail); return }
                 setStep(id, "ok", detail: ev.detail)
             case "recheck":
                 if let why = nonServiceRegression() { fail(id, why); return }
                 if env.isLinux {
-                    let ev = env.serviceEvidence()
+                    let ev = await env.serviceEvidence()
+                    guard alive() else { return }
                     guard ev.ok else { fail(id, "service: \(ev.detail)"); return }
                 }
                 for key in [ProviderProfiles.opencodeApiKeyKey, KeychainHelper.openAITranscriptionApiKeyKey, KeychainHelper.serperApiKeyKey,
@@ -1026,10 +1083,18 @@ actor QuickSetupWorkflow {
         return (200, ["poisoned": NSNull()])
     }
 
-    func stepByStep(generation g: Int) throws -> (Int, [String: Any]) {
+    func stepByStep(generation g: Int) async throws -> (Int, [String: Any]) {
         try checkpoint(g)
         if let poison = runner.currentPoison { return (409, ["error": "poisoned", "poisoned": poisonDict(poison)]) }
         if runner.currentJob != nil || rowTask != nil || finishTask != nil { return (409, ["error": "busy"]) }
+        // Revoke the page's authorization and let any in-flight verify/save
+        // unwind before the wizard takes the terminal.
+        generation += 1
+        generationBox.set(generation)
+        token = nil
+        cookie = ""
+        tokenUsed = true
+        await settleInFlight()
         wizardRequested = true
         return (200, ["message": "continue in the terminal"])
     }

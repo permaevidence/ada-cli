@@ -288,6 +288,70 @@ extension SelftestContext {
             unlink(dir.appendingPathComponent("agentmail.tx.json").path)
             check("validBasename rules", AgentMailService.validBasename("agentmail-bin") && AgentMailService.validBasename(v1name) && !AgentMailService.validBasename("agentmail") && !AgentMailService.validBasename("agentmail-bin-x-zz") && !AgentMailService.validBasename("../x") && !AgentMailService.validBasename(""))
         }
+        // Wrapper state: absent | valid | invalid — never conflated.
+        do {
+            dir = freshDir()
+            symlink("/etc/hosts", dir.appendingPathComponent("agentmail").path)
+            check("wrapper state: symlink → invalid", { if case .invalid = AgentMailService.liveWrapperState() { return true }; return false }())
+            useFixture(v1)
+            failure = await AgentMailService.installAgentMailBinary()
+            var st2 = stat()
+            let stillLink = lstat(dir.appendingPathComponent("agentmail").path, &st2) == 0 && (st2.st_mode & S_IFMT) == S_IFLNK
+            check("install refuses to overwrite an invalid agentmail entry (symlink kept, no metadata)", (failure ?? "").contains("refusing") && stillLink && txState(dir) == nil, failure ?? "")
+            unlink(dir.appendingPathComponent("agentmail").path)
+            check("wrapper state: absent", AgentMailService.liveWrapperState() == .absent)
+            // A transaction with the wrapper turned into a symlink mid-way → repair fails closed.
+            useFixture(v1)
+            _ = await AgentMailService.installAgentMailBinary()
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: selfPath)
+            p.arguments = ["__quicksetup-selftest", "--agentmail-crash", "after-committing", "--dir", dir.path, "--fixture", v2.archive.path, "--sums", v2.sums.path]
+            var env = ProcessInfo.processInfo.environment
+            env["BRIGLIA_SELFTEST_AM_VERSION"] = "2.0.0"
+            p.environment = env
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            try p.run(); p.waitUntilExit()
+            unlink(dir.appendingPathComponent("agentmail").path)
+            symlink("/etc/hosts", dir.appendingPathComponent("agentmail").path)
+            let hashBefore = dirHash(dir)
+            let outcome = await AgentMailService.repairTransaction()
+            check("repair with a symlinked wrapper under committing → fails closed, nothing deleted", { if case .failedClosed(let why) = outcome { return why.contains("invalid") }; return false }() && dirHash(dir) == hashBefore && txState(dir) == "committing", "\(outcome)")
+            check("doctor reports the interrupted transaction", (AgentMailService.transactionReport() ?? "").contains("interrupted"))
+            unlink(dir.appendingPathComponent("agentmail").path)
+            let missingPrevOutcome = await AgentMailService.repairTransaction()
+            check("an ABSENT wrapper where a previous one is recorded matches neither → fails closed", { if case .failedClosed = missingPrevOutcome { return true }; return false }())
+            // Fresh transaction (no previous wrapper): absent IS pre-commit.
+            dir = freshDir()
+            let p2 = Process()
+            p2.executableURL = URL(fileURLWithPath: selfPath)
+            p2.arguments = ["__quicksetup-selftest", "--agentmail-crash", "after-committing", "--dir", dir.path, "--fixture", v1.archive.path, "--sums", v1.sums.path]
+            p2.environment = ProcessInfo.processInfo.environment
+            p2.standardOutput = FileHandle.nullDevice; p2.standardError = FileHandle.nullDevice
+            try p2.run(); p2.waitUntilExit()
+            let absentOutcome = await AgentMailService.repairTransaction()
+            check("fresh transaction: an ABSENT wrapper (not an invalid one) classifies as pre-commit; repair settles to no installation", { if case .settled = absentOutcome { return true }; return false }() && txState(dir) == nil && entries(dir).isEmpty, "\(absentOutcome) \(entries(dir))")
+        }
+        // Cleanup and barrier failures are retryable, never silent success.
+        do {
+            dir = freshDir()
+            useFixture(v1)
+            _ = await AgentMailService.installAgentMailBinary()
+            useFixture(v2)
+            AgentMailService.injectFsyncFailure = true
+            failure = await AgentMailService.installAgentMailBinary()
+            AgentMailService.injectFsyncFailure = false
+            check("directory-barrier failure after verification → retryable failure, new pair live, metadata kept", (failure ?? "").contains("cleanup did not complete") && wrapperAnswers(dir, "2.0.0") && txState(dir) != nil, failure ?? "")
+            check("doctor reports it", (AgentMailService.transactionReport() ?? "").contains("interrupted"))
+            let settled = await AgentMailService.repairTransaction()
+            check("repair settles once the barrier works: no metadata, previous binary gone", { if case .settled = settled { return true }; return false }() && txState(dir) == nil && entries(dir) == ["agentmail", v2name], "\(settled) \(entries(dir))")
+            useFixture(v1)
+            AgentMailService.injectStagingRemovalFailure = true
+            failure = await AgentMailService.installAgentMailBinary()
+            AgentMailService.injectStagingRemovalFailure = false
+            check("staging-removal failure → retryable failure, staging debris reported by doctor", (failure ?? "").contains("cleanup did not complete") && (AgentMailService.transactionReport() ?? "").contains("interrupted"), failure ?? "")
+            let settled2 = await AgentMailService.repairTransaction()
+            check("repair removes the debris", { if case .settled = settled2 { return true }; return false }() && !entries(dir).contains { $0.hasPrefix(".agentmail-staging") } && txState(dir) == nil, "\(settled2) \(entries(dir))")
+        }
         // Locks.
         do {
             dir = freshDir()

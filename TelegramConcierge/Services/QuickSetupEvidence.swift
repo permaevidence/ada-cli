@@ -41,7 +41,9 @@ enum QuickSetupEvidence {
         var mount: String
         var freeBytes: Int64
         var floorBytes: Int64
-        var ok: Bool { freeBytes >= floorBytes }
+        /// statvfs failed for this destination: never silently omitted.
+        var unreadable = false
+        var ok: Bool { !unreadable && freeBytes >= floorBytes }
     }
 
     /// Selftest seam: (path) → (deviceID, mount, freeBytes); nil = statvfs failed.
@@ -68,8 +70,12 @@ enum QuickSetupEvidence {
         struct Agg { var paths: [String]; var mount: String; var free: Int64; var floor: Int64 }
         var byDevice: [UInt64: Agg] = [:]
         var order: [UInt64] = []
+        var unreadable: [DiskCheck] = []
         for (path, floor) in targets {
-            guard let info = statInfo(path) else { continue }
+            guard let info = statInfo(path) else {
+                unreadable.append(DiskCheck(path: path, mount: "?", freeBytes: 0, floorBytes: floor, unreadable: true))
+                continue
+            }
             if var agg = byDevice[info.device] {
                 agg.paths.append(path)
                 agg.floor += floor
@@ -79,7 +85,7 @@ enum QuickSetupEvidence {
                 order.append(info.device)
             }
         }
-        return order.compactMap { dev in
+        return unreadable + order.compactMap { dev in
             guard let agg = byDevice[dev] else { return nil }
             return DiskCheck(path: agg.paths.joined(separator: ", "), mount: agg.mount, freeBytes: agg.free, floorBytes: agg.floor)
         }
@@ -161,14 +167,14 @@ enum QuickSetupEvidence {
     nonisolated(unsafe) static var lingerOverride: (() -> Bool)?
     nonisolated(unsafe) static var isActiveOverride: (() -> String)?
 
-    static func serviceEvidence() -> ServiceEvidence {
+    static func serviceEvidence() async -> ServiceEvidence {
         let active = (isActiveOverride?() ?? AgentServiceSupport.run("systemctl", ["--user", "is-active", AgentServiceSupport.userUnitName]).output) == "active"
         let linger = lingerOverride?() ?? AgentServiceSupport.lingerEnabled()
         guard active else { return ServiceEvidence(active: false, linger: linger, handshake: false, stable: false, detail: "service is not active") }
         guard linger else { return ServiceEvidence(active: true, linger: false, handshake: false, stable: false, detail: "start at boot not confirmed enabled (linger)") }
         guard socketHandshake() else { return ServiceEvidence(active: true, linger: true, handshake: false, stable: false, detail: "the app socket did not answer the hello (the poller is not up)") }
         let before = systemctlShowOverride?() ?? AgentServiceSupport.run("systemctl", ["--user", "show", "-p", "NRestarts", "-p", "ActiveEnterTimestamp", AgentServiceSupport.userUnitName]).output
-        Thread.sleep(forTimeInterval: stabilityWindow)
+        try? await Task.sleep(nanoseconds: UInt64(stabilityWindow * 1_000_000_000))
         let after = systemctlShowOverride?() ?? AgentServiceSupport.run("systemctl", ["--user", "show", "-p", "NRestarts", "-p", "ActiveEnterTimestamp", AgentServiceSupport.userUnitName]).output
         guard before == after else { return ServiceEvidence(active: true, linger: true, handshake: true, stable: false, detail: "the service restarted within the stability window (\(after))") }
         guard socketHandshake() else { return ServiceEvidence(active: true, linger: true, handshake: true, stable: false, detail: "the app socket stopped answering during the stability window") }
@@ -258,7 +264,7 @@ enum QuickSetupEvidence {
     }
 
     private static func diskDict(_ c: DiskCheck) -> [String: Any] {
-        ["path": c.path, "mount": c.mount, "free_bytes": c.freeBytes, "floor_bytes": c.floorBytes, "ok": c.ok]
+        ["path": c.path, "mount": c.mount, "free_bytes": c.freeBytes, "floor_bytes": c.floorBytes, "ok": c.ok, "unreadable": c.unreadable]
     }
 
     #if os(macOS)

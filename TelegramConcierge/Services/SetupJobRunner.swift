@@ -353,12 +353,23 @@ final class SetupJobRunner: @unchecked Sendable {
         let ids = identities.map { ManagedPlaywright.ProcessGroups.Identity(pid: $0.pid, startTime: $0.startTime) }
         if let alive = ManagedPlaywright.ProcessGroups.stillAlive(ids) {
             var survivors = identities.filter { s in alive.contains { $0.pid == s.pid && $0.startTime == s.startTime } }
-            // Other members of the group count only while the recorded
-            // leader itself is still that process: once the leader (sudo,
-            // brew, the shell) is proven gone, a pid/pgid reused by an
-            // unrelated process must not read as a survivor.
-            if !survivors.isEmpty, pgid > 0, let members = ManagedPlaywright.ProcessGroups.members(of: pgid) {
-                for m in members where !m.zombie && !survivors.contains(where: { $0.pid == m.identity.pid }) {
+            // Descendants FAIL CLOSED (Codex, round 1): apt/dpkg/brew can
+            // outlive the journaled leader (sudo, the shell). Every live
+            // member of the recorded group that started no earlier than the
+            // leader is a survivor, leader alive or not; an unrelated process
+            // that reused the pgid after a reboot is excluded by the boot id,
+            // and one that reused it within the boot is reported and needs
+            // explicit recovery rather than being silently cleared.
+            if pgid > 0, let members = ManagedPlaywright.ProcessGroups.members(of: pgid) {
+                let leader = identities.first
+                let leaderStart = leader?.startTime ?? 0
+                for m in members where !m.zombie && m.identity.startTime >= leaderStart
+                    && !survivors.contains(where: { $0.pid == m.identity.pid }) {
+                    // The leader's own pid with a different start time is the
+                    // leader SLOT reused by an unrelated process (only the
+                    // leader can have pid == pgid): identity says gone.
+                    // Any other member is a descendant that outlived it.
+                    if m.identity.pid == pgid, let leader, m.identity.startTime != leader.startTime { continue }
                     survivors.append(Survivor(pid: m.identity.pid, startTime: m.identity.startTime, note: "group member"))
                 }
             }
