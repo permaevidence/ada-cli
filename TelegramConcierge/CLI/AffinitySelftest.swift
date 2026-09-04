@@ -115,6 +115,24 @@ struct AffinitySelftest: AsyncParsableCommand {
         print("\n2. Derivation and decoration")
         SessionAffinity.resetProcessStateForTests()
         check("no state file before the first request", !FileManager.default.fileExists(atPath: file.path))
+        // Fresh root (the data directory itself does not exist yet): doctor
+        // says "not created yet" and nothing else; no enumeration false alarm
+        // (Codex round 2).
+        check("fresh root: data directory absent", !FileManager.default.fileExists(atPath: dataRoot.path))
+        let freshDoctor = SessionAffinity.doctorFindings(activeBaseURL: "https://opencode.ai/zen/go/v1")
+        check("fresh root: doctor reports 'not created yet' with no problem and no enumeration finding",
+              freshDoctor.contains { $0.text.contains("not created yet") } && !freshDoctor.contains { $0.problem }
+              && !freshDoctor.contains { $0.text.contains("enumerate") }, freshDoctor.map(\.text).joined(separator: " | "))
+        if case .success(let fresh) = SessionAffinity.corruptFilesChecked() {
+            check("fresh root: zero quarantined files, not a failure", fresh.isEmpty)
+        } else {
+            check("fresh root: zero quarantined files, not a failure", false, "returned .failure")
+        }
+        check("fresh root: doctor is read-only (no data directory created)", !FileManager.default.fileExists(atPath: dataRoot.path))
+        check("fresh root: wipe on a never-started install reports no failures", SessionAffinity.deleteForUserDataWipe().isEmpty)
+        let afterFreshWipe = (try? FileManager.default.contentsOfDirectory(atPath: dataRoot.path)) ?? []
+        check("fresh root: wipe leaves at most the lock file behind, never a state file",
+              afterFreshWipe.allSatisfy { $0 == SessionAffinity.lockName }, "\(afterFreshWipe)")
         let state = try SessionAffinity.loadState()
         check("state minted: version 1, 32-byte salt, UUID main ID",
               state.version == 1 && state.saltBytes?.count == 32 && UUID(uuidString: state.mainConversationId) != nil)

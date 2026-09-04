@@ -501,6 +501,11 @@ enum SessionAffinity {
     /// is a result, never an empty list (wipe and doctor report it).
     static func corruptFilesChecked() -> Result<[String], Error> {
         let dir = fileURL.deletingLastPathComponent()
+        // A data root that does not exist yet (fresh install, before the first
+        // start) holds zero quarantined files; only a directory that exists
+        // but cannot be listed is a failure (Codex round 2).
+        var st = stat()
+        if lstat(dir.path, &st) != 0 && errno == ENOENT { return .success([]) }
         do {
             let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             return .success(names.filter { $0.hasPrefix(corruptPrefix) }.sorted())
