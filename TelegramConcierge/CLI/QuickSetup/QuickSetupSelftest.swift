@@ -782,8 +782,9 @@ final class SelftestContext: @unchecked Sendable {
         check("Linux without pip → distribution hint", refusal({ QuickSetupPreflight.pythonOverride = .init(present: true, pipOK: false) }, isLinux: true).contains("python3-pip"))
         check("Linux without a systemd user session → use briglia setup", refusal({ QuickSetupPreflight.systemdSessionOverride = false }, isLinux: true).contains("systemd user service"))
         check("disk below floor → names the mount and the numbers", refusal({ QuickSetupEvidence.statvfsOverride = { _ in (1, "/", 1 * QuickSetupEvidence.gb) } }, isLinux: false).contains("free on /"))
+        let home = NSHomeDirectory()
         check("disk information unreadable for a destination → refusal naming it (never silently omitted)",
-              refusal({ QuickSetupEvidence.statvfsOverride = { path in path.hasPrefix("/private/tmp") ? nil : (1, "/", 100 * QuickSetupEvidence.gb) } }, isLinux: false).contains("cannot read the free space on /private/tmp"))
+              refusal({ QuickSetupEvidence.statvfsOverride = { path in path == home ? nil : (1, "/", 100 * QuickSetupEvidence.gb) } }, isLinux: false).contains("cannot read the free space on \(home)"))
         check("all clear → no refusal", refusal({}, isLinux: false).isEmpty)
         check("all clear (Linux) → no refusal", refusal({}, isLinux: true).isEmpty)
         // Second instance: the session lock.
