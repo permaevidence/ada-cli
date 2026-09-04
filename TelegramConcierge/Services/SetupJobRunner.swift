@@ -353,7 +353,11 @@ final class SetupJobRunner: @unchecked Sendable {
         let ids = identities.map { ManagedPlaywright.ProcessGroups.Identity(pid: $0.pid, startTime: $0.startTime) }
         if let alive = ManagedPlaywright.ProcessGroups.stillAlive(ids) {
             var survivors = identities.filter { s in alive.contains { $0.pid == s.pid && $0.startTime == s.startTime } }
-            if pgid > 0, let members = ManagedPlaywright.ProcessGroups.members(of: pgid) {
+            // Other members of the group count only while the recorded
+            // leader itself is still that process: once the leader (sudo,
+            // brew, the shell) is proven gone, a pid/pgid reused by an
+            // unrelated process must not read as a survivor.
+            if !survivors.isEmpty, pgid > 0, let members = ManagedPlaywright.ProcessGroups.members(of: pgid) {
                 for m in members where !m.zombie && !survivors.contains(where: { $0.pid == m.identity.pid }) {
                     survivors.append(Survivor(pid: m.identity.pid, startTime: m.identity.startTime, note: "group member"))
                 }

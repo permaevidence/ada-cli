@@ -73,6 +73,38 @@ referenced version, unreferenced ones (never deleted automatically) and the
 last bootstrap outcome. The browser itself is still downloaded by Playwright's
 own installer on first use. Entries you edit by hand are left alone.
 
+## Quick setup (the local page)
+
+`briglia quicksetup` serves a setup page from the `briglia` process itself
+on `127.0.0.1` (ephemeral port) and opens it in your browser. Keys go from
+the page to that process, are sent by it to their providers for
+verification, and are stored in `secrets.json`; they never go to briglia.dev
+or to any host Briglia does not already talk to. The link printed in the
+terminal carries a single-use exchange token (five-minute lifetime) that
+turns into an HttpOnly, SameSite=Strict session cookie; pressing Enter in the
+terminal revokes every earlier token and cookie and prints a new link.
+Requests are accepted only with the exact `Host`, a same-origin `Origin`, a
+custom header no cross-site form can send, and that cookie; the page has no
+inline scripts, no storage, and a strict Content-Security-Policy.
+
+What this does not protect against, stated plainly: a process running as the
+**same user** can already read `secrets.json`, so the server grants it
+nothing new. Root can capture loopback traffic and read everything anyway.
+**Another local account** can reach the port and can, for the few
+milliseconds the link is on the browser opener's argument list, read the
+exchange token; if it uses it first it obtains a cookie until you press
+Enter, and the terminal tells you that the link was already used by
+something else. Report that as a finding on your machine, not as a Briglia
+vulnerability.
+
+The system steps (package installs, service start) run as journaled child
+processes with a start gate: a child's process-group identity is verified and
+recorded durably before it executes, and a step whose processes cannot be
+confirmed gone after cancellation blocks every further step until you
+recover explicitly. `briglia doctor` reports an interrupted AgentMail install
+transaction; only `briglia agentmail repair` (or quick setup's own preflight)
+settles it.
+
 ## Self-tests and release builds
 
 Release binaries refuse the internal migration-run entry point that the

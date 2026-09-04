@@ -63,6 +63,7 @@ final class QuickSetupHTTPServer: @unchecked Sendable {
     private var active = 0
     private(set) var lastActivity = Date()
     private var stopped = false
+    var activeConnections: Int { lock.lock(); defer { lock.unlock() }; return active }
 
     init(handler: @escaping (Request) async -> Response) {
         self.handler = handler
@@ -137,14 +138,18 @@ final class QuickSetupHTTPServer: @unchecked Sendable {
             var noSigpipe: Int32 = 1
             _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
             #endif
-            Task.detached { [self] in
-                await serve(fd)
+            // One plain thread per connection: the socket reads block in
+            // poll(2), and a stalled peer must never occupy a cooperative
+            // thread (16 stalled connections would otherwise starve the
+            // workflow actor and the handler itself).
+            Thread.detachNewThread { [self] in
+                serve(fd)
                 lock.lock(); active -= 1; lock.unlock()
             }
         }
     }
 
-    private func serve(_ fd: Int32) async {
+    private func serve(_ fd: Int32) {
         defer { close(fd) }
         var buffer = Data()
         let headStart = Date()
@@ -180,7 +185,15 @@ final class QuickSetupHTTPServer: @unchecked Sendable {
         if body.count > request.contentLength { body = body.prefix(request.contentLength) }
         request.body = body
         lock.lock(); lastActivity = Date(); lock.unlock()
-        let response = await handler(request)
+        // Bridge to the async handler (the workflow actor) from this thread.
+        let done = DispatchSemaphore(value: 0)
+        var response = Response(status: 500)
+        let handler = self.handler
+        Task.detached {
+            response = await handler(request)
+            done.signal()
+        }
+        done.wait()
         Self.writeAll(fd, Self.serialize(response))
     }
 

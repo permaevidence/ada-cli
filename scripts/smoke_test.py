@@ -505,6 +505,19 @@ def main():
     check("setup-api-selftest", result.returncode == 0,
           (result.stdout + result.stderr)[-1500:])
 
+    # 3f2. desktop quick setup: the offline battery (parser, generations,
+    # workflow enforcement, job runner + start gate, AgentMail transaction,
+    # lease, census, package maps), then the headless end-to-end run of the
+    # real binary against a mock provider server with dev stubs.
+    result = subprocess.run([os.path.abspath(ADA), "__quicksetup-selftest"],
+                            capture_output=True, text=True, timeout=600)
+    check("quicksetup-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-2500:])
+    result = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "quicksetup_headless_test.py"), os.path.abspath(ADA)],
+                            capture_output=True, text=True, timeout=600)
+    check("quicksetup headless end-to-end (mock providers, dev stubs)", result.returncode == 0,
+          (result.stdout + result.stderr)[-2500:])
+
     # 3g. companion-app chat socket: the selftest
     # covers rendering rules, the live protocol, privacy withhold/replay,
     # and socket hygiene; poller phase 10 later proves the same wire on a
@@ -2156,6 +2169,27 @@ def main():
     code = os.waitstatus_to_exitcode(status)
     check("tty-handoff: prompting child reads the terminal via foreground handoff",
           "HANDOFF_GOT:hello" in out and code == 0, f"exit={code} out={out[-300:]!r}")
+
+    # Quick-setup terminal lend (plan §8.8): a __gate-exec child that reads
+    # stdin immediately on exec must own the foreground BEFORE it is released.
+    out, status = run_under_pty(
+        [os.path.abspath(ADA), "__gate-tty-selftest"], timeout=30, send=b"sudo-line\n")
+    code = os.waitstatus_to_exitcode(status)
+    check("gate-tty: handoff child reads the terminal (lend before RELEASE), foreground restored",
+          "GATE_GOT:sudo-line" in out and code == 0, f"exit={code} out={out[-400:]!r}")
+    # With the lend removed the same child is SIGTTIN-stopped: the job never
+    # answers and times out (proving the order matters).
+    out, status = run_under_pty(
+        [os.path.abspath(ADA), "__gate-tty-selftest", "--skip-lend"], timeout=40, send=b"sudo-line\n")
+    code = os.waitstatus_to_exitcode(status)
+    check("gate-tty: without the lend the child cannot read the terminal (SIGTTIN stop or EIO; no output, job fails)",
+          "GATE_GOT" not in out and code != 0, f"exit={code} out={out[-400:]!r}")
+    # An injected tcsetpgrp failure closes the release pipe unwritten.
+    out, status = run_under_pty(
+        [os.path.abspath(ADA), "__gate-tty-selftest", "--fail-lend"], timeout=30, send=b"sudo-line\n")
+    code = os.waitstatus_to_exitcode(status)
+    check("gate-tty: failed lend → child never executes (exit 125 path), listener resumed, foreground restored",
+          "GATE_GOT" not in out and code == 0, f"exit={code} out={out[-400:]!r}")
 
     # Fallback-shim signal forwarding: SIGTERM to the trampoline must reach
     # the detached child (MCP/LSP registry shutdowns terminate the tracked

@@ -324,10 +324,10 @@ extension AgentMailService {
         }
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stagedBinary.path)
         #if os(macOS)
-        let xattr = await runner.run(["/usr/bin/xattr", "-d", "com.apple.quarantine", stagedBinary.path], 10, "unquarantine agentmail")
-        if !xattr.ok, !((xattr.detail ?? "").contains("No such xattr") || (xattr.stdout ?? "").contains("No such xattr")) {
-            // A missing attribute is success; anything else is a real failure.
-            if let detail = xattr.detail, !detail.contains("exit 1") { return "xattr failed: \(detail)" }
+        // Unquarantine with the syscall the `xattr -d` tool wraps: no child
+        // to journal or reap, and a missing attribute (ENOATTR) is success.
+        if removexattr(stagedBinary.path, "com.apple.quarantine", 0) != 0, errno != ENOATTR {
+            return "could not remove the quarantine attribute: \(String(cString: strerror(errno)))"
         }
         try checkpoint()
         #endif
@@ -439,6 +439,12 @@ extension AgentMailService {
         let live = liveWrapperBytes()
         let liveHash = live.map(sha256Hex)
         if liveHash == tx.newWrapperSHA256 {
+            // The metadata sits at `committing` through the rollback swap, so
+            // a crash right after it is classified by wrapper inspection.
+            if tx.state != "committing" {
+                tx.state = "committing"
+                try writeTransaction(tx)
+            }
             if let prev = tx.previousWrapper, let bytes = Data(base64Encoded: prev.bytesB64) {
                 try atomicReplaceWrapper(bytes: bytes, mode: mode_t(prev.mode))
             } else {
@@ -521,7 +527,9 @@ extension AgentMailService {
         case "rolled_back":
             return cleanPreCommit()
         case "committing", "committed":
-            let cls = tx.state == "committed" ? "post" : classifyCommitting()
+            // `committed` is inspected too: a rollback that crashed after
+            // its swap leaves the previous wrapper live under either state.
+            let cls = classifyCommitting()
             switch cls {
             case "pre":
                 return cleanPreCommit()

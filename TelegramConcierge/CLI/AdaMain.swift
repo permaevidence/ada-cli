@@ -27,7 +27,7 @@ struct AdaCLI: AsyncParsableCommand {
         subcommands: [Chat.self, Setup.self, QuickSetup.self, SetupAPI.self, Daemon.self, Doctor.self, Upgrade.self,
                       AdaService.self, Trigger.self, MediaSelftest.self, BundleCheck.self,
                       ToolchainCommand.self, ToolchainPrefixSelftest.self,
-                      SetsidExec.self, GateExec.self, TTYHandoffSelftest.self, BashPipelineSelftest.self,
+                      SetsidExec.self, GateExec.self, TTYHandoffSelftest.self, GateTTYSelftest.self, BashPipelineSelftest.self,
                       BashGoldenSelftest.self, BashJobsSelftest.self,
                       TriggerSelftest.self, WatcherTriageSelftest.self, LaneSelftest.self,
                       WebAgentSelftest.self, ProviderSelftest.self, ServiceSelftest.self,
@@ -42,7 +42,7 @@ struct AdaCLI: AsyncParsableCommand {
                       AppChatSocketSelftest.self,
                       CommandMenuSelftest.self, BotSwitchSelftest.self,
                       EmailCalendarSelftest.self, AgentMailKeyCommand.self, AgentMailCommand.self,
-                      WebLiveTest.self],
+                      WebLiveTest.self, QuickSetupSelftest.self],
         defaultSubcommand: Chat.self
     )
 }
@@ -315,6 +315,58 @@ struct TTYHandoffSelftest: ParsableCommand {
         child.arguments = ["-c", "read line && printf 'HANDOFF_GOT:%s\\n' \"$line\""]
         try TerminalHandoff.runLendingForeground(child)
         Foundation.exit(child.terminationStatus)
+    }
+}
+
+/// Hidden regression probe for the quick-setup terminal lend (driven by the
+/// smoke suite under a real pty): runs a HANDOFF job through SetupJobRunner
+/// whose command reads stdin immediately on exec. With the lend the child
+/// owns the foreground before RELEASE, reads the line the harness writes,
+/// and this exits 0; with `--skip-lend` the child is SIGTTIN-stopped (the
+/// harness observes the timeout); with `--fail-lend` an injected tcsetpgrp
+/// failure must close the release pipe unwritten (child exits 125) and
+/// restore the foreground group.
+struct GateTTYSelftest: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "__gate-tty-selftest",
+        abstract: "Internal: verify the quick-setup terminal lend under a pty.",
+        shouldDisplay: false
+    )
+
+    @Flag(name: .customLong("skip-lend")) var skipLend = false
+    @Flag(name: .customLong("fail-lend")) var failLend = false
+
+    func run() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("briglia-gate-tty-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        SetupJobRunner.journalURLOverride = tempRoot.appendingPathComponent("journal.json")
+        SetupJobRunner.skipLendForTest = skipLend
+        if failLend {
+            TerminalHandoff.ForegroundLend.tcsetpgrpImpl = { _, _ in errno = EPERM; return -1 }
+        }
+        let runner = SetupJobRunner()
+        runner.onLine = { print("JOB: \($0)") }
+        let listener = CountingListener()
+        runner.listener = listener
+        let result = await runner.run(.init(row: "tty", command: ["/bin/sh", "-c", "read line && printf 'GATE_GOT:%s\\n' \"$line\""],
+                                            mode: .terminalHandoff, timeout: 20, label: "read stdin"))
+        let foregroundRestored = tcgetpgrp(STDIN_FILENO) == getpgrp()
+        print("RESULT: \(result.outcome) listener=\(listener.suspends)/\(listener.resumes) fg_restored=\(foregroundRestored)")
+        if failLend {
+            guard case .failedToStart(let why) = result.outcome, why.contains("terminal handoff failed"), foregroundRestored,
+                  listener.suspends == 1, listener.resumes == 1 else { throw ExitCode(2) }
+            return
+        }
+        guard result.ok, foregroundRestored, listener.suspends == 1, listener.resumes == 1 else { throw ExitCode(1) }
+    }
+
+    final class CountingListener: StdinListenerControl, @unchecked Sendable {
+        var suspends = 0
+        var resumes = 0
+        func suspend() { suspends += 1 }
+        func resume() { resumes += 1 }
     }
 }
 

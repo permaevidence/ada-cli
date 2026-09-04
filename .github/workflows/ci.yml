@@ -32,6 +32,13 @@ jobs:
         run: swift build
       - name: Smoke test
         run: python3 scripts/smoke_test.py .build/debug/briglia
+      - name: Install Playwright (browser test of the quick-setup page)
+        run: |
+          apt-get install -y python3-pip
+          python3 -m pip install --break-system-packages playwright==1.55.0
+          python3 -m playwright install --with-deps chromium
+      - name: Quick-setup browser test
+        run: python3 scripts/quicksetup_browser_test.py .build/debug/briglia
 
   macos:
     name: macOS
@@ -42,3 +49,9 @@ jobs:
         run: swift build
       - name: Smoke test
         run: python3 scripts/smoke_test.py .build/debug/briglia
+      - name: Quick-setup browser test (best effort on the macOS runner)
+        continue-on-error: true
+        run: |
+          python3 -m pip install --break-system-packages playwright==1.55.0 || python3 -m pip install playwright==1.55.0
+          python3 -m playwright install chromium
+          python3 scripts/quicksetup_browser_test.py .build/debug/briglia

@@ -102,3 +102,8 @@ case ":$PATH:" in
     *":$DEST_DIR:"*) ;;
     *) echo "⚠ $DEST_DIR is not in your PATH — add it to your shell profile." ;;
 esac
+if [ "$MIGRATED" != "1" ] && [ "$MIGRATE_STATE" = "0" ]; then
+    echo
+    echo "Next: briglia quicksetup   (verify every key on a local page in your browser, then install the tools)"
+    echo "  or: briglia setup        (the step-by-step wizard in the terminal)"
+fi
