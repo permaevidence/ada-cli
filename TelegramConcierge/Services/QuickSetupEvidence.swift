@@ -9,6 +9,31 @@ import Darwin
 /// in `setup-api status` (plan §3.1, §4.5–4.7, §6.2). Every reader here is
 /// side-effect free; the mutating steps live in the workflow.
 enum QuickSetupEvidence {
+    /// Silent process runner for evidence probes. `GoogleWorkspaceService.runBlockingProcess`
+    /// prints a diagnostic line to STDOUT on a non-zero exit — fatal for
+    /// `setup-api status`, whose stdout must stay pure JSON (CI, 2026-09-04:
+    /// `python3 -m pip --version` failing broke every status parse).
+    static func quietRun(_ executable: String, _ args: [String], timeoutSeconds: Int = 20) -> (status: Int32, stdout: String, stderr: String)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        process.standardInput = FileHandle.nullDevice
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        do { try process.run() } catch { return nil }
+        var outData = Data(), errData = Data()
+        let group = DispatchGroup()
+        group.enter(); DispatchQueue.global().async { outData = out.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        group.enter(); DispatchQueue.global().async { errData = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
+        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        if process.isRunning { process.terminate(); Thread.sleep(forTimeInterval: 0.2); if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
+        process.waitUntilExit()
+        group.wait()
+        return (process.terminationStatus, String(decoding: outData, as: UTF8.self), String(decoding: errData, as: UTF8.self))
+    }
+
     // MARK: Disk floors (§3.1)
 
     struct DiskCheck: Equatable {
@@ -101,8 +126,8 @@ enum QuickSetupEvidence {
 
     static func pythonStatus() -> PythonStatus {
         guard let python = ToolchainService.python3Path() else { return PythonStatus(present: false, pipOK: false) }
-        let r = GoogleWorkspaceService.runBlockingProcess(executable: python, args: ["-m", "pip", "--version"], timeoutSeconds: 20)
-        return PythonStatus(present: true, pipOK: r.failureDetail == nil)
+        let r = quietRun(python, ["-m", "pip", "--version"], timeoutSeconds: 20)
+        return PythonStatus(present: true, pipOK: r?.status == 0)
     }
 
     // MARK: Linux package manager / cache
@@ -254,8 +279,8 @@ enum QuickSetupEvidence {
 
     /// `pmset -g custom` → `sleep` on AC (informational only).
     static func systemSleepMinutesAC() -> Int? {
-        let r = GoogleWorkspaceService.runBlockingProcess(executable: "/usr/bin/pmset", args: ["-g", "custom"], timeoutSeconds: 10)
-        guard let out = r.stdout else { return nil }
+        guard let r = quietRun("/usr/bin/pmset", ["-g", "custom"], timeoutSeconds: 10), r.status == 0 else { return nil }
+        let out = r.stdout
         var inAC = true
         for line in out.components(separatedBy: "\n") {
             let t = line.trimmingCharacters(in: .whitespaces)

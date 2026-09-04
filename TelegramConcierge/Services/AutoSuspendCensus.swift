@@ -126,14 +126,13 @@ enum AutoSuspendCensus {
     static func collectFacts() -> Facts {
         if let factsOverride { return factsOverride }
         let env = ProcessInfo.processInfo.environment
+        // Silent runner: `systemctl is-enabled` exits non-zero for masked
+        // units and `is-active` for inactive ones — normal answers, and
+        // nothing here may print (setup-api status stdout is pure JSON).
         func run(_ name: String, _ args: [String]) -> (status: Int32, out: String)? {
             guard let path = PlatformBinary.find(name) else { return nil }
-            let r = GoogleWorkspaceService.runBlockingProcess(executable: path, args: args, timeoutSeconds: 10)
-            if let out = r.stdout { return (0, out) }
-            if let detail = r.failureDetail, detail.hasPrefix("exit ") {
-                return (1, r.stderrHead ?? "")
-            }
-            return nil
+            guard let r = QuickSetupEvidence.quietRun(path, args, timeoutSeconds: 10) else { return nil }
+            return (r.status, r.stdout)
         }
         // 1. Masked targets.
         var masked: Bool?
@@ -221,11 +220,9 @@ enum AutoSuspendCensus {
         if desktop?.uppercased().contains("GNOME") == true {
             if let gs = PlatformBinary.find("gsettings") {
                 for (source, sink) in [("ac", 0), ("battery", 1)] {
-                    let r = GoogleWorkspaceService.runBlockingProcess(
-                        executable: gs, args: ["get", "org.gnome.settings-daemon.plugins.power", "sleep-inactive-\(source)-type"],
-                        timeoutSeconds: 10)
-                    guard let out = r.stdout else { gsFailed = true; continue }
-                    if sink == 0 { ac = out } else { bat = out }
+                    guard let r = QuickSetupEvidence.quietRun(gs, ["get", "org.gnome.settings-daemon.plugins.power", "sleep-inactive-\(source)-type"], timeoutSeconds: 10),
+                          r.status == 0 else { gsFailed = true; continue }
+                    if sink == 0 { ac = r.stdout } else { bat = r.stdout }
                 }
             } else { gsFailed = true }
         }

@@ -511,8 +511,9 @@ def main():
     # real binary against a mock provider server with dev stubs.
     result = subprocess.run([os.path.abspath(ADA), "__quicksetup-selftest"],
                             capture_output=True, text=True, timeout=600)
-    check("quicksetup-selftest", result.returncode == 0,
-          (result.stdout + result.stderr)[-2500:])
+    qs_out = result.stdout + result.stderr
+    qs_failed = "\n".join(l for l in qs_out.splitlines() if l.startswith("✖") or "FAILED" in l or "threw" in l)
+    check("quicksetup-selftest", result.returncode == 0, (qs_failed or qs_out)[-4000:])
     result = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "quicksetup_headless_test.py"), os.path.abspath(ADA)],
                             capture_output=True, text=True, timeout=600)
     check("quicksetup headless end-to-end (mock providers, dev stubs)", result.returncode == 0,

@@ -317,7 +317,23 @@ enum QuickSetupSession {
         _ = text.withCString { pwrite(fd, $0, strlen($0), 0) }
     }
 
+    /// Dev builds only (`BRIGLIA_DEV_QUICKSETUP_STUBS=1`): the environment
+    /// refusals are stubbed as satisfied so the headless and browser drivers
+    /// run on any machine (CI containers have no sudo, no systemd session,
+    /// runners no Homebrew). Release builds ignore the variable.
+    static func applyPreflightDevStubsIfRequested() {
+        guard adaCLIVersion.hasSuffix("-dev"),
+              ProcessInfo.processInfo.environment["BRIGLIA_DEV_QUICKSETUP_STUBS"] == "1" else { return }
+        QuickSetupPreflight.brewPresentOverride = true
+        QuickSetupPreflight.pythonOverride = .init(present: true, pipOK: true)
+        QuickSetupPreflight.packageManagerOverride = ("apt-get", true)
+        QuickSetupPreflight.sudoPresentOverride = true
+        QuickSetupPreflight.systemdSessionOverride = true
+        QuickSetupEvidence.statvfsOverride = { _ in (1, "/", 100 * QuickSetupEvidence.gb) }
+    }
+
     static func runInteractive() async throws {
+        applyPreflightDevStubsIfRequested()
         do { try QuickSetupPreflight.check() } catch {
             print("✖ \(error)")
             throw ExitCode(2)

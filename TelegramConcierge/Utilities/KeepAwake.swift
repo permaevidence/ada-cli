@@ -52,10 +52,8 @@ enum KeepAwake {
     /// nil on Linux (not applicable).
     static func assertionListedBySystem(reason: String = defaultReason) -> Bool? {
         #if os(macOS)
-        let result = GoogleWorkspaceService.runBlockingProcess(
-            executable: "/usr/bin/pmset", args: ["-g", "assertions"], timeoutSeconds: 10)
-        guard let out = result.stdout else { return false }
-        return out.contains("PreventUserIdleSystemSleep") && out.contains(reason)
+        guard let r = QuickSetupEvidence.quietRun("/usr/bin/pmset", ["-g", "assertions"], timeoutSeconds: 10), r.status == 0 else { return false }
+        return r.stdout.contains("PreventUserIdleSystemSleep") && r.stdout.contains(reason)
         #else
         return nil
         #endif
