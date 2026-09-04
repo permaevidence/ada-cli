@@ -104,6 +104,9 @@ enum SessionAffinity {
         var randomFails = false
         /// Extra log sink for the selftest (warnings are also printed).
         var warningSink: ((String) -> Void)? = nil
+        /// Runs inside `affinity.lock` after the state was read and before it
+        /// is published to the cache (the race window Codex round 1 named).
+        var afterReadBeforePublish: (() -> Void)? = nil
     }
     nonisolated(unsafe) static var testHooks = TestHooks()
 
@@ -186,7 +189,12 @@ enum SessionAffinity {
                 let state = try loadState()
                 headers[openrouterHeader] = wireId(state: state, apiKey: apiKey, lane: lane)
             } catch {
-                warn("OpenRouter request sent without \(openrouterHeader): \(error)")
+                // Best effort: one warning per process, not one per request.
+                cacheLock.lock()
+                let first = !openRouterWarned
+                openRouterWarned = true
+                cacheLock.unlock()
+                if first { warn("OpenRouter request sent without \(openrouterHeader) (further occurrences not logged): \(error)") }
             }
         }
         return headers
@@ -265,14 +273,21 @@ enum SessionAffinity {
 
     /// The state, loading it from disk on first use (creating it under the
     /// lock if absent, quarantining an undecodable file once per process).
-    /// Only a successfully decoded state is cached.
+    /// Only a successfully decoded state is cached, and it is published to
+    /// the cache while `affinity.lock` is still held: every in-process
+    /// writer invalidates the cache under that same lock, so a load that
+    /// read the old file can never be published after a writer's reset
+    /// (Codex round 1).
     static func loadState() throws -> State {
         cacheLock.lock()
         if let cached { cacheLock.unlock(); return cached }
         cacheLock.unlock()
-        let state = try withLock { try loadStateLocked() }
-        cacheLock.lock(); cached = state; cacheLock.unlock()
-        return state
+        return try withLock {
+            let state = try loadStateLocked()
+            testHooks.afterReadBeforePublish?()
+            cacheLock.lock(); cached = state; cacheLock.unlock()
+            return state
+        }
     }
 
     private static func loadStateLocked() throws -> State {
@@ -429,8 +444,8 @@ enum SessionAffinity {
     /// `/rotateaffinity`: new install salt, same conversation ID. The cache
     /// is invalidated whether or not the write succeeds.
     static func rotateSalt() throws {
-        defer { resetCache() }
         try withLock {
+            defer { resetCache() }   // under the file lock: ordered with every loader's publish
             let current = try loadStateLocked()
             guard let salt = randomBytes(count: 32) else {
                 throw AffinityError(description: "system randomness unavailable; nothing changed")
@@ -444,8 +459,8 @@ enum SessionAffinity {
     /// The cache is invalidated whether or not the write succeeds.
     @discardableResult
     static func replaceMainConversationId() throws -> String {
-        defer { resetCache() }
         return try withLock {
+            defer { resetCache() }   // under the file lock: ordered with every loader's publish
             let current = try loadStateLocked()
             let next = UUID().uuidString.lowercased()
             try writeState(State(version: currentVersion, installSalt: current.installSalt,
@@ -457,14 +472,17 @@ enum SessionAffinity {
     /// `/deleteuserdata`: remove the file and every quarantined sibling under
     /// the lock, fsync the directory. Returns human-readable failures.
     static func deleteForUserDataWipe() -> [String] {
-        defer { resetCache() }
         var failures: [String] = []
         do {
             try withLock {
+                defer { resetCache() }   // under the file lock, like every writer
                 let dir = fileURL.deletingLastPathComponent()
                 var targets = [fileURL.path]
-                if let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
-                    targets += names.filter { $0.hasPrefix(corruptPrefix) }.map { dir.appendingPathComponent($0).path }
+                switch corruptFilesChecked() {
+                case .success(let names):
+                    targets += names.map { dir.appendingPathComponent($0).path }
+                case .failure(let error):
+                    failures.append("could not enumerate \(dir.path) for quarantined affinity files (they may remain): \(error)")
                 }
                 for path in targets where unlink(path) != 0 && errno != ENOENT {
                     failures.append("could not delete \(path): \(String(cString: strerror(errno)))")
@@ -479,11 +497,21 @@ enum SessionAffinity {
         return failures
     }
 
-    /// Quarantined copies currently beside the file.
-    static func corruptFiles() -> [String] {
+    /// Quarantined copies currently beside the file; an enumeration failure
+    /// is a result, never an empty list (wipe and doctor report it).
+    static func corruptFilesChecked() -> Result<[String], Error> {
         let dir = fileURL.deletingLastPathComponent()
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return [] }
-        return names.filter { $0.hasPrefix(corruptPrefix) }.sorted()
+        do {
+            let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            return .success(names.filter { $0.hasPrefix(corruptPrefix) }.sorted())
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// Convenience for callers that only need the list (selftests).
+    static func corruptFiles() -> [String] {
+        (try? corruptFilesChecked().get()) ?? []
     }
 
     // MARK: - Doctor (plan §10)
@@ -513,10 +541,15 @@ enum SessionAffinity {
         else if let url = URL(string: activeBaseURL), isOpenRouterURL(url) { receives = "OpenRouter (\(openrouterHeader), optional)" }
         else { receives = "none (custom or local endpoint)" }
         findings.append(DoctorFinding(text: "active provider session header: \(receives)", problem: false, hint: nil))
-        let corrupt = corruptFiles()
-        if !corrupt.isEmpty {
-            findings.append(DoctorFinding(text: "\(corrupt.count) quarantined affinity file(s): \(corrupt.joined(separator: ", "))", problem: false,
-                                          hint: "kept for inspection; removed by /deleteuserdata"))
+        switch corruptFilesChecked() {
+        case .success(let corrupt):
+            if !corrupt.isEmpty {
+                findings.append(DoctorFinding(text: "\(corrupt.count) quarantined affinity file(s): \(corrupt.joined(separator: ", "))", problem: false,
+                                              hint: "kept for inspection; removed by /deleteuserdata"))
+            }
+        case .failure(let error):
+            findings.append(DoctorFinding(text: "cannot enumerate \(fileURL.deletingLastPathComponent().path) for quarantined affinity files: \(error)", problem: true,
+                                          hint: "check the data root's permissions"))
         }
         return findings
     }

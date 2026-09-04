@@ -527,6 +527,120 @@ struct AffinitySelftest: AsyncParsableCommand {
             check("rotation waits for affinity.lock held by another holder", blocked)
         }
 
+        // ---- 14. Codex round 1 ------------------------------------------------------
+        print("\n14. Round-1 corrections")
+        // (a) Cache publication is ordered with writers: a loader that has read
+        //     the old file holds affinity.lock until it has published, so a
+        //     rotation started in that window blocks, and after it completes
+        //     the next load sees the new salt (no resurrected old state).
+        SessionAffinity.resetCache()
+        final class Box: @unchecked Sendable { var done = false; let l = NSLock()
+            func set() { l.lock(); done = true; l.unlock() }
+            func get() -> Bool { l.lock(); defer { l.unlock() }; return done } }
+        let box = Box()
+        var doneDuringWindow = true
+        SessionAffinity.testHooks.afterReadBeforePublish = {
+            let t = Thread { try? SessionAffinity.rotateSalt(); box.set() }
+            t.start()
+            Thread.sleep(forTimeInterval: 0.5)
+            doneDuringWindow = box.get()
+        }
+        let loadedDuringRace = try SessionAffinity.loadState()
+        SessionAffinity.testHooks.afterReadBeforePublish = nil
+        var waited = 0
+        while !box.get() && waited < 100 { try await Task.sleep(nanoseconds: 50_000_000); waited += 1 }
+        let afterRace = try SessionAffinity.loadState()
+        var onDisk: SessionAffinity.State?
+        if case .decoded(let d) = SessionAffinity.readFile() { onDisk = d }
+        check("(a) rotation blocks while a loader holds the lock; the loader cannot publish stale state over the writer",
+              !doneDuringWindow && box.get() && afterRace.installSalt != loadedDuringRace.installSalt && afterRace == onDisk,
+              "doneDuringWindow=\(doneDuringWindow) rotated=\(box.get())")
+        // Same ordering for the other two writers.
+        SessionAffinity.resetCache()
+        let box2 = Box()
+        SessionAffinity.testHooks.afterReadBeforePublish = {
+            let t = Thread { _ = SessionAffinity.deleteForUserDataWipe(); box2.set() }
+            t.start(); Thread.sleep(forTimeInterval: 0.3)
+        }
+        let loadedBeforeWipe = try SessionAffinity.loadState()
+        SessionAffinity.testHooks.afterReadBeforePublish = nil
+        waited = 0
+        while !box2.get() && waited < 100 { try await Task.sleep(nanoseconds: 50_000_000); waited += 1 }
+        let afterWipeRace = try SessionAffinity.loadState()
+        check("(a) wipe racing a loader: the next load mints fresh state, not the pre-wipe one",
+              box2.get() && afterWipeRace.installSalt != loadedBeforeWipe.installSalt)
+        SessionAffinity.resetCache()
+        let box3 = Box()
+        SessionAffinity.testHooks.afterReadBeforePublish = {
+            let t = Thread { _ = try? SessionAffinity.replaceMainConversationId(); box3.set() }
+            t.start(); Thread.sleep(forTimeInterval: 0.3)
+        }
+        let loadedBeforeImport = try SessionAffinity.loadState()
+        SessionAffinity.testHooks.afterReadBeforePublish = nil
+        waited = 0
+        while !box3.get() && waited < 100 { try await Task.sleep(nanoseconds: 50_000_000); waited += 1 }
+        let afterImportRace = try SessionAffinity.loadState()
+        check("(a) import racing a loader: the next load carries the new main ID",
+              box3.get() && afterImportRace.mainConversationId != loadedBeforeImport.mainConversationId
+              && afterImportRace.installSalt == loadedBeforeImport.installSalt)
+
+        // (b) Chunked web_fetch: one execution ID for the chunks and the merge pass.
+        WebSearchBackend.processOverride = .opencode
+        opencodeServer.contentOverride = String(repeating: "x", count: 20_000)
+        opencodeServer.clear()
+        let bigPage = String(repeating: "lorem ipsum dolor ", count: 55_000)   // ~990K chars → 2 chunks of 800K
+        let fetchRun = UUID()
+        _ = try await orchestrator.compressLargePageForPrompt(
+            pageURL: "https://example.com/page", pageTitle: "T", markdown: bigPage, prompt: "summarize",
+            sectionOffset: 0, postCap: 30_000, executionID: fetchRun)
+        let chunkReqs = opencodeServer.requests
+        let chunkValues = Set(chunkReqs.compactMap { $0["x-opencode-session"] })
+        check("(b) chunked web_fetch: 2 chunks + merge pass = 3 requests sharing ONE session value",
+              chunkReqs.count == 3 && chunkValues.count == 1, "requests=\(chunkReqs.count) values=\(chunkValues.count)")
+        opencodeServer.clear()
+        _ = try await orchestrator.compressPageForPrompt(
+            pageURL: "https://example.com/page", pageTitle: "T", markdown: "small", prompt: "summarize", executionID: fetchRun)
+        check("(b) one-shot compression with the same execution ID carries the same value",
+              opencodeServer.requests.first?["x-opencode-session"] == chunkValues.first)
+        opencodeServer.clear()
+        _ = try await orchestrator.compressPageForPrompt(
+            pageURL: "https://example.com/page", pageTitle: "T", markdown: "small", prompt: "summarize", executionID: UUID())
+        check("(b) another fetch gets another value",
+              opencodeServer.requests.first?["x-opencode-session"] != chunkValues.first)
+        opencodeServer.contentOverride = nil
+        WebSearchBackend.processOverride = nil
+
+        // (c) Checked enumeration in wipe and doctor.
+        if getuid() != 0 {
+            try writeRaw(Data("{bad".utf8))
+            SessionAffinity.resetProcessStateForTests()
+            _ = try SessionAffinity.loadState()          // one quarantined sibling exists now
+            chmod(dataRoot.path, 0o100)                  // traversable, not listable
+            let wipeEnum = SessionAffinity.deleteForUserDataWipe()
+            let doctorEnum = SessionAffinity.doctorFindings(activeBaseURL: opencodeBase)
+            chmod(dataRoot.path, 0o700)
+            check("(c) wipe reports an enumeration failure instead of claiming success",
+                  wipeEnum.contains { $0.contains("enumerate") }, "\(wipeEnum)")
+            check("(c) doctor reports the enumeration failure as a problem",
+                  doctorEnum.contains { $0.problem && $0.text.contains("enumerate") })
+            check("(c) the quarantined file was indeed left behind", !SessionAffinity.corruptFiles().isEmpty)
+            _ = SessionAffinity.deleteForUserDataWipe()
+        }
+
+        // (d) OpenRouter best-effort warning is logged once per process.
+        SessionAffinity.resetProcessStateForTests()
+        try? FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        var orWarnings = 0
+        SessionAffinity.testHooks.warningSink = { if $0.contains("OpenRouter") { orWarnings += 1 } }
+        _ = try SessionAffinity.headers(url: openrouterURL, apiKey: keyA, lane: .main)
+        _ = try SessionAffinity.headers(url: openrouterURL, apiKey: keyA, lane: .main)
+        _ = try SessionAffinity.headers(url: openrouterURL, apiKey: keyA, lane: .archive)
+        SessionAffinity.testHooks.warningSink = nil
+        try FileManager.default.removeItem(at: file)
+        check("(d) three failed OpenRouter affinity loads log one warning", orWarnings == 1, "\(orWarnings)")
+        SessionAffinity.resetProcessStateForTests()
+
         // ---- 12. Live ---------------------------------------------------------------
         if live {
             print("\n12. Live")
@@ -603,6 +717,11 @@ final class CaptureServer: @unchecked Sendable {
         set { lock.lock(); _status = newValue; lock.unlock() }
     }
     private var _status: Int?
+    var contentOverride: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _content }
+        set { lock.lock(); _content = newValue; lock.unlock() }
+    }
+    private var _content: String?
 
     var requests: [[String: String]] { lock.lock(); defer { lock.unlock() }; return recorded }
     func clear() { lock.lock(); recorded = []; lock.unlock() }
@@ -679,8 +798,9 @@ final class CaptureServer: @unchecked Sendable {
             if let he = headerEnd, buffer.count - he.upperBound >= contentLength { break }
         }
         let status = statusOverride ?? 200
+        let content = contentOverride ?? "OK"
         let body = status == 200
-            ? "{\"id\":\"cap\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"
+            ? "{\"id\":\"cap\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"\(content)\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"
             : "{\"error\":{\"message\":\"injected \(status)\"}}"
         let reason = status == 200 ? "OK" : "Service Unavailable"
         let response = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"

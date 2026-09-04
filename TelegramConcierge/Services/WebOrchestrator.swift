@@ -135,6 +135,19 @@ enum WebSearchBackend: String {
     }
 
     var endpoint: URL {
+        // Development builds may point a backend at a local capture server
+        // (affinity selftest); release builds ignore the variables.
+        if adaCLIVersion.hasSuffix("-dev") {
+            let env = ProcessInfo.processInfo.environment
+            switch self {
+            case .opencode:
+                if let raw = env["BRIGLIA_DEV_AFFINITY_OPENCODE_BASE"], !raw.isEmpty, let url = URL(string: raw + "/zen/go/v1/chat/completions") { return url }
+            case .openrouter:
+                if let raw = env["BRIGLIA_DEV_AFFINITY_OPENROUTER_BASE"], !raw.isEmpty, let url = URL(string: raw + "/api/v1/chat/completions") { return url }
+            case .openai:
+                break
+            }
+        }
         switch self {
         case .openrouter: return Endpoints.openrouter
         case .openai:     return URL(string: "https://api.openai.com/v1/chat/completions")!
@@ -1627,6 +1640,10 @@ actor WebOrchestrator {
             throw NSError(domain: "WebOrchestrator", code: 1, userInfo: [NSLocalizedDescriptionKey: "web_fetch requires a non-empty prompt describing what to extract from the page."])
         }
         let sectionOffset = max(0, sectionOffset)
+        // One execution (= one affinity lane) for the whole fetch: the
+        // one-shot compression, every parallel chunk and the merge pass
+        // share it (Codex round 1).
+        let executionID = UUID()
 
         let normalizedURL = normalize(url)
 
@@ -1669,7 +1686,8 @@ actor WebOrchestrator {
                     pageURL: url,
                     pageTitle: rawTitle,
                     markdown: rawMarkdown,
-                    prompt: trimmedPrompt
+                    prompt: trimmedPrompt,
+                    executionID: executionID
                 )
             } catch {
                 webLog("[WebOrchestrator] web_fetch compression failed, returning truncated raw markdown: \(error.localizedDescription)")
@@ -1688,7 +1706,8 @@ actor WebOrchestrator {
                 markdown: rawMarkdown,
                 prompt: trimmedPrompt,
                 sectionOffset: sectionOffset,
-                postCap: postCap
+                postCap: postCap,
+                executionID: executionID
             )
         }
 
@@ -1706,12 +1725,13 @@ actor WebOrchestrator {
 
     /// Small-model compression of a page's markdown against the user's prompt.
     /// Mirrors Claude Code's WebFetch small-model stage.
-    private func compressPageForPrompt(
+    func compressPageForPrompt(
         pageURL: String,
         pageTitle: String?,
         markdown: String,
         prompt: String,
-        section: (index: Int, total: Int)? = nil
+        section: (index: Int, total: Int)? = nil,
+        executionID: UUID
     ) async throws -> String {
         let titleLine = pageTitle.map { "Page title: \($0)\n" } ?? ""
         var systemMsg = """
@@ -1758,7 +1778,7 @@ actor WebOrchestrator {
             // Groq/Vertex, which don't host Luna.
             provider: providerPreferences(forModel: ORModel.webFetchCompression),
             temperature: 0.1,
-            executionID: UUID()
+            executionID: executionID
         )
     }
 
@@ -1768,13 +1788,14 @@ actor WebOrchestrator {
     /// the rest in page order. Falls back to truncated raw markdown only when
     /// every chunk fails. The returned text always ends with a coverage line so
     /// the caller knows whether the whole page was judged.
-    private func compressLargePageForPrompt(
+    func compressLargePageForPrompt(
         pageURL: String,
         pageTitle: String?,
         markdown: String,
         prompt: String,
         sectionOffset: Int,
-        postCap: Int
+        postCap: Int,
+        executionID: UUID
     ) async throws -> String {
         let totalChars = markdown.count
         let step = webFetchChunkChars - chunkOverlapChars
@@ -1814,7 +1835,8 @@ actor WebOrchestrator {
                             pageTitle: pageTitle,
                             markdown: chunk,
                             prompt: prompt,
-                            section: (index: absoluteSection, total: totalChunks)
+                            section: (index: absoluteSection, total: totalChunks),
+                            executionID: executionID
                         )
                         return ChunkOutcome(index: i, text: out)
                     } catch {
@@ -1865,7 +1887,8 @@ actor WebOrchestrator {
                     pageURL: pageURL,
                     pageTitle: pageTitle,
                     markdown: stitched,
-                    prompt: prompt
+                    prompt: prompt,
+                    executionID: executionID
                 )
             } catch {
                 webLog("[WebOrchestrator] web_fetch merge pass failed, hard-truncating stitched result: \(error.localizedDescription)")
