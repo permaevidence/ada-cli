@@ -388,10 +388,17 @@ actor QuickSetupWorkflow {
     static func randomHex() -> String? {
         var bytes = [UInt8](repeating: 0, count: 16)
         #if os(Linux)
+        // The Glibc module does not export getrandom(2); /dev/urandom is
+        // the same CSPRNG pool. Any failure (missing device, short read)
+        // aborts the command before listening — never a weaker fallback.
+        let fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
         var filled = 0
         while filled < bytes.count {
-            let n = bytes.withUnsafeMutableBytes { getrandom($0.baseAddress! + filled, $0.count - filled, 0) }
+            let n = bytes.withUnsafeMutableBytes { read(fd, $0.baseAddress! + filled, $0.count - filled) }
             if n < 0 { if errno == EINTR { continue }; return nil }
+            if n == 0 { return nil }
             filled += n
         }
         #else
