@@ -93,13 +93,32 @@ struct EmailCalendarSelftest: AsyncParsableCommand {
         check("gws envelope hint teaches gws gmail",
               EmailCalendarProvider.current.emailFollowUpHint.contains("gws gmail +read"))
         EmailCalendarProvider.storedOverrideForTesting = { "agentmail" }
+        // Prompt syntax follows the INSTALLED CLI: the pinned 1.x Rust CLI
+        // nests resources (`inboxes messages`); a device still on the 0.7.x
+        // Go CLI keeps the colon form (`inboxes:messages`). Teaching the
+        // wrong one makes every first email action fail (2026-09-04).
+        AgentMailService.cliSyntaxOverrideForTesting = .v0Colon
+        let legacyHint = EmailCalendarProvider.current.emailFollowUpHint
+        check("0.x CLI installed → colon syntax in the envelope hint", legacyHint.contains("agentmail inboxes:messages get"))
+        check("0.x CLI installed → colon syntax in the guidance bullet",
+              (EmailCalendarProvider.current.toolGuidanceBullet ?? "").contains("agentmail inboxes:messages list"))
+        check("syntax map: nil (not installed) → nested (what a fresh install gets)", AgentMailService.cliSyntax(forInstalledVersion: nil) == .v1Nested)
+        check("syntax map: legacy unversioned → colon", AgentMailService.cliSyntax(forInstalledVersion: "legacy") == .v0Colon)
+        check("syntax map: 0.7.14 → colon", AgentMailService.cliSyntax(forInstalledVersion: "0.7.14") == .v0Colon)
+        check("syntax map: 1.3.0 → nested", AgentMailService.cliSyntax(forInstalledVersion: "1.3.0") == .v1Nested)
+        check("syntax map: 2.0.0 → nested", AgentMailService.cliSyntax(forInstalledVersion: "2.0.0") == .v1Nested)
+        check("version parse: versioned name", AgentMailService.cliVersion(fromTargetBasename: "agentmail-bin-1.3.0-0123456789ab") == "1.3.0")
+        check("version parse: legacy name", AgentMailService.cliVersion(fromTargetBasename: "agentmail-bin") == "legacy")
+        check("version parse: foreign name → nil", AgentMailService.cliVersion(fromTargetBasename: "agentmail") == nil)
+        AgentMailService.cliSyntaxOverrideForTesting = .v1Nested
         let amHint = EmailCalendarProvider.current.emailFollowUpHint
-        check("agentmail envelope hint teaches the agentmail CLI", amHint.contains("agentmail inboxes:messages"))
+        check("agentmail envelope hint teaches the agentmail CLI (nested 1.x syntax)", amHint.contains("agentmail inboxes messages"))
+        check("1.x syntax never emits the colon form", !amHint.contains("inboxes:messages"))
         check("agentmail envelope hint never mentions gws", !amHint.contains("gws"))
         // The installed CLI (v0.7.14+) says `get`, not `retrieve` — teaching a
         // dead subcommand makes the first read of an arrived email fail
         // (Codex, 2026-08-22; verified against the live binary).
-        check("envelope hint uses the real `get` subcommand", amHint.contains("inboxes:messages get"))
+        check("envelope hint uses the real `get` subcommand", amHint.contains("inboxes messages get"))
         check("no prompt string teaches the removed `retrieve`",
               !amHint.contains("retrieve") && !(EmailCalendarProvider.current.toolGuidanceBullet ?? "").contains("retrieve"))
         check("guidance bullet uses `get` too",
@@ -302,7 +321,8 @@ struct EmailCalendarSelftest: AsyncParsableCommand {
         let formatted = AgentMailService.formatUnreadEmails([sample])
         check("format contains inbox header", formatted.contains("📧 **Your Inbox**"))
         check("format contains subject + sender", formatted.contains("**Ciao** from Alice <alice@example.com>"))
-        check("format teaches agentmail follow-ups", formatted.contains("agentmail inboxes:messages"))
+        check("format teaches agentmail follow-ups", formatted.contains("agentmail inboxes messages"))
+        AgentMailService.cliSyntaxOverrideForTesting = nil
         check("no emails → empty context (block omitted)", AgentMailService.formatUnreadEmails([]) == "")
 
         // 7. Local calendar store roundtrip (isolated XDG root).

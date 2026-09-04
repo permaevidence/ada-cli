@@ -403,7 +403,7 @@ struct AgentMailKeyCommand: ParsableCommand {
 struct AgentMailCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "agentmail",
-        abstract: "AgentMail CLI maintenance (repair an interrupted install).",
+        abstract: "AgentMail CLI maintenance (repair an interrupted install, upgrade to the pinned version).",
         shouldDisplay: false
     )
 
@@ -411,15 +411,33 @@ struct AgentMailCommand: AsyncParsableCommand {
 
     func run() async throws {
         AdaCLI.prepareIO()
-        guard action == "repair" else {
-            print("usage: briglia agentmail repair")
+        switch action {
+        case "repair":
+            switch await AgentMailService.repairTransaction() {
+            case .nothingToDo: print("✔ no interrupted AgentMail transaction")
+            case .settled(let how): print("✔ settled: \(how)")
+            case .busy: print("✖ an AgentMail installation or repair is in progress — retry later"); throw ExitCode(1)
+            case .failedClosed(let why): print("✖ \(why)"); throw ExitCode(1)
+            }
+        case "upgrade", "install":
+            // Setup paths skip an already-installed broker; this is the one
+            // explicit way to move a device to the pinned upstream version
+            // (e.g. 0.7.x → 1.x). Same transactional installer, same lock.
+            let installed = AgentMailService.installedCLIVersion()
+            print("installed: \(installed.map { "agentmail CLI \($0)" } ?? "none")")
+            print("pinned:    agentmail CLI \(AgentMailService.pinnedVersion)")
+            if installed == AgentMailService.pinnedVersion {
+                print("✔ already at the pinned version")
+                return
+            }
+            if let failure = await AgentMailService.installAgentMailBinary(progress: { print("  \($0)") }) {
+                print("✖ \(failure)")
+                throw ExitCode(1)
+            }
+            print("✔ agentmail CLI \(AgentMailService.pinnedVersion) installed — wrapper at \(AgentMailService.wrapperURL.path)")
+        default:
+            print("usage: briglia agentmail repair | upgrade")
             throw ExitCode(64)
-        }
-        switch await AgentMailService.repairTransaction() {
-        case .nothingToDo: print("✔ no interrupted AgentMail transaction")
-        case .settled(let how): print("✔ settled: \(how)")
-        case .busy: print("✖ an AgentMail installation or repair is in progress — retry later"); throw ExitCode(1)
-        case .failedClosed(let why): print("✖ \(why)"); throw ExitCode(1)
         }
     }
 }

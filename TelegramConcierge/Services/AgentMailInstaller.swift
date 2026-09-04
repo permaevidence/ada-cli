@@ -32,6 +32,50 @@ extension AgentMailService {
     static let installerLockName = ".agentmail.lock"
     static let stagingPrefix = ".agentmail-staging-"
 
+    // MARK: Pinned upstream release
+    //
+    // The upstream CLI is pinned to ONE version whose per-target archive
+    // SHA-256 is compiled in (same idea as the lockfile-pinned Playwright):
+    // the installer never asks GitHub for "latest", so an upstream layout or
+    // toolchain change cannot break installs silently — v1.0.0 (2026-08-26)
+    // renamed every asset and nested the binary, and every install 404'd
+    // until 2026-09-04 — and the archive is authenticated against Briglia's
+    // own record instead of a sidecar served from the same origin.
+    // Bumping = new version + hashes here, then the selftest battery.
+    static let pinnedVersion = "1.3.0"
+    /// Target triple → SHA-256 of `agentmail-cli-<triple>.tar.gz` for
+    /// `pinnedVersion`. Linux uses the musl builds: statically linked, no
+    /// libssl.so.3 requirement (the gnu builds need OpenSSL 3 on the host).
+    static let pinnedArchiveSHA256: [String: String] = [
+        "aarch64-apple-darwin":       "01177d7b2d020da2d00d1eeede4fcfec427c0eefaf15997a7c3aad2f6361a365",
+        "x86_64-apple-darwin":        "6c143440548c1b0f61ca8976f68c0a4ff945af5c4531c3b87470abae82ba435c",
+        "aarch64-unknown-linux-musl": "2bf5310c9ca534da7674f744001bbd5d65145f24ce79fdb19d0bfe495237364b",
+        "x86_64-unknown-linux-musl":  "993d8ef53b1e46b229d58cb04bc37526f3055ba3907679b9004379d36ee31165",
+    ]
+    static var currentTargetTriple: String {
+        #if os(Linux)
+        #if arch(arm64)
+        return "aarch64-unknown-linux-musl"
+        #else
+        return "x86_64-unknown-linux-musl"
+        #endif
+        #else
+        #if arch(arm64)
+        return "aarch64-apple-darwin"
+        #else
+        return "x86_64-apple-darwin"
+        #endif
+        #endif
+    }
+    /// The pinned archive for a target: asset name, download URL and the
+    /// expected SHA-256. Nil for a target without a pinned build.
+    static func pinnedAsset(triple: String = currentTargetTriple) -> (asset: String, url: URL, sha256: String)? {
+        guard let sha = pinnedArchiveSHA256[triple] else { return nil }
+        let asset = "agentmail-cli-\(triple).tar.gz"
+        guard let url = URL(string: "https://github.com/agentmail-to/agentmail-cli/releases/download/v\(pinnedVersion)/\(asset)") else { return nil }
+        return (asset, url, sha)
+    }
+
     /// Selftest seam: the install directory (production: ~/.local/bin).
     nonisolated(unsafe) static var installDirectoryOverride: URL?
     static var installDirectory: URL {
@@ -138,6 +182,44 @@ extension AgentMailService {
         guard lstat(target, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return false }
         return FileManager.default.isExecutableFile(atPath: target)
     }
+
+    /// The upstream version baked into the installed key-brokered binary's
+    /// name (`agentmail-bin-<version>-<sha12>`). "legacy" for the
+    /// unversioned pre-transaction name (a 0.7.x install); nil when the
+    /// broker isn't installed.
+    static func installedCLIVersion() -> String? {
+        guard agentMailBrokerInstalled(), let data = try? Data(contentsOf: wrapperURL),
+              let target = wrapperTarget(data) else { return nil }
+        return cliVersion(fromTargetBasename: URL(fileURLWithPath: target).lastPathComponent)
+    }
+
+    static func cliVersion(fromTargetBasename base: String) -> String? {
+        if base == legacyBinaryName { return "legacy" }
+        guard base.hasPrefix(legacyBinaryName + "-") else { return nil }
+        let rest = base.dropFirst(legacyBinaryName.count + 1)          // "<version>-<sha12>"
+        guard let dash = rest.lastIndex(of: "-"), dash > rest.startIndex else { return nil }
+        return String(rest[..<dash])
+    }
+
+    /// Command syntax of the CLI the model will find on PATH. The Go CLI
+    /// (0.x) used colon resources (`inboxes:messages list`); the Rust
+    /// rewrite (1.x, pinned) uses nested subcommands (`inboxes messages
+    /// list`) with the same flags. Prompt text follows the INSTALLED
+    /// binary so a device still on 0.7.x is taught commands that work.
+    enum CLISyntax: Equatable { case v0Colon, v1Nested }
+
+    static func cliSyntax(forInstalledVersion version: String?) -> CLISyntax {
+        guard let version else { return .v1Nested }          // not installed: a fresh install gets the pinned 1.x
+        if version == "legacy" { return .v0Colon }
+        let major = Int(version.split(separator: ".").first ?? "") ?? 1
+        return major == 0 ? .v0Colon : .v1Nested
+    }
+
+    /// Selftest seam.
+    nonisolated(unsafe) static var cliSyntaxOverrideForTesting: CLISyntax?
+    static var cliSyntax: CLISyntax { cliSyntaxOverrideForTesting ?? cliSyntax(forInstalledVersion: installedCLIVersion()) }
+    /// `inboxes:messages` or `inboxes messages`, for prompt examples.
+    static var messagesResource: String { cliSyntax == .v0Colon ? "inboxes:messages" : "inboxes messages" }
 
     private static func brigliaPath() -> String {
         brigliaPathOverride ?? (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
@@ -297,7 +379,11 @@ extension AgentMailService {
     }
 
     private static func crashIf(_ point: String) {
-        if crashPoint == point { kill(getpid(), SIGKILL) }
+        // A process-directed SIGKILL may be delivered to another thread
+        // first; never let this thread run past the crash point (it once
+        // reached the wrapper swap and left a temp file the "crash" could
+        // not have produced). A real crash executes nothing further either.
+        if crashPoint == point { kill(getpid(), SIGKILL); while true { sleep(10) } }
     }
 
     /// Selftest seam: make unlink of this basename fail (EACCES-like).
@@ -355,6 +441,7 @@ extension AgentMailService {
         checkpoint: () throws -> Void,
         runner: ChildRunner
     ) async throws -> String? {
+        try sweepStaleWrapperTemps()
         // Settle any interrupted transaction first (repair is idempotent).
         if try readTransaction() != nil {
             let outcome = await repairLocked(runner: runner)
@@ -392,7 +479,11 @@ extension AgentMailService {
         let archivePath = staging.appendingPathComponent(fixture.asset)
         try fixture.archive.write(to: archivePath)
         progress?("Extracting the agentmail CLI…")
-        let untar = await runner.run(["/usr/bin/tar", "-xf", archivePath.path, "-C", staging.path], 60, "extract agentmail")
+        // Upstream archives (cargo-dist) nest everything under one
+        // `agentmail-cli-<triple>/` directory; strip it so the binary lands
+        // at `staging/agentmail`. A flat archive yields nothing here and
+        // fails the "did not contain" check below.
+        let untar = await runner.run(["/usr/bin/tar", "-xf", archivePath.path, "-C", staging.path, "--strip-components=1"], 60, "extract agentmail")
         guard untar.ok else { return "extraction failed: \(untar.detail ?? "tar failed")" }
         try checkpoint()
         let stagedBinary = staging.appendingPathComponent("agentmail")
@@ -574,7 +665,23 @@ extension AgentMailService {
         }
     }
 
+    /// The atomic wrapper writer stages `.agentmail.tmp-<uuid>` next to the
+    /// wrapper; a crash between its creation and the rename leaves it
+    /// behind. Under the installer lock no writer is mid-write, so every
+    /// such file is stale. Checked removal.
+    static func sweepStaleWrapperTemps() throws {
+        let prefix = ".\(wrapperName).tmp-"
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: installDirectory.path)) ?? []
+        for name in names where name.hasPrefix(prefix) {
+            let path = installDirectory.appendingPathComponent(name).path
+            var st = stat()
+            guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
+            try unlinkChecked(path)
+        }
+    }
+
     private static func repairLocked(runner: ChildRunner) async -> RepairOutcome {
+        do { try sweepStaleWrapperTemps() } catch { return .failedClosed("a stale wrapper temp file could not be removed: \(error)") }
         let tx: Transaction
         do {
             guard let read = try readTransaction() else {
@@ -684,51 +791,20 @@ extension AgentMailService {
     // MARK: Download
 
     private static func downloadRelease(progress: (@Sendable (String) -> Void)?) async throws -> DownloadFixture {
-        guard let apiURL = URL(string: "https://api.github.com/repos/agentmail-to/agentmail-cli/releases/latest") else {
-            throw NSError(domain: "briglia.agentmail", code: 10, userInfo: [NSLocalizedDescriptionKey: "internal error: malformed release-lookup URL"])
+        guard let pin = pinnedAsset() else {
+            throw NSError(domain: "briglia.agentmail", code: 10, userInfo: [NSLocalizedDescriptionKey:
+                "no pinned AgentMail CLI build for this platform (\(currentTargetTriple))"])
         }
-        var lookup = URLRequest(url: apiURL)
-        lookup.timeoutInterval = 30
-        lookup.setValue("briglia-cli", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await URLSession.shared.data(for: lookup)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let archive: Data
+        do {
+            archive = try await GoogleWorkspaceService.downloadReportingProgress(
+                from: pin.url, label: "Downloading the agentmail CLI \(pinnedVersion)", progress: progress)
+        } catch {
             throw NSError(domain: "briglia.agentmail", code: 11, userInfo: [NSLocalizedDescriptionKey:
-                "release lookup failed (HTTP \(code)) — GitHub may be rate-limiting; retry in a few minutes"])
+                "download of \(pin.asset) failed (\(error.localizedDescription)) — \(pin.url.absoluteString)"])
         }
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tag = json["tag_name"] as? String else {
-            throw NSError(domain: "briglia.agentmail", code: 12, userInfo: [NSLocalizedDescriptionKey: "release lookup returned no tag"])
-        }
-        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        #if os(Linux)
-        #if arch(arm64)
-        let platformArch = "linux_arm64"
-        #else
-        let platformArch = "linux_amd64"
-        #endif
-        let ext = "tar.gz"
-        #else
-        #if arch(arm64)
-        let platformArch = "macos_arm64"
-        #else
-        let platformArch = "macos_amd64"
-        #endif
-        let ext = "zip"
-        #endif
-        let asset = "agentmail_\(version)_\(platformArch).\(ext)"
-        let base = "https://github.com/agentmail-to/agentmail-cli/releases/download/v\(version)/"
-        guard let assetURL = URL(string: base + asset),
-              let checksumsURL = URL(string: base + "agentmail_\(version)_checksums.txt") else {
-            throw NSError(domain: "briglia.agentmail", code: 13, userInfo: [NSLocalizedDescriptionKey: "internal error: malformed release URL"])
-        }
-        let archive = try await GoogleWorkspaceService.downloadReportingProgress(
-            from: assetURL, label: "Downloading the agentmail CLI", progress: progress)
-        try Task.checkCancellation()
-        let (checksumData, checksumResp) = try await URLSession.shared.data(from: checksumsURL)
-        if let code = (checksumResp as? HTTPURLResponse)?.statusCode, code != 200 {
-            throw NSError(domain: "briglia.agentmail", code: 14, userInfo: [NSLocalizedDescriptionKey: "checksum download failed (HTTP \(code))"])
-        }
-        return (version, asset, archive, checksumData)
+        // The verification step reads a checksums text; synthesize it from
+        // the compiled-in record so the rest of the pipeline is unchanged.
+        return (pinnedVersion, pin.asset, archive, Data("\(pin.sha256)  \(pin.asset)\n".utf8))
     }
 }

@@ -223,6 +223,10 @@ struct Doctor: AsyncParsableCommand {
             }
             if !AgentMailService.agentMailBrokerInstalled() {
                 note("agentmail CLI (key broker) not installed — inbox context/alerts still work; email ACTIONS need it (`briglia setup`, toolchain step). A bare agentmail binary from npm/brew cannot authenticate: Briglia never puts the key in bash environments")
+            } else if let installed = AgentMailService.installedCLIVersion(), installed != AgentMailService.pinnedVersion {
+                note("agentmail CLI \(installed) installed (key broker); Briglia pins \(AgentMailService.pinnedVersion) — `briglia agentmail upgrade` moves it (prompt examples follow the installed version either way)")
+            } else {
+                note("agentmail CLI \(AgentMailService.pinnedVersion) installed (key broker, pinned version)")
             }
             let foreign = AgentMailService.foreignAgentMailInstalls()
             if !foreign.isEmpty {

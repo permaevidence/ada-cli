@@ -72,7 +72,8 @@ enum EmailCalendarProvider: String, CaseIterable {
         case .agentmail:
             let inbox = Self.agentMailInboxAddress
             let inboxNote = inbox.isEmpty ? "" : " (\(inbox))"
-            return "- You have a dedicated email inbox\(inboxNote) on AgentMail. Use the `agentmail` CLI via `bash` for email actions — it authenticates itself automatically (e.g. `agentmail inboxes:messages list --inbox-id \(inbox.isEmpty ? "<inbox>" : inbox) --limit 10`, `… get --message-id '<id>'`, `… reply`, `… send`). For raw API calls, `briglia __agentmail-key` prints the key. Use `manage_calendar` for the calendar."
+            let msgs = AgentMailService.messagesResource
+            return "- You have a dedicated email inbox\(inboxNote) on AgentMail. Use the `agentmail` CLI via `bash` for email actions — it authenticates itself automatically (e.g. `agentmail \(msgs) list --inbox-id \(inbox.isEmpty ? "<inbox>" : inbox) --limit 10`, `… get --message-id '<id>'`, `… reply`, `… send`; `agentmail --help` lists the rest). For raw API calls, `briglia __agentmail-key` prints the key. Use `manage_calendar` for the calendar."
         case .gws:
             return "- Use `gws` for Google Workspace actions."
         }
@@ -88,7 +89,8 @@ enum EmailCalendarProvider: String, CaseIterable {
         case .agentmail:
             let inbox = Self.agentMailInboxAddress
             let inboxArg = inbox.isEmpty ? "<inbox>" : inbox
-            return "Use the `agentmail` CLI via `bash` for follow-up actions when needed (e.g. `agentmail inboxes:messages get --inbox-id \(inboxArg) --message-id '<id>'`, `… reply --inbox-id \(inboxArg) --message-id '<id>' --text \"…\"`)."
+            let msgs = AgentMailService.messagesResource
+            return "Use the `agentmail` CLI via `bash` for follow-up actions when needed (e.g. `agentmail \(msgs) get --inbox-id \(inboxArg) --message-id '<id>'`, `… reply --inbox-id \(inboxArg) --message-id '<id>' --text \"…\"`)."
         case .gws:
             return "Use `gws` via `bash` for follow-up actions when needed (e.g. `gws gmail +read --id <id>`, `gws gmail +reply`)."
         }

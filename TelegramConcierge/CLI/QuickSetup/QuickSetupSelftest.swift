@@ -70,6 +70,7 @@ struct QuickSetupSelftest: AsyncParsableCommand {
         await t.section("14. keep-awake census") { try await t.census() }
         await t.section("16. package maps + disk floors") { try await t.packagesAndDisk() }
         await t.section("2b. AgentMail installer") { try await t.agentMailInstaller() }
+        await t.section("2c. AgentMail pinned release") { try await t.agentMailPinning() }
 
         print(t.failures == 0 ? "\nquicksetup selftest: all \(t.checks) checks passed"
                               : "\nquicksetup selftest: \(t.failures) of \(t.checks) FAILED")

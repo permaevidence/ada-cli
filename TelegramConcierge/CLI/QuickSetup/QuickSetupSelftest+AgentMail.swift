@@ -19,20 +19,25 @@ extension SelftestContext {
     /// and — through the wrapper (AGENTMAIL_API_KEY exported) — fails when
     /// `failWrapped` is set, so a "published wrapper smoke test fails" can be
     /// produced deterministically.
-    func makeFixture(version: String, failWrapped: Bool = false, failDirect: Bool = false) throws -> Fixture {
+    func makeFixture(version: String, failWrapped: Bool = false, failDirect: Bool = false, flat: Bool = false) throws -> Fixture {
         let dir = tempDir("fixture-\(version)")
-        let bin = dir.appendingPathComponent("agentmail")
+        // Mirrors the upstream (cargo-dist) layout: one top-level directory
+        // holding the binary and docs; the installer strips it.
+        let top = flat ? dir : dir.appendingPathComponent("agentmail-cli-test", isDirectory: true)
+        try FileManager.default.createDirectory(at: top, withIntermediateDirectories: true)
+        let bin = top.appendingPathComponent("agentmail")
         var script = "#!/bin/sh\n"
         if failDirect { script += "exit 1\n" }
         if failWrapped { script += "if [ \"${AGENTMAIL_API_KEY+set}\" = set ]; then exit 1; fi\n" }
         script += "echo agentmail \(version)\n"
         try script.write(to: bin, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin.path)
-        let asset = "agentmail_\(version)_test.tar.gz"
+        try "readme".write(to: top.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        let asset = "agentmail-cli-test-\(version).tar.gz"
         let archive = dir.appendingPathComponent(asset)
         let tar = Process()
         tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        tar.arguments = ["-czf", archive.path, "-C", dir.path, "agentmail"]
+        tar.arguments = ["-czf", archive.path, "-C", dir.path, flat ? "agentmail" : "agentmail-cli-test"]
         try tar.run(); tar.waitUntilExit()
         let data = try Data(contentsOf: archive)
         let sums = dir.appendingPathComponent("checksums.txt")
@@ -66,6 +71,98 @@ extension SelftestContext {
             parts.append("\(e):\(st.st_mode):\(AgentMailService.sha256Hex(data))")
         }
         return parts.joined(separator: "|")
+    }
+
+    /// Pinned upstream release (2026-09-04): the installer never asks GitHub
+    /// for "latest"; the archive for this target is authenticated against
+    /// the compiled-in SHA-256, extracted from its nested top directory, and
+    /// the prompt syntax follows the installed binary's version.
+    func agentMailPinning() async throws {
+        AgentMailService.brigliaPathOverride = "/usr/bin/true"
+        defer { AgentMailService.brigliaPathOverride = nil; AgentMailService.downloadOverride = nil; AgentMailService.installDirectoryOverride = nil; AgentMailService.cliSyntaxOverrideForTesting = nil }
+        let hex = CharacterSet(charactersIn: "0123456789abcdef")
+        func isSHA(_ s: String) -> Bool { s.count == 64 && s.unicodeScalars.allSatisfy { hex.contains($0) } }
+        check("pinned version is a plain semver", AgentMailService.pinnedVersion.split(separator: ".").count == 3 && !AgentMailService.pinnedVersion.hasPrefix("v"))
+        check("every pinned entry is a lowercase 64-hex SHA-256", AgentMailService.pinnedArchiveSHA256.values.allSatisfy(isSHA) && AgentMailService.pinnedArchiveSHA256.count == 4)
+        let pin = AgentMailService.pinnedAsset()
+        check("this platform (\(AgentMailService.currentTargetTriple)) has a pinned build", pin != nil)
+        if let pin {
+            check("asset name follows the cargo-dist layout", pin.asset == "agentmail-cli-\(AgentMailService.currentTargetTriple).tar.gz")
+            check("download URL is the immutable tag path on github.com",
+                  pin.url.host == "github.com" && pin.url.path == "/agentmail-to/agentmail-cli/releases/download/v\(AgentMailService.pinnedVersion)/\(pin.asset)")
+            check("Linux pins the static musl build (no libssl.so.3 dependency)",
+                  !AgentMailService.currentTargetTriple.contains("linux") || AgentMailService.currentTargetTriple.hasSuffix("-musl"))
+        }
+        check("no pinned build for an unknown target", AgentMailService.pinnedAsset(triple: "sparc-unknown-plan9") == nil)
+
+        func freshDir() -> URL {
+            let d = tempDir("pin")
+            AgentMailService.installDirectoryOverride = d
+            return d
+        }
+
+        // A flat archive (binary at the top level, the pre-1.0 layout) is
+        // rejected after extraction: nothing is published.
+        var dir = freshDir()
+        let flat = try makeFixture(version: "1.3.0", flat: true)
+        useFixture(flat)
+        var failure = await AgentMailService.installAgentMailBinary()
+        check("flat archive → 'did not contain' failure, nothing published", (failure ?? "").contains("did not contain") && entries(dir).isEmpty, "\(failure ?? "") \(entries(dir))")
+
+        // The synthesized checksum line is what authenticates the download:
+        // a record that does not match the bytes fails closed.
+        let good = try makeFixture(version: "1.3.0")
+        AgentMailService.downloadOverride = { _ in
+            (good.version, good.archive.lastPathComponent, try Data(contentsOf: good.archive),
+             Data("\(String(repeating: "0", count: 64))  \(good.archive.lastPathComponent)\n".utf8))
+        }
+        failure = await AgentMailService.installAgentMailBinary()
+        check("compiled-in hash mismatch → checksum failure, nothing published", (failure ?? "").contains("checksum mismatch") && entries(dir).isEmpty, "\(failure ?? "") \(entries(dir))")
+        AgentMailService.downloadOverride = { _ in
+            (good.version, good.archive.lastPathComponent, try Data(contentsOf: good.archive),
+             Data("\(AgentMailService.sha256Hex(try Data(contentsOf: good.archive))) *\(good.archive.lastPathComponent)\n".utf8))
+        }
+        failure = await AgentMailService.installAgentMailBinary()
+        check("nested archive with a matching record installs (upstream `hash *name` line form accepted)", failure == nil && wrapperAnswers(dir, "1.3.0"), failure ?? "")
+        check("installed version parsed from the versioned target", AgentMailService.installedCLIVersion() == "1.3.0")
+        check("1.x installed → nested prompt syntax", AgentMailService.cliSyntax == .v1Nested && AgentMailService.messagesResource == "inboxes messages")
+
+        // A crash between the wrapper temp's creation and its rename leaves
+        // `.agentmail.tmp-<uuid>`; repair and install sweep it under the lock.
+        let stale = dir.appendingPathComponent(".agentmail.tmp-DEADBEEF-0000")
+        try Data("half-written".utf8).write(to: stale)
+        let sweepOutcome = await AgentMailService.repairTransaction()
+        check("stale wrapper temp: repair (nothing to do) sweeps it", { if case .nothingToDo = sweepOutcome { return true }; return false }() && !entries(dir).contains(".agentmail.tmp-DEADBEEF-0000") && wrapperAnswers(dir, "1.3.0"), "\(sweepOutcome) \(entries(dir))")
+        try Data("half-written".utf8).write(to: stale)
+        failure = await AgentMailService.installAgentMailBinary()
+        check("stale wrapper temp: install sweeps it, pair intact", failure == nil && entries(dir) == ["agentmail", AgentMailService.versionedName(version: "1.3.0", sha256: good.binarySHA)], "\(failure ?? "") \(entries(dir))")
+
+        // A device still on the Go CLI keeps the colon syntax until upgraded.
+        dir = freshDir()
+        let old = try makeFixture(version: "0.7.14")
+        useFixture(old)
+        failure = await AgentMailService.installAgentMailBinary()
+        check("0.7.14 fixture installs", failure == nil && AgentMailService.installedCLIVersion() == "0.7.14", failure ?? "")
+        check("0.x installed → colon prompt syntax", AgentMailService.cliSyntax == .v0Colon && AgentMailService.messagesResource == "inboxes:messages")
+        useFixture(good)
+        failure = await AgentMailService.installAgentMailBinary()
+        check("upgrade 0.7.14 → 1.3.0 flips the prompt syntax", failure == nil && AgentMailService.installedCLIVersion() == "1.3.0" && AgentMailService.cliSyntax == .v1Nested, failure ?? "")
+        check("not installed → nested syntax (what a fresh install gets)", { AgentMailService.installDirectoryOverride = tempDir("empty"); return AgentMailService.installedCLIVersion() == nil && AgentMailService.cliSyntax == .v1Nested }())
+
+        // Opt-in live check (network): the real pinned download installs and
+        // answers with the pinned version. BRIGLIA_AGENTMAIL_LIVE=1.
+        if ProcessInfo.processInfo.environment["BRIGLIA_AGENTMAIL_LIVE"] == "1" {
+            dir = freshDir()
+            AgentMailService.downloadOverride = nil
+            var lines: [String] = []
+            failure = await AgentMailService.installAgentMailBinary(progress: { lines.append($0) })
+            check("LIVE: pinned \(AgentMailService.pinnedVersion) downloads, verifies and installs", failure == nil, failure ?? "")
+            let r = GoogleWorkspaceService.runBlockingProcess(executable: dir.appendingPathComponent("agentmail").path, args: ["--version"], timeoutSeconds: 20)
+            check("LIVE: wrapper answers `agentmail \(AgentMailService.pinnedVersion)`", (r.stdout ?? "").contains("agentmail \(AgentMailService.pinnedVersion)"), r.stdout ?? r.failureDetail ?? "")
+            check("LIVE: installed version parsed", AgentMailService.installedCLIVersion() == AgentMailService.pinnedVersion)
+            let nested = GoogleWorkspaceService.runBlockingProcess(executable: dir.appendingPathComponent("agentmail").path, args: ["inboxes", "messages", "--help"], timeoutSeconds: 20)
+            check("LIVE: the pinned CLI has the nested `inboxes messages` resource", (nested.stdout ?? "").contains("List Messages"), nested.stdout ?? nested.failureDetail ?? "")
+        }
     }
 
     func agentMailInstaller() async throws {
