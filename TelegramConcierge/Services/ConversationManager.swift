@@ -3187,6 +3187,9 @@ class ConversationManager: ObservableObject {
         case "/setname":
             await handleSetNameCommand(argument: commandArgument(from: text))
             return true
+        case "/rotateaffinity":
+            await handleRotateAffinityCommand()
+            return true
         case "/switchbot":
             await handleSwitchBotCommand(argument: commandArgument(from: text))
             return true
@@ -3206,6 +3209,28 @@ class ConversationManager: ObservableObject {
     /// `/setname confirm` applies it. The name feeds the system prompt and
     /// serves as /deleteuserdata's confirmation token, so "confirm" itself
     /// is reserved.
+    /// `/rotateaffinity` (plan §3.3): a single file write under
+    /// `affinity.lock` that replaces the install salt. Every lane presents a
+    /// new session value from its next request; requests in flight finish
+    /// with the old one. Human-only: no tool, no scheduler, no watcher path
+    /// reaches this handler.
+    private func handleRotateAffinityCommand() async {
+        guard replyAddress != nil else { return }
+        do {
+            try SessionAffinity.rotateSalt()
+            try? await sendText("🔄 Session identity rotated. From the next request, every conversation, subagent session and background lane presents a new session value to OpenCode (and OpenRouter). Cost: one prompt-cache miss per lane. Nothing was deleted or changed in memory.")
+        } catch let failure as SessionAffinity.WriteFailure {
+            switch failure.phase {
+            case .beforeRename:
+                try? await sendText("✖ Rotation did not happen: \(failure.description). The previous session identity is unchanged.")
+            case .afterRename:
+                try? await sendText("⚠️ Rotation took effect (the new state is in place), but its directory entry could not be proven durable: \(failure.description). Run `briglia doctor` if this repeats.")
+            }
+        } catch {
+            try? await sendText("✖ Rotation did not happen: \(error). The previous session identity is unchanged.")
+        }
+    }
+
     private func handleSetNameCommand(argument: String) async {
         guard replyAddress != nil else { return }
         let current = (KeychainHelper.load(key: KeychainHelper.userNameKey) ?? "")
@@ -3617,6 +3642,11 @@ class ConversationManager: ObservableObject {
                 try? await sendText("""
                 ⚠️ Import failed while replacing data: \(message)
                 The previous memory may be PARTIALLY replaced. Restore another backup with /importmind, or run /deleteuserdata for a clean state.
+                """)
+            case .failedBeforeApply(let message, let advanced):
+                try? await sendText("""
+                ✖ ABORTED before replacing anything: could not record the new session identity — \(message)
+                Your current memory is intact and nothing was discarded.\(advanced ? " The session identity presented to OpenCode has already advanced (harmless: one cache miss)." : "") Fix the cause (see `briglia doctor`) and retry: /importmind confirm.
                 """)
             }
             return
@@ -4207,7 +4237,7 @@ class ConversationManager: ObservableObject {
         let current = KeychainHelper.load(key: modelKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let baseURL = KeychainHelper.load(key: KeychainHelper.openAICompatibleBaseURLKey) ?? ""
-        let isOpenCode = provider == .openAICompatible && baseURL.contains("opencode.ai")
+        let isOpenCode = provider == .openAICompatible && SessionAffinity.isOpenCodeBaseURL(baseURL)
 
         guard !argument.isEmpty else {
             var lines = ["Current model: \(current.isEmpty ? "(not set)" : current)"]
@@ -4310,7 +4340,7 @@ class ConversationManager: ObservableObject {
     private func handleSubagentModelsCommand(argument: String) async {
         let provider = SubagentModelLanes.activeProvider()
         let baseURL = KeychainHelper.load(key: KeychainHelper.openAICompatibleBaseURLKey) ?? ""
-        let isOpenCode = provider == .openAICompatible && baseURL.contains("opencode.ai")
+        let isOpenCode = provider == .openAICompatible && SessionAffinity.isOpenCodeBaseURL(baseURL)
 
         func laneStatus(_ lane: SubagentModelLane) -> String {
             let model = SubagentModelLanes.configuredModel(lane, provider: provider)
@@ -5359,7 +5389,8 @@ class ConversationManager: ObservableObject {
                     totalChunkCount: totalChunkCount,
                     currentUserMessageId: currentUserMessageId,
                     turnStartDate: systemPromptDate,
-                    deferredMCPSummaries: deferredSummaries.isEmpty ? nil : deferredSummaries
+                    deferredMCPSummaries: deferredSummaries.isEmpty ? nil : deferredSummaries,
+                    lane: .main
                 )
                 // The request was sent — but the guard stands down only if it
                 // actually carried the in-flight annotation (nonce-checked).
@@ -5741,7 +5772,8 @@ class ConversationManager: ObservableObject {
                     currentUserMessageId: currentUserMessageId,
                     turnStartDate: systemPromptDate,
                     tailSystemMessage: tail,
-                    deferredMCPSummaries: lastDeferredSummaries.isEmpty ? nil : lastDeferredSummaries
+                    deferredMCPSummaries: lastDeferredSummaries.isEmpty ? nil : lastDeferredSummaries,
+                    lane: .main
                 )
                 // Carried-check matters most here: an exhaustion path that
                 // discarded the annotation's interaction reaches this
@@ -6658,7 +6690,8 @@ class ConversationManager: ObservableObject {
                 currentUserMessageId: currentUserMessageId,
                 turnStartDate: turnStartDate,
                 tailUserMessage: tail,
-                deferredMCPSummaries: deferredMCPSummaries.isEmpty ? nil : deferredMCPSummaries
+                deferredMCPSummaries: deferredMCPSummaries.isEmpty ? nil : deferredMCPSummaries,
+                lane: .main
             )
             switch response {
             case .text(let content, _, _, _, _, _):
@@ -6702,7 +6735,8 @@ class ConversationManager: ObservableObject {
                             currentUserMessageId: currentUserMessageId,
                             turnStartDate: turnStartDate,
                             tailUserMessage: retryTail,
-                            deferredMCPSummaries: deferredMCPSummaries.isEmpty ? nil : deferredMCPSummaries
+                            deferredMCPSummaries: deferredMCPSummaries.isEmpty ? nil : deferredMCPSummaries,
+                            lane: .main
                         )
                         switch retryResponse {
                         case .text(let content, _, _, _, _, _):
@@ -9385,6 +9419,10 @@ class ConversationManager: ObservableObject {
                 failures.append(f)
             }
         }
+        // Session affinity (harness state, plan §5/§9): the file and every
+        // quarantined sibling, deleted under affinity.lock with a checked
+        // directory fsync; the next start mints a new salt and main ID.
+        failures.append(contentsOf: SessionAffinity.deleteForUserDataWipe())
         for (dir, label) in [
             (appFolder.appendingPathComponent("archive", isDirectory: true), "archive directory"),
             (appFolder.appendingPathComponent("subagent_sessions", isDirectory: true), "subagent sessions directory"),
@@ -9546,6 +9584,11 @@ class ConversationManager: ObservableObject {
         case rejectedArchive(String)
         /// applyStagedMind error: the replacement may be partial.
         case failedApply(String)
+        /// The session-affinity write after quiescence failed (plan §8):
+        /// nothing was discarded or replaced; the old Mind is intact.
+        /// `affinityAdvanced` says whether the new main conversation ID is
+        /// nevertheless in place (post-rename directory-fsync failure).
+        case failedBeforeApply(String, affinityAdvanced: Bool)
     }
 
     /// Full Mind-import orchestration, in the ONLY safe order (Codex round
@@ -9621,6 +9664,21 @@ class ConversationManager: ObservableObject {
         if let busy = await quiesceBackgroundWorkForMindRestore(timeoutSeconds: quiesceTimeoutSeconds) {
             await MindExportService.shared.discardStagedMind(staged)
             return .refusedBusy(busy)
+        }
+
+        // Session affinity (plan §8): the importing device's main
+        // conversation gets a new ID, written after successful quiescence and
+        // BEFORE anything is discarded, so a failure here aborts with the
+        // old Mind intact. Failure before the rename leaves the old state;
+        // failure at the directory fsync leaves the complete new state.
+        do {
+            try SessionAffinity.replaceMainConversationId()
+        } catch let failure as SessionAffinity.WriteFailure {
+            await MindExportService.shared.discardStagedMind(staged)
+            return .failedBeforeApply(failure.description, affinityAdvanced: failure.phase == .afterRename)
+        } catch {
+            await MindExportService.shared.discardStagedMind(staged)
+            return .failedBeforeApply("\(error)", affinityAdvanced: false)
         }
 
         await discardPreImportBackgroundOutputs()

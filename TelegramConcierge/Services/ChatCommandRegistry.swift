@@ -59,6 +59,8 @@ enum ChatCommandRegistry {
                     usage: "[lite]", inMenu: false, category: "Account"),
         ChatCommand(name: "importmind", description: "Restore a memory backup (asks for confirmation)",
                     usage: "[path]", inMenu: false, category: "Account"),
+        ChatCommand(name: "rotateaffinity", description: "Present a new session identity to OpenCode/OpenRouter from the next request (no data change)",
+                    usage: nil, inMenu: false, category: "Account"),
         ChatCommand(name: "resumewatcher", description: "Review and re-arm watchers quarantined by a memory import",
                     usage: "[id]", inMenu: false, category: "Account"),
         ChatCommand(name: "switchbot", description: "Move Briglia to a different Telegram bot (guided, asks for confirmation)",

@@ -110,7 +110,7 @@ enum WebSearchBackend: String {
             let profileKey = first(ProviderProfiles.opencodeApiKeyKey)
             if !profileKey.isEmpty { return profileKey }
             let mainBase = KeychainHelper.load(key: KeychainHelper.openAICompatibleBaseURLKey) ?? ""
-            if mainBase.contains("opencode.ai") {
+            if SessionAffinity.isOpenCodeBaseURL(mainBase) {
                 return first(KeychainHelper.openAICompatibleApiKeyKey)
             }
             return ""
@@ -915,7 +915,7 @@ actor WebOrchestrator {
                 data = try await httpJSONPostWithRetry(
                     url: backend.endpoint,
                     body: body,
-                    headers: requestHeaders(for: backend),
+                    headers: try requestHeaders(for: backend, url: backend.endpoint, lane: .ephemeral(executionID)),
                     timeout: generous ? 600 : 120,
                     label: "\(backend.rawValue) \(stage)",
                     retryTimeouts: !generous
@@ -1009,7 +1009,7 @@ actor WebOrchestrator {
             let data = try await httpJSONPostWithRetry(
                 url: Endpoints.openaiResponses,
                 body: req,
-                headers: requestHeaders(for: .openai),
+                headers: try requestHeaders(for: .openai, url: Endpoints.openaiResponses, lane: .ephemeral(executionID)),
                 timeout: generous ? 600 : 120,
                 label: "openai \(stage)",
                 retryTimeouts: !generous
@@ -1426,7 +1426,7 @@ actor WebOrchestrator {
                 data = try await httpJSONPostWithRetry(
                     url: backend.endpoint,
                     body: body,
-                    headers: requestHeaders(for: backend),
+                    headers: try requestHeaders(for: backend, url: backend.endpoint, lane: .ephemeral(executionID)),
                     timeout: timeout,
                     label: "\(backend.rawValue) \(stage)",
                     retryTimeouts: retryTimeouts
@@ -2290,13 +2290,16 @@ actor WebOrchestrator {
         return WebSearchBackend.storedKey(for: backend)
     }
 
-    private func requestHeaders(for backend: WebSearchBackend) -> [String: String] {
-        var headers = ["Authorization": "Bearer \(apiKey(for: backend))"]
-        if backend == .opencode {
-            // OpenCode Go sits behind Cloudflare, which 403s (error 1010)
-            // requests whose User-Agent looks like a script.
-            let version = adaCLIVersion
-            headers["User-Agent"] = "Briglia/\(version) (\(PlatformOS.userAgentToken))"
+    /// Model-request headers for `url`: the backend's credential plus the
+    /// affinity decorator's output (User-Agent always; the OpenCode session
+    /// header when the URL is OpenCode's — required, so a failed affinity
+    /// load throws; OpenRouter's optional session header). One
+    /// `.ephemeral(executionID)` lane per web run (plan §7.1 site 8).
+    func requestHeaders(for backend: WebSearchBackend, url: URL, lane: AffinityLane) throws -> [String: String] {
+        let key = apiKey(for: backend)
+        var headers = ["Authorization": "Bearer \(key)"]
+        for (name, value) in try SessionAffinity.headers(url: url, apiKey: key, lane: lane) {
+            headers[name] = value
         }
         return headers
     }

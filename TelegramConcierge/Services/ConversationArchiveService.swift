@@ -368,6 +368,17 @@ actor ConversationArchiveService {
         currentProvider.isCustomEndpoint
     }
 
+    /// The bare credential the active provider receives (affinity input).
+    private var activeAPIKey: String {
+        switch currentProvider {
+        case .openRouter: return apiKey
+        case .lmStudio: return "lm-studio"
+        case .openAICompatible:
+            return KeychainHelper.load(key: KeychainHelper.openAICompatibleApiKeyKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+    }
+
     /// Authorization header value for the active provider.
     private var authorizationHeaderValue: String {
         switch currentProvider {
@@ -2215,10 +2226,7 @@ actor ConversationArchiveService {
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue(authorizationHeaderValue, forHTTPHeaderField: "Authorization")
-            if !usingCustomEndpoint {
-                request.setValue("Briglia/1.0", forHTTPHeaderField: "HTTP-Referer")
-                request.setValue("Telegram Concierge Bot", forHTTPHeaderField: "X-Title")
-            }
+            try SessionAffinity.decorate(&request, apiKey: activeAPIKey, lane: .archive)
             request.timeoutInterval = usingCustomEndpoint ? 1200 : 360
             request.httpBody = try JSONEncoder().encode(body)
 

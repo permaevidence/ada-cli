@@ -88,6 +88,18 @@ actor OpenRouterService {
         currentProvider.isCustomEndpoint
     }
 
+    /// The bare credential the active provider receives (the affinity
+    /// derivation input, plan §4); mirrors `authorizationHeaderValue`.
+    private var activeAPIKey: String {
+        switch currentProvider {
+        case .openRouter: return apiKey
+        case .lmStudio: return "lm-studio"
+        case .openAICompatible:
+            return KeychainHelper.load(key: KeychainHelper.openAICompatibleApiKeyKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+    }
+
     /// Authorization header value for the active provider.
     /// - OpenRouter: the configured OpenRouter key.
     /// - Local inference: a throwaway token (most local servers ignore it).
@@ -1416,7 +1428,8 @@ actor OpenRouterService {
         providerOverride: [String]? = nil,
         reasoningEffortOverride: String? = nil,
         textOnlyOverride: Bool? = nil,
-        deferredMCPSummaries: [(name: String, description: String, toolCount: Int)]? = nil
+        deferredMCPSummaries: [(name: String, description: String, toolCount: Int)]? = nil,
+        lane: AffinityLane
     ) async throws -> LLMResponse {
         guard isCustomEndpoint || !apiKey.isEmpty else {
             throw OpenRouterError.notConfigured
@@ -2103,10 +2116,7 @@ actor OpenRouterService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(authorizationHeaderValue, forHTTPHeaderField: "Authorization")
-        if !usingCustomEndpoint {
-            request.setValue("Briglia/1.0", forHTTPHeaderField: "HTTP-Referer")
-            request.setValue("Telegram Concierge Bot", forHTTPHeaderField: "X-Title")
-        }
+        try SessionAffinity.decorate(&request, apiKey: activeAPIKey, lane: lane)
         // Local inference and large reasoning models can legitimately take a long time.
         request.timeoutInterval = usingCustomEndpoint ? 1200 : 360
 
@@ -3042,6 +3052,7 @@ actor OpenRouterService {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("Bearer \(backend.bearer)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        try SessionAffinity.decorate(&urlRequest, apiKey: backend.bearer, lane: .ephemeral(UUID()))
         urlRequest.timeoutInterval = 120
         urlRequest.httpBody = try JSONEncoder().encode(request)
 
@@ -3259,6 +3270,7 @@ actor OpenRouterService {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("Bearer \(backend.bearer)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        try SessionAffinity.decorate(&urlRequest, apiKey: backend.bearer, lane: .ephemeral(UUID()))
         urlRequest.timeoutInterval = 120
         urlRequest.httpBody = try JSONEncoder().encode(request)
 
@@ -3372,6 +3384,7 @@ actor OpenRouterService {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("Bearer \(backend.bearer)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        try SessionAffinity.decorate(&urlRequest, apiKey: backend.bearer, lane: .ephemeral(UUID()))
         urlRequest.timeoutInterval = 120
         urlRequest.httpBody = try JSONEncoder().encode(request)
 
@@ -3612,16 +3625,21 @@ actor OpenRouterService {
         // Make API call (uses separate endpoint for LM Studio to preserve main KV cache)
         var urlRequest = URLRequest(url: URL(string: descriptionURL)!)
         urlRequest.httpMethod = "POST"
+        let descriptionCredential: String
         if usingCustomEndpointForDescriptions {
             // Custom endpoint (local or remote OpenAI-compatible): use its provider-specific auth.
             urlRequest.setValue(authorizationHeaderValue, forHTTPHeaderField: "Authorization")
+            descriptionCredential = activeAPIKey
         } else if let visionDescriptionBackend {
             // Text-only mode: same credentials as the vision backend.
             urlRequest.setValue("Bearer \(visionDescriptionBackend.bearer)", forHTTPHeaderField: "Authorization")
+            descriptionCredential = visionDescriptionBackend.bearer
         } else {
             urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            descriptionCredential = apiKey
         }
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        try SessionAffinity.decorate(&urlRequest, apiKey: descriptionCredential, lane: .ephemeral(UUID()))
         urlRequest.timeoutInterval = usingCustomEndpointForDescriptions ? 1200 : 360
         urlRequest.httpBody = try JSONEncoder().encode(request)
         

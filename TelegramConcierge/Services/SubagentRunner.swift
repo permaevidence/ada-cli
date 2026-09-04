@@ -311,8 +311,9 @@ actor SubagentRunner {
                modelOverride: effectiveModelOverride,
                providerOverride: effectiveProviderOverride,
                reasoningEffortOverride: effectiveReasoningOverride,
-               textOnlyOverride: effectiveTextOnlyOverride
-           ) {
+               textOnlyOverride: effectiveTextOnlyOverride,
+           lane: .subagent(resolvedSessionId)
+) {
             messagesForLLM = compacted.messages
             priorToolInteractions = compacted.interactions
             compactionsUsed += 1
@@ -362,8 +363,9 @@ actor SubagentRunner {
                        modelOverride: effectiveModelOverride,
                        providerOverride: effectiveProviderOverride,
                        reasoningEffortOverride: effectiveReasoningOverride,
-                       textOnlyOverride: effectiveTextOnlyOverride
-                   ) {
+                       textOnlyOverride: effectiveTextOnlyOverride,
+                   lane: .subagent(resolvedSessionId)
+) {
                     messagesForLLM = compacted.messages
                     toolInteractions = compacted.interactions
                     priorToolInteractions = compacted.interactions  // commitRun appends relative to this baseline
@@ -401,7 +403,8 @@ actor SubagentRunner {
                     modelOverride: effectiveModelOverride,
                     providerOverride: effectiveProviderOverride,
                     reasoningEffortOverride: effectiveReasoningOverride,
-                    textOnlyOverride: effectiveTextOnlyOverride
+                    textOnlyOverride: effectiveTextOnlyOverride,
+                    lane: .subagent(resolvedSessionId)
                 )
                 markProgress()  // LLM responded — subagent is alive
 
@@ -447,7 +450,8 @@ actor SubagentRunner {
                                 modelOverride: effectiveModelOverride,
                                 providerOverride: effectiveProviderOverride,
                                 reasoningEffortOverride: effectiveReasoningOverride,
-                                textOnlyOverride: effectiveTextOnlyOverride
+                                textOnlyOverride: effectiveTextOnlyOverride,
+                                lane: .subagent(resolvedSessionId)
                             )
                             markProgress()
 
@@ -544,8 +548,9 @@ actor SubagentRunner {
                                    modelOverride: effectiveModelOverride,
                                    providerOverride: effectiveProviderOverride,
                                    reasoningEffortOverride: effectiveReasoningOverride,
-                                   textOnlyOverride: effectiveTextOnlyOverride
-                               ),
+                                   textOnlyOverride: effectiveTextOnlyOverride,
+                               lane: .subagent(resolvedSessionId)
+),
                                compacted.estimatedTokens < turnTokenBudget {
                                 messagesForLLM = compacted.messages
                                 toolInteractions = compacted.interactions
@@ -611,7 +616,8 @@ actor SubagentRunner {
                         modelOverride: effectiveModelOverride,
                         providerOverride: effectiveProviderOverride,
                         reasoningEffortOverride: effectiveReasoningOverride,
-                        textOnlyOverride: effectiveTextOnlyOverride
+                        textOnlyOverride: effectiveTextOnlyOverride,
+                        lane: .subagent(resolvedSessionId)
                     )
                     markProgress()
 
@@ -726,7 +732,8 @@ actor SubagentRunner {
         modelOverride: String?,
         providerOverride: [String]?,
         reasoningEffortOverride: String?,
-        textOnlyOverride: Bool?
+        textOnlyOverride: Bool?,
+        lane: AffinityLane
     ) async -> CompactionOutcome? {
         var keptMessages = messages
         var keptInteractions = interactions
@@ -758,7 +765,8 @@ actor SubagentRunner {
             modelOverride: modelOverride,
             providerOverride: providerOverride,
             reasoningEffortOverride: reasoningEffortOverride,
-            textOnlyOverride: textOnlyOverride
+            textOnlyOverride: textOnlyOverride,
+            lane: lane
         ) else { return nil }
 
         let summaryMsg = Message(role: .user, content: summary, timestamp: Date(timeIntervalSince1970: 0))
@@ -795,7 +803,8 @@ actor SubagentRunner {
         modelOverride: String?,
         providerOverride: [String]?,
         reasoningEffortOverride: String?,
-        textOnlyOverride: Bool?
+        textOnlyOverride: Bool?,
+        lane: AffinityLane
     ) async -> String? {
         // Build a text representation of the evicted content.
         var transcript = ""
@@ -860,7 +869,8 @@ actor SubagentRunner {
                     modelOverride: modelOverride,
                     providerOverride: providerOverride,
                     reasoningEffortOverride: reasoningEffortOverride,
-                    textOnlyOverride: textOnlyOverride
+                    textOnlyOverride: textOnlyOverride,
+                    lane: lane
                 )
 
                 switch response {

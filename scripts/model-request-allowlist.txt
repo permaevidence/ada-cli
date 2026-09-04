@@ -1,0 +1,26 @@
+# Model-request allowlist — URLRequest(url sites under TelegramConcierge/ that are
+# NOT decorated by SessionAffinity in the same function. Format:
+# <path> :: <trimmed source line> :: <reason>. A reason of 'unreviewed' fails the scan.
+# Regenerate missing entries with scripts/model_request_scan.py --regen; prune stale
+# ones with --prune. Sorted by path so merges are trivial.
+TelegramConcierge/CLI/ReleaseSigning.swift :: var request = URLRequest(url: url) :: signed-release download (GitHub Releases), not a model request
+TelegramConcierge/CLI/SetupAPICommand.swift :: var request = URLRequest(url: url) :: Telegram Bot API probe (getMe/getChat), not a model request
+TelegramConcierge/CLI/TranscriptionService.swift :: var request = URLRequest(url: endpoint) :: OpenAI audio transcription endpoint; OpenAI direct carries no session header (plan §6)
+TelegramConcierge/CLI/WizardIO.swift :: var request = URLRequest(url: URL(string: DevProbeOverride.url("https://api.openai.com/v1/models", dev: "/openai/v1/models"))!) :: OpenAI key probe (models list), not a model request
+TelegramConcierge/CLI/WizardIO.swift :: var request = URLRequest(url: URL(string: DevProbeOverride.url("https://google.serper.dev/search", dev: "/serper/search"))!) :: Serper key probe
+TelegramConcierge/CLI/WizardIO.swift :: var request = URLRequest(url: URL(string: DevProbeOverride.url("https://r.jina.ai/https://example.com/", dev: "/jina/https://example.com/"))!) :: Jina key probe
+TelegramConcierge/CLI/WizardIO.swift :: var request = URLRequest(url: url) :: Telegram getMe probe (Probes.telegram); the chat-completion probe in the same file is decorated
+TelegramConcierge/Services/AgentMailService.swift :: var request = URLRequest(url: url) :: AgentMail REST API, not a model request
+TelegramConcierge/Services/BalanceMonitor.swift :: let req = URLRequest(url: comps.url!) :: balance/credit lookups (OpenRouter credits/key, Serper account, Jina), not model requests
+TelegramConcierge/Services/BalanceMonitor.swift :: var req = URLRequest(url: URL(string: "https://google.serper.dev/account")!) :: balance/credit lookups (OpenRouter credits/key, Serper account, Jina), not model requests
+TelegramConcierge/Services/BalanceMonitor.swift :: var req = URLRequest(url: URL(string: "https://openrouter.ai/api/v1/credits")!) :: balance/credit lookups (OpenRouter credits/key, Serper account, Jina), not model requests
+TelegramConcierge/Services/BalanceMonitor.swift :: var req = URLRequest(url: URL(string: "https://openrouter.ai/api/v1/key")!) :: balance/credit lookups (OpenRouter credits/key, Serper account, Jina), not model requests
+TelegramConcierge/Services/ConversationManager.swift :: var request = URLRequest(url: URL(string: "\(telegramAPIBase)\(token)/getWebhookInfo")!) :: Telegram Bot API (getWebhookInfo / getChat / setMyCommands), not a model request
+TelegramConcierge/Services/ConversationManager.swift :: var request = URLRequest(url: components.url!) :: Telegram Bot API (getWebhookInfo / getChat / setMyCommands), not a model request
+TelegramConcierge/Services/ConversationManager.swift :: var request = URLRequest(url: url) :: Telegram Bot API (getWebhookInfo / getChat / setMyCommands), not a model request
+TelegramConcierge/Services/GeminiImageService.swift :: var request = URLRequest(url: url) :: image generation API (Gemini), not a chat-model request; no affinity semantics
+TelegramConcierge/Services/TelegramBotService.swift :: var request = URLRequest(url: downloadURL) :: Telegram Bot API transport, not a model request
+TelegramConcierge/Services/TelegramBotService.swift :: var request = URLRequest(url: url) :: Telegram Bot API transport, not a model request
+TelegramConcierge/Services/TelegramBotService.swift :: var request = URLRequest(url: urlComponents.url!) :: Telegram Bot API transport, not a model request
+TelegramConcierge/Services/WebOrchestrator+Helpers.swift :: var request = URLRequest(url: url) :: generic JSON POST helper; only forwards the headers it is given — model callers decorate via WebOrchestrator.requestHeaders(for:url:lane:) (plan §7.1 site 8), non-model callers (Serper) pass none
+TelegramConcierge/Services/WebOrchestrator.swift :: var req = URLRequest(url: proxyURL) :: Jina Reader proxy fetch, not a model request

@@ -369,6 +369,22 @@ def main():
     check("private-storage repository scan (writes under the roots are routed or allowlisted)",
           scan.returncode == 0, (scan.stdout + scan.stderr)[-1500:])
 
+    # Session affinity (x-opencode-session / x-session-id): host rule, HMAC
+    # derivation, the decorator on the real builders against a local capture
+    # server, stability, separation, key change, two-process creation,
+    # quarantine, durability seams, wipe, Mind ID replacement, /rotateaffinity.
+    result = subprocess.run([os.path.abspath(ADA), "__affinity-selftest"], capture_output=True,
+                            text=True, timeout=300)
+    check("affinity-selftest", result.returncode == 0,
+          (result.stdout + result.stderr)[-1500:])
+
+    # Repository invariant: every URLRequest to a model endpoint is decorated
+    # by SessionAffinity in the same function, or allowlisted with a reason.
+    scan = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "model_request_scan.py")],
+                          capture_output=True, text=True, timeout=60)
+    check("model-request repository scan (every model request site is decorated or allowlisted)",
+          scan.returncode == 0, (scan.stdout + scan.stderr)[-1500:])
+
     result = subprocess.run([os.path.abspath(ADA), "__mcp-surface-selftest"], capture_output=True,
                             text=True, timeout=300)
     check("mcp-surface-selftest", result.returncode == 0,

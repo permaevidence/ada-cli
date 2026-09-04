@@ -320,7 +320,7 @@ enum ProviderProfiles {
                       let model = value(KeychainHelper.openAICompatibleModelKey),
                       let apiKey = value(KeychainHelper.openAICompatibleApiKeyKey) else { return }
                 let effort = value(KeychainHelper.openAICompatibleReasoningEffortKey)
-                if baseURL.contains("opencode.ai") {
+                if SessionAffinity.isOpenCodeBaseURL(baseURL) {
                     try saveProfile(.opencode, apiKey: apiKey, baseURL: nil, model: model,
                                     effort: effort, textOnly: globalTextOnly)
                     try KeychainHelper.save(key: activeProfileKey, value: Profile.opencode.rawValue)

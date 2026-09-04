@@ -206,20 +206,24 @@ struct UserContextStructurer {
         var request = URLRequest(url: configuredURL())
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let credential: String
         switch provider {
         case .lmStudio:
+            credential = "lm-studio"
             request.setValue("Bearer lm-studio", forHTTPHeaderField: "Authorization")
             request.timeoutInterval = 1200
         case .openAICompatible:
             let key = config.openAICompatibleApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            credential = key
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
             request.timeoutInterval = 1200
         case .openRouter:
+            credential = trimmedOpenRouterAPIKey
             request.setValue("Bearer \(trimmedOpenRouterAPIKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("Briglia/1.0", forHTTPHeaderField: "HTTP-Referer")
-            request.setValue("Telegram Concierge Bot", forHTTPHeaderField: "X-Title")
             request.timeoutInterval = 360
         }
+        // One ephemeral lane per structuring operation (plan §3.1).
+        try SessionAffinity.decorate(&request, apiKey: credential, lane: .ephemeral(UUID()))
         request.httpBody = try JSONSerialization.data(withJSONObject: requestPayload)
 
         let (data, response) = try await URLSession.shared.data(for: request)

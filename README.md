@@ -57,6 +57,7 @@ Commands:
 | --- | --- |
 | `briglia` / `briglia chat` | interactive chat REPL (`/stop`, `/status`, `/prune`, `/attach`, `/quit`) |
 | `briglia setup` | setup wizard; rerun any single section later. Step 1 can configure SEVERAL main-agent providers (OpenCode Go, OpenRouter, custom endpoint, local server) — hop between them anytime with `/provider <name>` in chat |
+| session affinity | requests to OpenCode Go carry the required `x-opencode-session` header and requests to OpenRouter the optional `x-session-id` (one opaque HMAC-derived value per conversation, subagent session or background run; state in `~/.local/share/briglia/affinity.json`, never exported, wiped by `/deleteuserdata`, refreshed by the hidden `/rotateaffinity`). The header is sent only to `opencode.ai` / `openrouter.ai` hosts directly — a proxy in front of OpenCode must add its own |
 | `briglia daemon` | headless mode — Telegram channel only. One conversation-owning instance at a time: `briglia` and `briglia daemon` share state, so the second refuses to start |
 | `briglia service install` | Linux: systemd user service for the daemon (auto-start at boot via linger; keep-awake support on Ubuntu Touch). `status`/`uninstall` included |
 | `briglia toolchain` | Linux: install/upgrade/remove the media toolchain (poppler, ImageMagick, ffmpeg, optional LibreOffice/pandoc); userdata prefix on Ubuntu Touch |

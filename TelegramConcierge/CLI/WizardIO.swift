@@ -164,8 +164,11 @@ enum Probes {
         baseURL: String, apiKey: String?, model: String, fallbackModels: [String]
     ) async -> String? {
         var lastFailure: String?
+        // One probe lane for the whole operation, shared by every fallback
+        // candidate (plan §3.1).
+        let lane = AffinityLane.probe(UUID())
         for candidate in [model] + fallbackModels {
-            let failure = await chatCompletion(baseURL: baseURL, apiKey: apiKey, model: candidate)
+            let failure = await chatCompletion(baseURL: baseURL, apiKey: apiKey, model: candidate, lane: lane)
             guard let failure else {
                 if candidate != model {
                     print("(\(model) endpoint is down — validated with \(candidate) instead)",
@@ -184,7 +187,9 @@ enum Probes {
     }
 
     /// One tiny completion against any OpenAI-compatible /chat/completions.
-    static func chatCompletion(baseURL rawBase: String, apiKey: String?, model: String) async -> String? {
+    /// `lane` defaults to a fresh probe lane for single-shot callers.
+    static func chatCompletion(baseURL rawBase: String, apiKey: String?, model: String,
+                               lane: AffinityLane = .probe(UUID())) async -> String? {
         var baseURL = rawBase
         if DevProbeOverride.base != nil {
             if rawBase == OpenCodeGo.baseURL { baseURL = DevProbeOverride.chatBase(rawBase, service: "opencode") }
@@ -198,6 +203,11 @@ enum Probes {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey, !apiKey.isEmpty {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        do {
+            try SessionAffinity.decorate(&request, apiKey: apiKey ?? "", lane: lane)
+        } catch {
+            return "session affinity state unavailable: \(error)"
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "model": model,

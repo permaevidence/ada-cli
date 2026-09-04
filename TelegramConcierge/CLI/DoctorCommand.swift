@@ -83,6 +83,13 @@ struct Doctor: AsyncParsableCommand {
             }
         }
 
+        // Session affinity (x-opencode-session / x-session-id): state file
+        // validity, what the active provider receives, quarantined copies.
+        print("\nSession affinity")
+        for finding in SessionAffinity.doctorFindings(activeBaseURL: provider == .openRouter ? "https://openrouter.ai/api/v1" : baseURL) {
+            if finding.problem { check(finding.text, ok: false, hint: finding.hint) } else { note(finding.text) }
+        }
+
         // Managed Playwright (Release C): the entry's shape, the referenced
         // install's marker, unreferenced/leftover directories, last bootstrap.
         let playwrightFindings = ManagedPlaywright.doctorFindings(
