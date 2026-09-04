@@ -23,6 +23,7 @@ enum WizardIO {
 
     static func ask(_ prompt: String, default defaultValue: String? = nil) -> String {
         print("\(prompt): ", terminator: "")
+        fflush(stdout)   // a piped stdout is fully buffered; the prompt must be visible before the read
         let line = readLineOrExit().trimmingCharacters(in: .whitespaces)
         if line.isEmpty, let defaultValue { return defaultValue }
         return line
@@ -118,6 +119,26 @@ enum WizardIO {
 
 /// Inline network validation probes. Each returns nil on success or a short
 /// human-readable failure reason.
+/// Dev-build-only redirection of every setup probe to a local mock server
+/// (`BRIGLIA_DEV_PROBE_BASE=http://127.0.0.1:port`), for the quick-setup
+/// headless smoke and browser tests. Release builds (no `-dev` suffix)
+/// ignore the variable entirely.
+enum DevProbeOverride {
+    static let base: String? = {
+        guard adaCLIVersion.hasSuffix("-dev"),
+              let raw = ProcessInfo.processInfo.environment["BRIGLIA_DEV_PROBE_BASE"], !raw.isEmpty else { return nil }
+        return raw.hasSuffix("/") ? String(raw.dropLast()) : raw
+    }()
+    static func url(_ production: String, dev path: String) -> String {
+        guard let base else { return production }
+        return base + path
+    }
+    static func chatBase(_ production: String, service: String) -> String {
+        guard let base else { return production }
+        return "\(base)/\(service)/v1"
+    }
+}
+
 enum Probes {
     /// How a failed probe should steer the retry loop: auth failures are
     /// terminal for the key, server-side failures say nothing about the key
@@ -163,7 +184,12 @@ enum Probes {
     }
 
     /// One tiny completion against any OpenAI-compatible /chat/completions.
-    static func chatCompletion(baseURL: String, apiKey: String?, model: String) async -> String? {
+    static func chatCompletion(baseURL rawBase: String, apiKey: String?, model: String) async -> String? {
+        var baseURL = rawBase
+        if DevProbeOverride.base != nil {
+            if rawBase == OpenCodeGo.baseURL { baseURL = DevProbeOverride.chatBase(rawBase, service: "opencode") }
+            else if rawBase == "https://openrouter.ai/api/v1" { baseURL = DevProbeOverride.chatBase(rawBase, service: "openrouter") }
+        }
         let trimmedBase = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         guard let url = URL(string: "\(trimmedBase)/chat/completions") else { return "invalid base URL" }
         var request = URLRequest(url: url)
@@ -182,14 +208,14 @@ enum Probes {
     }
 
     static func openAI(apiKey: String) async -> String? {
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/models")!)
+        var request = URLRequest(url: URL(string: DevProbeOverride.url("https://api.openai.com/v1/models", dev: "/openai/v1/models"))!)
         request.timeoutInterval = 30
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         return await expectHTTP200(request, service: "OpenAI")
     }
 
     static func serper(apiKey: String) async -> String? {
-        var request = URLRequest(url: URL(string: "https://google.serper.dev/search")!)
+        var request = URLRequest(url: URL(string: DevProbeOverride.url("https://google.serper.dev/search", dev: "/serper/search"))!)
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         request.setValue(apiKey, forHTTPHeaderField: "X-API-KEY")
@@ -199,14 +225,14 @@ enum Probes {
     }
 
     static func jina(apiKey: String) async -> String? {
-        var request = URLRequest(url: URL(string: "https://r.jina.ai/https://example.com/")!)
+        var request = URLRequest(url: URL(string: DevProbeOverride.url("https://r.jina.ai/https://example.com/", dev: "/jina/https://example.com/"))!)
         request.timeoutInterval = 45
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         return await expectHTTP200(request, service: "Jina")
     }
 
     static func telegram(token: String) async -> String? {
-        guard let url = URL(string: "https://api.telegram.org/bot\(token)/getMe") else {
+        guard let url = URL(string: DevProbeOverride.url("https://api.telegram.org/bot\(token)/getMe", dev: "/telegram/bot\(token)/getMe")) else {
             return "invalid token format"
         }
         var request = URLRequest(url: url)

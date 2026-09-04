@@ -108,24 +108,16 @@ enum ToolchainService {
     }
 
     static func linuxPackageManager() -> LinuxPackageManager? {
-        if PlatformBinary.find("apt-get") != nil {
-            return LinuxPackageManager(name: "apt-get", installArgs: ["install", "-y"])
-        }
-        if PlatformBinary.find("dnf") != nil {
-            return LinuxPackageManager(name: "dnf", installArgs: ["install", "-y"])
-        }
-        if PlatformBinary.find("pacman") != nil {
-            return LinuxPackageManager(name: "pacman", installArgs: ["-S", "--noconfirm"])
+        for name in ["apt-get", "dnf", "pacman"] where PlatformBinary.find(name) != nil {
+            return LinuxPackageManager(name: name, installArgs: LinuxPackageMap.installArgs(for: name))
         }
         return nil
     }
 
     /// Map the curated Homebrew package names to their distribution names.
     static func linuxPackageName(forBrewPackage package: String) -> String {
-        switch package {
-        case "poppler": return "poppler-utils"
-        default: return package
-        }
+        let manager = linuxPackageManager()?.name ?? "apt-get"
+        return LinuxPackageMap.package(package, manager: manager)
     }
 
     /// Public entry for the wizard's required-package installs (poppler,
@@ -182,6 +174,30 @@ enum ToolchainService {
             return .ok
         }
         return out == "True" ? .externallyManaged : .ok
+    }
+
+    /// The exact mandatory set of the desktop quick setup (plan §4.7):
+    /// every doctor entry except the html-to-pdf engine (weasyprint on
+    /// macOS without pango is a broken install; Chrome covers it), plus
+    /// LibreOffice. `nil` when the doctor could not run.
+    static let doctorExclusions: Set<String> = ["html-to-pdf engine"]
+
+    struct DesktopStatus: Equatable {
+        var doctorRan: Bool
+        var missing: [String]
+        var libreOffice: Bool
+        var mandatoryMissing: [String]
+        var complete: Bool { doctorRan && mandatoryMissing.isEmpty && libreOffice }
+    }
+
+    static func desktopStatus() -> DesktopStatus {
+        let libre = libreOfficePresent()
+        guard let report = runDoctor() else {
+            return DesktopStatus(doctorRan: false, missing: [], libreOffice: libre, mandatoryMissing: [])
+        }
+        let missing = report.missing.map(\.name)
+        let mandatory = missing.filter { !doctorExclusions.contains($0) }
+        return DesktopStatus(doctorRan: true, missing: missing, libreOffice: libre, mandatoryMissing: mandatory)
     }
 
     /// True when LibreOffice is installed (app bundle or PATH).
@@ -256,7 +272,7 @@ enum ToolchainService {
             guard let manager = linuxPackageManager() else {
                 return "no supported package manager found (apt-get/dnf/pacman)"
             }
-            return linuxInstall(linuxPackageName(forBrewPackage: spec.package), manager: manager)
+            return linuxInstall(LinuxPackageMap.package(spec.package, manager: manager.name), manager: manager)
             #else
             guard let brew = brewPath() else { return "Homebrew non trovato" }
             let args = spec.manager == "brewCask"
@@ -278,7 +294,7 @@ enum ToolchainService {
         guard let manager = linuxPackageManager() else {
             return "no supported package manager found (apt-get/dnf/pacman)"
         }
-        return linuxInstall("libreoffice", manager: manager)
+        return linuxInstall(LinuxPackageMap.package("libreoffice", manager: manager.name), manager: manager)
         #else
         guard let brew = brewPath() else { return "Homebrew non trovato" }
         let result = await GoogleWorkspaceService.runProcessAsync(

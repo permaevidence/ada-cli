@@ -23,6 +23,7 @@ import Glibc
 /// concurrent REPL read would SIGTTIN-stop the whole process. The setup
 /// wizard and the standalone `briglia upgrade` command qualify; the in-chat
 /// upgrade path (REPL/Telegram) must not use it — it never runs sudo.
+/// `briglia quicksetup` suspends its Enter listener before every lend.
 enum TerminalHandoff {
     /// Launches the process and waits for it, giving it the terminal's
     /// foreground process group for the duration. Falls back to a plain
@@ -44,5 +45,51 @@ enum TerminalHandoff {
         process.waitUntilExit()
         _ = tcsetpgrp(STDIN_FILENO, getpgrp())
         signal(SIGTTOU, previousTTOU)
+    }
+
+    struct LendError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// The foreground lend for an ALREADY-SPAWNED, blocked child (the
+    /// quick-setup job gate): `restore()` gives the terminal back to
+    /// Briglia's own process group and reinstates the SIGTTOU disposition.
+    /// Call it from a `defer` so a throw between lend and wait cannot leave
+    /// the terminal owned by a dead group.
+    final class ForegroundLend {
+        private let previousTTOU: (@convention(c) (Int32) -> Void)?
+        private var restored = false
+        fileprivate init(previousTTOU: (@convention(c) (Int32) -> Void)?) { self.previousTTOU = previousTTOU }
+
+        func restore() {
+            guard !restored else { return }
+            restored = true
+            _ = Self.tcsetpgrpImpl(STDIN_FILENO, getpgrp())
+            if let previousTTOU { signal(SIGTTOU, previousTTOU) }
+        }
+
+        /// Selftest seam for the tcsetpgrp(2) call (inject EPERM/ENOTTY).
+        nonisolated(unsafe) static var tcsetpgrpImpl: (Int32, pid_t) -> Int32 = { fd, pgid in
+            tcsetpgrp(fd, pgid)
+        }
+    }
+
+    /// Give the terminal's foreground slot to `pgid` (a child that is its
+    /// own process-group leader, spawned blocked on the release pipe and
+    /// not yet executing). Throws when stdin is not a terminal or the
+    /// kernel refuses (EPERM: the group is not in our session; EINVAL;
+    /// ENOTTY) — the caller must then NOT release the child.
+    static func lendForeground(toPGID pgid: pid_t) throws -> ForegroundLend {
+        guard isatty(STDIN_FILENO) == 1 else {
+            throw LendError(description: "stdin is not a terminal — this step needs an interactive terminal")
+        }
+        let previousTTOU = signal(SIGTTOU, SIG_IGN)
+        errno = 0
+        if ForegroundLend.tcsetpgrpImpl(STDIN_FILENO, pgid) != 0 {
+            let code = errno
+            signal(SIGTTOU, previousTTOU)
+            throw LendError(description: "tcsetpgrp(\(pgid)) failed: \(String(cString: strerror(code)))")
+        }
+        return ForegroundLend(previousTTOU: previousTTOU)
     }
 }

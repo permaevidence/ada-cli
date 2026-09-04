@@ -22,6 +22,13 @@ final class TerminalSession {
     private var printedMessageIds = Set<UUID>()
     private var lastActivityDescription: String?
     private var signalSources: [DispatchSourceSignal] = []
+    /// The exclusive instance lease: acquired at start, or ADOPTED from
+    /// `briglia quicksetup` (which holds it through its run and hands it
+    /// over instead of releasing — a second flock in the same process would
+    /// block). Released explicitly on every shutdown path.
+    private var lease: InstanceLease?
+    private static let leaseReleaseLock = NSLock()
+    nonisolated(unsafe) private static var leaseForSignalHandler: InstanceLease?
 
     /// Messages suppressed while privacy mode (/hide) was active, replayed
     /// in order when the user sends /show. Mirrors the app, where the
@@ -38,11 +45,12 @@ final class TerminalSession {
 
     // MARK: - Entry points
 
-    func runChat() async throws {
-        try await start(headless: false)
+    func runChat(adopting lease: InstanceLease? = nil) async throws {
+        try await start(headless: false, adopting: lease)
         printWelcome()
         await inputLoop()
         Self.shutdownChildProcesses()
+        releaseLease()
     }
 
     func runDaemon() async throws {
@@ -53,7 +61,7 @@ final class TerminalSession {
         if !telegramConfigured {
             print("⚠ Telegram is not configured — the daemon will listen only on the companion-app socket. Run `briglia setup` to add Telegram.")
         }
-        try await start(headless: true)
+        try await start(headless: true, adopting: nil)
         print("Briglia daemon running — listening on \(telegramConfigured ? "Telegram and the app socket" : "the app socket"). Ctrl-C to stop.")
         while true {
             try await Task.sleep(nanoseconds: 3_600_000_000_000)
@@ -62,12 +70,21 @@ final class TerminalSession {
 
     // MARK: - Startup
 
-    private func start(headless: Bool) async throws {
-        if let conflict = InstanceLock.acquire() {
-            print("✖ \(conflict)")
-            throw ExitCode(1)
+    private func start(headless: Bool, adopting adopted: InstanceLease?) async throws {
+        if let adopted {
+            precondition(adopted.held, "adopted lease must be held")
+            lease = adopted
+        } else {
+            switch InstanceLease.acquire(label: headless ? "daemon" : "chat") {
+            case .success(let acquired): lease = acquired
+            case .failure(let conflict):
+                print("✖ \(conflict)")
+                throw ExitCode(1)
+            }
         }
+        Self.leaseForSignalHandler = lease
         installSignalHandlers()
+        KeepAwake.holdForProcessLifetime(reason: "Briglia is running")
         // Both roots must be usable directories before anything writes;
         // a root that exists as something else is a hard startup error.
         do {
@@ -449,11 +466,30 @@ final class TerminalSession {
                     AppChatSocketServer.shared.stop()
                 }
                 TerminalSession.shutdownChildProcesses()
+                TerminalSession.releaseLeaseForShutdown()
                 exit(0)
             }
             source.resume()
             signalSources.append(source)
         }
+    }
+
+    /// Release the instance lease after the poller stopped and the socket
+    /// closed. Explicit on every normal path, so the `deinit` fallback of
+    /// `InstanceLease` never fires for a session that ended cleanly.
+    private func releaseLease() {
+        AppChatSocketServer.shared.stop()
+        Self.releaseLeaseForShutdown()
+        lease = nil
+    }
+
+    /// Signal-handler-safe variant (runs on the main queue): releases the
+    /// lease registered at start, once.
+    static func releaseLeaseForShutdown() {
+        leaseReleaseLock.lock()
+        defer { leaseReleaseLock.unlock() }
+        if let lease = leaseForSignalHandler, lease.held { lease.release() }
+        leaseForSignalHandler = nil
     }
 
     /// Same contract as the app's AppShutdownDelegate: kill every child the

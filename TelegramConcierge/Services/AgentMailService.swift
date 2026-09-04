@@ -65,7 +65,7 @@ actor AgentMailService {
     private let maxUnread = 10
     private let maxInboxes = 5
 
-    private static let apiBase = "https://api.agentmail.to/v0"
+    private static let apiBase = DevProbeOverride.url("https://api.agentmail.to/v0", dev: "/agentmail/v0")
 
     // MARK: - Configuration
 
@@ -746,18 +746,6 @@ actor AgentMailService {
 // MARK: - Native CLI binary install (model-facing bash surface)
 
 extension AgentMailService {
-    /// Is Briglia's key-brokered install complete: the `agentmail` wrapper at
-    /// ~/.local/bin (verified by content, not just name) plus the real
-    /// binary beside it. A bare binary named `agentmail` — a pre-broker Briglia
-    /// install, npm, or Homebrew — does NOT count: without the broker it
-    /// cannot authenticate, so setup must not skip installation for it
-    /// (Codex, 2026-08-22).
-    static func agentMailBrokerInstalled() -> Bool {
-        let dir = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".local/bin", isDirectory: true)
-        return isBrokerWrapper(at: dir.appendingPathComponent("agentmail"))
-            && FileManager.default.isExecutableFile(atPath: dir.appendingPathComponent("agentmail-bin").path)
-    }
-
     /// Content check for the broker wrapper, parameterized so the selftest
     /// can exercise it against temp files.
     static func isBrokerWrapper(at url: URL) -> Bool {
@@ -774,140 +762,6 @@ extension AgentMailService {
     static func foreignAgentMailInstalls() -> [String] {
         ["/opt/homebrew/bin/agentmail", "/usr/local/bin/agentmail", "/usr/bin/agentmail"]
             .filter { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    /// Downloads the official native `agentmail` CLI (a standalone Go binary —
-    /// the npm package is just a wrapper around these same GitHub release
-    /// assets), verifies the SHA-256 against the published checksums file, and
-    /// installs to ~/.local/bin/agentmail. Returns nil on success or a
-    /// human-readable failure.
-    static func installAgentMailBinary(progress: (@Sendable (String) -> Void)? = nil) async -> String? {
-        // Latest version via the GitHub API (assets are version-named, so
-        // `releases/latest/download/` alone can't address them).
-        guard let apiURL = URL(string: "https://api.github.com/repos/agentmail-to/agentmail-cli/releases/latest") else {
-            return "internal error: malformed release-lookup URL"
-        }
-        var version = ""
-        do {
-            var lookup = URLRequest(url: apiURL)
-            lookup.timeoutInterval = 30
-            lookup.setValue("briglia-cli", forHTTPHeaderField: "User-Agent")
-            let (data, response) = try await URLSession.shared.data(for: lookup)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                return "release lookup failed (HTTP \(code)) — GitHub may be rate-limiting; retry in a few minutes"
-            }
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tag = json["tag_name"] as? String else {
-                return "release lookup returned no tag"
-            }
-            version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        } catch {
-            return "release lookup failed: \(error.localizedDescription)"
-        }
-
-        #if os(Linux)
-        #if arch(arm64)
-        let platformArch = "linux_arm64"
-        #else
-        let platformArch = "linux_amd64"
-        #endif
-        let ext = "tar.gz"
-        #else
-        #if arch(arm64)
-        let platformArch = "macos_arm64"
-        #else
-        let platformArch = "macos_amd64"
-        #endif
-        let ext = "zip"
-        #endif
-        let asset = "agentmail_\(version)_\(platformArch).\(ext)"
-        let base = "https://github.com/agentmail-to/agentmail-cli/releases/download/v\(version)/"
-        guard let assetURL = URL(string: base + asset),
-              let checksumsURL = URL(string: base + "agentmail_\(version)_checksums.txt") else {
-            return "internal error: malformed release URL"
-        }
-
-        do {
-            let archiveData = try await GoogleWorkspaceService.downloadReportingProgress(
-                from: assetURL, label: "Downloading the agentmail CLI", progress: progress)
-            let (checksumData, checksumResp) = try await URLSession.shared.data(from: checksumsURL)
-            if let code = (checksumResp as? HTTPURLResponse)?.statusCode, code != 200 {
-                return "checksum download failed (HTTP \(code))"
-            }
-            progress?("Installing agentmail…")
-            // Checksums file: one "<hex>  <filename>" line per asset.
-            guard let checksums = String(data: checksumData, encoding: .utf8),
-                  let line = checksums.split(separator: "\n").first(where: { $0.contains(asset) }),
-                  let expected = line.split(separator: " ").first.map(String.init)?.lowercased(),
-                  expected.count == 64 else {
-                return "checksum for \(asset) not found in checksums file"
-            }
-            let actual = SHA256.hash(data: archiveData).map { String(format: "%02x", $0) }.joined()
-            guard actual == expected else {
-                return "checksum mismatch — download corrupted or release changed mid-flight, retry"
-            }
-
-            let fm = FileManager.default
-            let tmpDir = fm.temporaryDirectory.appendingPathComponent("agentmail-install-\(UUID().uuidString)")
-            try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-            defer { try? fm.removeItem(at: tmpDir) }
-            let archivePath = tmpDir.appendingPathComponent(asset)
-            try archiveData.write(to: archivePath)
-
-            // bsdtar (macOS /usr/bin/tar) extracts zip archives too, so one
-            // invocation covers both platforms' asset formats.
-            let untar = await GoogleWorkspaceService.runProcessAsync(
-                executable: "/usr/bin/tar",
-                args: ["-xf", archivePath.path, "-C", tmpDir.path],
-                timeoutSeconds: 30
-            )
-            if let detail = untar.failureDetail {
-                return "extraction failed: \(detail)"
-            }
-            let extracted = tmpDir.appendingPathComponent("agentmail")
-            guard fm.fileExists(atPath: extracted.path) else {
-                return "archive did not contain the agentmail binary"
-            }
-
-            let destDir = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".local/bin", isDirectory: true)
-            try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
-            // The real binary installs as agentmail-bin; the `agentmail`
-            // command the model runs is a broker wrapper that fetches the
-            // key itself and execs the binary — so the key exists only in
-            // the actual AgentMail process, never in other subprocesses'
-            // environments (Codex, 2026-08-22).
-            let realBinary = destDir.appendingPathComponent("agentmail-bin")
-            if fm.fileExists(atPath: realBinary.path) {
-                try fm.removeItem(at: realBinary)
-            }
-            try fm.moveItem(at: extracted, to: realBinary)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: realBinary.path)
-            #if os(macOS)
-            _ = await GoogleWorkspaceService.runProcessAsync(
-                executable: "/usr/bin/xattr",
-                args: ["-d", "com.apple.quarantine", realBinary.path],
-                timeoutSeconds: 5
-            )
-            #endif
-
-            let wrapper = destDir.appendingPathComponent("agentmail")
-            let adaPath = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
-                .resolvingSymlinksInPath().path
-            let script = wrapperScript(adaPath: adaPath, realBinaryPath: realBinary.path)
-            try script.data(using: .utf8)?.write(to: wrapper, options: [.atomic])
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
-
-            // Smoke test through the wrapper — --version needs no auth, so
-            // this passes even before a key is stored.
-            let probe = await GoogleWorkspaceService.runProcessAsync(executable: wrapper.path, args: ["--version"], timeoutSeconds: 10)
-            guard probe.stdout != nil else {
-                return "installed binary failed to run: \(probe.failureDetail ?? "unknown error")"
-            }
-            return nil
-        } catch {
-            return "install failed: \(error.localizedDescription)"
-        }
     }
 
     /// The broker wrapper installed as `agentmail`. Pure so the selftest can

@@ -123,6 +123,12 @@ enum SetupAPICore {
         let message: String
     }
 
+    /// Thrown by an `apply` checkpoint whose authorization was revoked.
+    struct CheckpointRevoked: Error {
+        let message: String
+        init(_ message: String = "this operation was superseded") { self.message = message }
+    }
+
     // MARK: Response plumbing
 
     private static func base(ok: Bool) -> [String: Any] {
@@ -304,8 +310,15 @@ enum SetupAPICore {
         #else
         payload["service"] = ["supported": false]
         #endif
+        if includeDesktopEvidence {
+            for (key, value) in QuickSetupEvidence.statusAdditions() { payload[key] = value }
+        }
         return payload
     }
+
+    /// Desktop quick-setup additions (§6.2) run the toolchain doctor and
+    /// statvfs; the UT app's status calls do not need them.
+    nonisolated(unsafe) static var includeDesktopEvidence = !AgentServiceSupport.isUbuntuTouch()
 
     // MARK: probe
 
@@ -361,6 +374,18 @@ enum SetupAPICore {
                     payload["bot_username"] = username
                 }
                 return payload
+            case "telegram_chat":
+                // Coupled token + chat-ID verification (quick setup's one
+                // Telegram row): getMe, then getChat — private chats only.
+                let token = try require("token")
+                let chatId = try require("chat_id")
+                let result = await telegramChatProbe(token: token, chatId: chatId)
+                var payload = verdict(result.failure)
+                if let code = result.reasonCode { payload["reason_code"] = code }
+                if let u = result.botUsername { payload["bot_username"] = u }
+                if let t = result.chatTitle { payload["chat_title"] = t }
+                if let u = result.chatUsername { payload["chat_username"] = u }
+                return payload
             case "agentmail":
                 let key = try require("api_key")
                 let (failure, inboxes) = await AgentMailService.probeKey(key)
@@ -377,8 +402,76 @@ enum SetupAPICore {
         }
     }
 
+    struct TelegramChatProbe {
+        var failure: String?
+        var reasonCode: String?
+        var botUsername: String?
+        var chatTitle: String?
+        var chatUsername: String?
+    }
+
+    /// Selftest seam: replaces the network calls.
+    nonisolated(unsafe) static var telegramChatProbeOverride: ((String, String) async -> TelegramChatProbe)?
+
+    static func telegramChatProbe(token: String, chatId: String) async -> TelegramChatProbe {
+        if let telegramChatProbeOverride { return await telegramChatProbeOverride(token, chatId) }
+        var out = TelegramChatProbe()
+        switch TelegramPairing.parseChatId(chatId) {
+        case .failure(.notNumeric):
+            out.failure = "chat ID must be numeric (letters mean it's a username — use @userinfobot to get the numeric ID)"
+            out.reasonCode = "not_numeric"
+            return out
+        case .failure(.notPrivate):
+            out.failure = TelegramPairing.privateChatExplanation
+            out.reasonCode = "not_private"
+            return out
+        case .success: break
+        }
+        if let failure = await Probes.telegram(token: token) {
+            out.failure = failure
+            out.reasonCode = "bad_token"
+            return out
+        }
+        out.botUsername = await telegramBotUsername(token: token)
+        guard let url = URL(string: DevProbeOverride.url("https://api.telegram.org/bot\(token)/getChat?chat_id=\(chatId)", dev: "/telegram/bot\(token)/getChat?chat_id=\(chatId)")) else {
+            out.failure = "invalid token format"; return out
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if code != 200 || json?["ok"] as? Bool != true {
+                let description = (json?["description"] as? String) ?? "HTTP \(code)"
+                if description.lowercased().contains("chat not found") {
+                    out.failure = "chat not found — open @\(out.botUsername ?? "yourbot") in Telegram, send /start, then tap Retry"
+                    out.reasonCode = "chat_not_found"
+                } else {
+                    out.failure = "Telegram getChat failed: \(description)"
+                    out.reasonCode = "getchat_failed"
+                }
+                return out
+            }
+            let result = json?["result"] as? [String: Any] ?? [:]
+            guard result["type"] as? String == "private" else {
+                out.failure = TelegramPairing.privateChatExplanation
+                out.reasonCode = "not_private"
+                return out
+            }
+            let first = result["first_name"] as? String ?? ""
+            let last = result["last_name"] as? String ?? ""
+            out.chatTitle = [first, last].filter { !$0.isEmpty }.joined(separator: " ")
+            out.chatUsername = result["username"] as? String
+        } catch {
+            out.failure = "Telegram unreachable: \(error.localizedDescription)"
+            out.reasonCode = "unreachable"
+        }
+        return out
+    }
+
     private static func telegramBotUsername(token: String) async -> String? {
-        guard let url = URL(string: "https://api.telegram.org/bot\(token)/getMe") else { return nil }
+        guard let url = URL(string: DevProbeOverride.url("https://api.telegram.org/bot\(token)/getMe", dev: "/telegram/bot\(token)/getMe")) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 15
         guard let (data, _) = try? await URLSession.shared.data(for: request),
@@ -392,7 +485,13 @@ enum SetupAPICore {
     /// Sections process in a fixed order; each commits independently (its own
     /// atomic batch), so a failure aborts the REMAINING sections and reports
     /// what already committed via "applied".
-    static func apply(_ request: [String: Any]) async -> [String: Any] {
+    /// `checkpoint` (plan §6.5): called by the sections that await between
+    /// writes — after the AgentMail probe, immediately before its
+    /// `saveBatch`, and before the CLI install — so a caller whose
+    /// authorization was revoked mid-section aborts with nothing further
+    /// written. A throw surfaces as `superseded` with `applied` listing what
+    /// committed before it. `setup-api` and the UT app pass nothing.
+    static func apply(_ request: [String: Any], checkpoint: () throws -> Void = {}) async -> [String: Any] {
         if let refusal = migrationRefusal() { return refusal }
         ProviderProfiles.ensureMigrated()
         var applied: [String] = []
@@ -423,7 +522,7 @@ enum SetupAPICore {
                 applied.append("telegram")
             }
             if let section = request["email_calendar"] as? [String: Any] {
-                try await applyEmailCalendar(section, warnings: &warnings)
+                try await applyEmailCalendar(section, warnings: &warnings, checkpoint: checkpoint)
                 applied.append("email_calendar")
             }
             if let backend = request["web_search_backend"] {
@@ -496,6 +595,10 @@ enum SetupAPICore {
         } catch let error as APIError {
             var payload = errorResponse(code: error.code, message: error.message)
             payload["applied"] = applied  // sections committed before the failure
+            return payload
+        } catch let error as CheckpointRevoked {
+            var payload = errorResponse(code: "superseded", message: error.message)
+            payload["applied"] = applied
             return payload
         } catch {
             var payload = errorResponse(code: "internal", message: error.localizedDescription)
@@ -734,7 +837,7 @@ enum SetupAPICore {
     }
 
     private static func applyEmailCalendar(
-        _ section: [String: Any], warnings: inout [String]
+        _ section: [String: Any], warnings: inout [String], checkpoint: () throws -> Void = {}
     ) async throws {
         guard let raw = nonEmptyString(section["provider"]),
               let provider = EmailCalendarProvider(rawValue: raw) else {
@@ -779,6 +882,7 @@ enum SetupAPICore {
             // Same as the wizard: capture the inbox address from a live
             // probe when reachable; an offline probe is nonfatal.
             let (failure, inboxes) = await AgentMailService.probeKey(key)
+            try checkpoint()   // after the await, before any write
             var changes: [String: String?] = [
                 KeychainHelper.agentMailApiKeyKey: key,
                 KeychainHelper.emailCalendarProviderKey: EmailCalendarProvider.agentmail.rawValue,
@@ -786,13 +890,15 @@ enum SetupAPICore {
             if let inbox = inboxes.first {
                 changes[KeychainHelper.agentMailInboxAddressKey] = inbox
             }
+            try checkpoint()   // immediately before the saveBatch
             do { try KeychainHelper.saveBatch(changes) } catch { throw saveFailed(error) }
             if let failure {
                 warnings.append("agentmail: could not list inboxes (\(failure)) — continuing; "
                                 + "Briglia retries at runtime")
             }
             if section["install_cli"] as? Bool == true, !AgentMailService.agentMailBrokerInstalled() {
-                if let installFailure = await AgentMailService.installAgentMailBinary() {
+                try checkpoint()   // immediately before the install
+                if let installFailure = await AgentMailService.installAgentMailBinary(checkpoint: checkpoint) {
                     warnings.append("agentmail CLI install failed: \(installFailure) — inbox "
                                     + "alerts and context still work; retry the install later")
                 }

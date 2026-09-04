@@ -24,10 +24,10 @@ struct AdaCLI: AsyncParsableCommand {
         commandName: "briglia",
         abstract: "Briglia — your personal AI agent, in the terminal.",
         version: adaCLIVersion,
-        subcommands: [Chat.self, Setup.self, SetupAPI.self, Daemon.self, Doctor.self, Upgrade.self,
+        subcommands: [Chat.self, Setup.self, QuickSetup.self, SetupAPI.self, Daemon.self, Doctor.self, Upgrade.self,
                       AdaService.self, Trigger.self, MediaSelftest.self, BundleCheck.self,
                       ToolchainCommand.self, ToolchainPrefixSelftest.self,
-                      SetsidExec.self, TTYHandoffSelftest.self, BashPipelineSelftest.self,
+                      SetsidExec.self, GateExec.self, TTYHandoffSelftest.self, BashPipelineSelftest.self,
                       BashGoldenSelftest.self, BashJobsSelftest.self,
                       TriggerSelftest.self, WatcherTriageSelftest.self, LaneSelftest.self,
                       WebAgentSelftest.self, ProviderSelftest.self, ServiceSelftest.self,
@@ -41,7 +41,7 @@ struct AdaCLI: AsyncParsableCommand {
                       Migrate.self, MigrateProbe.self, MigrateGate.self,
                       AppChatSocketSelftest.self,
                       CommandMenuSelftest.self, BotSwitchSelftest.self,
-                      EmailCalendarSelftest.self, AgentMailKeyCommand.self,
+                      EmailCalendarSelftest.self, AgentMailKeyCommand.self, AgentMailCommand.self,
                       WebLiveTest.self],
         defaultSubcommand: Chat.self
     )
@@ -81,6 +81,13 @@ struct SetsidExec: ParsableCommand {
         shouldDisplay: false
     )
 
+    /// Quick-setup start gate (SetupJobRunner): with both fds given, the
+    /// FINAL session leader reports `READY <pid> <pgid> <sid>` on
+    /// `readyFd`, then blocks until one RELEASE byte arrives on
+    /// `releaseFd`; EOF or any other byte exits 125 without executing.
+    @Option(name: .customLong("ready-fd")) var readyFd: Int32?
+    @Option(name: .customLong("release-fd")) var releaseFd: Int32?
+
     @Argument(parsing: .remaining)
     var argv: [String] = []
 
@@ -119,6 +126,9 @@ struct SetsidExec: ParsableCommand {
         // path execs in place, so the PID the parent tracks IS the target.
         if setsid() != -1 {
             reportDetachedLeader(getpid())
+            if let readyFd, let releaseFd {
+                StartGate.awaitRelease(readyFd: readyFd, releaseFd: releaseFd)
+            }
             execv(exe, cargs)
             FileHandle.standardError.write(Data(
                 "briglia __setsid-exec: exec \(exe) failed: \(String(cString: strerror(errno)))\n".utf8))
@@ -130,6 +140,23 @@ struct SetsidExec: ParsableCommand {
         // POSIX_SPAWN_SETSID (detaches in the child, where it can't fail for
         // that reason) and mirror its exit status. Tree kills in Briglia walk
         // pgrep -P descendants, so the extra hop stays killable.
+        //
+        // Gate mode: the re-spawned process must be the one doing the
+        // READY/RELEASE handshake, so the identity the parent journals is
+        // the FINAL leader's, not this shim's — re-spawn ourselves as
+        // `__gate-exec` (same handshake, no setsid of its own; the SETSID
+        // spawn flag makes it the leader) with the gate fds inherited.
+        var spawnArgv = argv
+        if let readyFd, let releaseFd {
+            let selfPath = (Bundle.main.executableURL
+                ?? URL(fileURLWithPath: CommandLine.arguments[0])).resolvingSymlinksInPath().path
+            spawnArgv = [selfPath, "__gate-exec", "--ready-fd", "\(readyFd)",
+                         "--release-fd", "\(releaseFd)", "--"] + argv
+            for ptr in cargs { free(ptr) }
+            cargs = spawnArgv.map { strdup($0) }
+            cargs.append(nil)
+        }
+        let spawnExe = spawnArgv[0]
         #if os(Linux)
         let setsidFlag: Int16 = 0x80          // glibc spawn.h, glibc >= 2.26
         var attr = posix_spawnattr_t()
@@ -157,12 +184,18 @@ struct SetsidExec: ParsableCommand {
         var cenv: [UnsafeMutablePointer<CChar>?] = envStrings.map { strdup($0) }
         cenv.append(nil)
         var pid: pid_t = 0
-        let rc = posix_spawn(&pid, exe, nil, &attr, cargs, cenv)
+        let rc = posix_spawn(&pid, spawnExe, nil, &attr, cargs, cenv)
         posix_spawnattr_destroy(&attr)
         guard rc == 0 else {
             FileHandle.standardError.write(Data(
-                "briglia __setsid-exec: spawn \(exe) failed: \(String(cString: strerror(rc)))\n".utf8))
+                "briglia __setsid-exec: spawn \(spawnExe) failed: \(String(cString: strerror(rc)))\n".utf8))
             Foundation.exit(127)
+        }
+        // The gate fds now belong to the re-spawned leader; drop our copies
+        // so the parent's EOF-on-release semantics see one reader only.
+        if let readyFd, let releaseFd {
+            close(readyFd)
+            close(releaseFd)
         }
         // Forward termination signals to the detached child: a parent that
         // kills this shim (MCP/LSP registry shutdown, Process.terminate)
@@ -182,6 +215,84 @@ struct SetsidExec: ParsableCommand {
             Foundation.exit(128 + signum)
         }
         Foundation.exit((status >> 8) & 0xff)
+    }
+}
+
+/// The child side of the quick-setup start gate (SetupJobRunner, plan §5.6).
+/// Shared by `__setsid-exec` (detached jobs) and `__gate-exec` (terminal
+/// handoff jobs). Contract:
+///   child:  "READY <pid> <pgid> <sid>\n" on readyFd, then close it;
+///           block on exactly one byte from releaseFd;
+///           0x01 → return (caller execs); EOF, any other byte, read error
+///           → exit 125 WITHOUT executing.
+/// The parent holds the only write end of the release pipe, close-on-exec,
+/// so parent death before RELEASE is EOF here.
+enum StartGate {
+    static let releaseByte: UInt8 = 0x01
+    static let refusedExitCode: Int32 = 125
+
+    static func awaitRelease(readyFd: Int32, releaseFd: Int32) {
+        let line = "READY \(getpid()) \(getpgrp()) \(getsid(0))\n"
+        var ok = line.withCString { ptr -> Bool in
+            var offset = 0
+            let total = strlen(ptr)
+            while offset < total {
+                let n = write(readyFd, ptr + offset, total - offset)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                offset += n
+            }
+            return true
+        }
+        close(readyFd)
+        guard ok else { Foundation.exit(refusedExitCode) }
+        var byte: UInt8 = 0
+        while true {
+            let n = read(releaseFd, &byte, 1)
+            if n < 0 && errno == EINTR { continue }
+            ok = n == 1 && byte == releaseByte
+            break
+        }
+        close(releaseFd)
+        guard ok else { Foundation.exit(refusedExitCode) }
+    }
+}
+
+/// Hidden trampoline for quick-setup TERMINAL jobs (sudo): the same
+/// READY/RELEASE handshake as `__setsid-exec` in gate mode, but WITHOUT a
+/// new session — the parent spawns it as its own process-group leader
+/// (pgid == pid) inside the terminal's session, journals its identity,
+/// lends it the terminal foreground (tcsetpgrp) and only then releases it,
+/// so a `sudo` that execs never reads the tty as a background job (the
+/// SIGTTIN freeze TerminalHandoff exists for).
+struct GateExec: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "__gate-exec",
+        abstract: "Internal: exec a program after the quick-setup start gate (no setsid).",
+        shouldDisplay: false
+    )
+
+    @Option(name: .customLong("ready-fd")) var readyFd: Int32
+    @Option(name: .customLong("release-fd")) var releaseFd: Int32
+
+    @Argument(parsing: .remaining)
+    var argv: [String] = []
+
+    func run() throws {
+        guard let exe = argv.first, exe.hasPrefix("/") else {
+            FileHandle.standardError.write(Data(
+                "briglia __gate-exec: usage: briglia __gate-exec --ready-fd N --release-fd M -- /abs/path arg...\n".utf8))
+            throw ExitCode(64)
+        }
+        var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
+        cargs.append(nil)
+        StartGate.awaitRelease(readyFd: readyFd, releaseFd: releaseFd)
+        execv(exe, cargs)
+        FileHandle.standardError.write(Data(
+            "briglia __gate-exec: exec \(exe) failed: \(String(cString: strerror(errno)))\n".utf8))
+        Foundation.exit(127)
     }
 }
 
@@ -229,6 +340,35 @@ struct AgentMailKeyCommand: ParsableCommand {
             throw ExitCode(1)
         }
         print(key)
+    }
+}
+
+/// Hidden: settle an interrupted AgentMail install transaction
+/// (`briglia agentmail repair`). Takes the installer lock, validates the
+/// metadata, inspects the live wrapper, and either completes, rolls back,
+/// or refuses with instructions. Doctor only reports; this is the one
+/// explicit mutation path besides quick setup's preflight.
+struct AgentMailCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "agentmail",
+        abstract: "AgentMail CLI maintenance (repair an interrupted install).",
+        shouldDisplay: false
+    )
+
+    @Argument var action: String
+
+    func run() async throws {
+        AdaCLI.prepareIO()
+        guard action == "repair" else {
+            print("usage: briglia agentmail repair")
+            throw ExitCode(64)
+        }
+        switch await AgentMailService.repairTransaction() {
+        case .nothingToDo: print("✔ no interrupted AgentMail transaction")
+        case .settled(let how): print("✔ settled: \(how)")
+        case .busy: print("✖ an AgentMail installation or repair is in progress — retry later"); throw ExitCode(1)
+        case .failedClosed(let why): print("✖ \(why)"); throw ExitCode(1)
+        }
     }
 }
 

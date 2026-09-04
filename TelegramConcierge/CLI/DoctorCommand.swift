@@ -113,9 +113,10 @@ struct Doctor: AsyncParsableCommand {
         #if os(macOS)
         check("Full Disk Access", ok: PermissionsService.fullDiskAccessGranted(),
               hint: "grant it to your terminal app: System Settings → Privacy & Security → Full Disk Access")
+        note("keep-awake: assertion held while Briglia runs (idle system sleep prevented) — a closed lid or a manual sleep still stops it")
         let sleep = PermissionsService.displaySleepMinutes()
         if let ac = sleep.ac {
-            note("display sleep on power: \(ac == 0 ? "never" : "\(ac) min — make sure the SYSTEM stays awake for unattended use")")
+            note("display sleep on power: \(ac == 0 ? "never" : "\(ac) min (harmless — only system sleep stops Briglia)")")
         }
         #else
         note("Full Disk Access: not applicable on Linux (ordinary file permissions)")
@@ -124,12 +125,9 @@ struct Doctor: AsyncParsableCommand {
             // settings are irrelevant — the keep-awake unit is what counts.
             note("Ubuntu Touch detected — suspend is governed by the keep-awake unit (below)")
         } else {
-            let sleepStatus = PermissionsService.linuxSleepStatus()
-            check("automatic suspend disabled", ok: sleepStatus.neverSuspends,
-                  hint: "run `briglia setup`, section 6 — a suspended machine stops Briglia completely")
-            if sleepStatus.sleepTargetsMasked {
-                note("systemd sleep targets: masked (machine can never suspend)")
-            }
+            let verdict = PermissionsService.autoSuspendVerdict()
+            check(verdict.summary, ok: verdict.isOK,
+                  hint: "\(AutoSuspendCensus.Verdict.maskCommand) — or run `briglia setup`, section 6; a suspended machine stops Briglia completely")
         }
 
         // Background service (briglia service): optional, but when installed it
@@ -219,6 +217,9 @@ struct Doctor: AsyncParsableCommand {
                 note("email/calendar: AgentMail\(inbox.isEmpty ? "" : " (\(inbox))") + local calendar — key configured")
             } else {
                 note("email/calendar: AgentMail selected but NO API key stored — rerun `briglia setup`, toolchain step")
+            }
+            if let tx = AgentMailService.transactionReport() {
+                check(tx, ok: false, hint: "doctor never repairs; the command above settles it safely")
             }
             if !AgentMailService.agentMailBrokerInstalled() {
                 note("agentmail CLI (key broker) not installed — inbox context/alerts still work; email ACTIONS need it (`briglia setup`, toolchain step). A bare agentmail binary from npm/brew cannot authenticate: Briglia never puts the key in bash environments")

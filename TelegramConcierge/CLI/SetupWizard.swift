@@ -8,10 +8,17 @@ struct Setup: AsyncParsableCommand {
         abstract: "Interactive setup wizard: providers, keys, permissions, channels."
     )
 
+    @Flag(name: .customLong("quick"), help: "Run the browser-based quick setup instead (same as `briglia quicksetup`).")
+    var quick = false
+
     func run() async throws {
         AdaCLI.prepareIO()
         try IdentityMigration.gateMutatingEntry()
         IdentityMigration.warnLegacyEnvironment()
+        if quick {
+            try await QuickSetupSession.runInteractive()
+            return
+        }
         try await SetupWizard().run()
     }
 }
@@ -84,7 +91,17 @@ struct SetupWizard {
         }
 
         var startIndex = 0
-        if let saved = KeychainHelper.load(key: Self.progressKey),
+        if let saved = KeychainHelper.load(key: Self.progressKey), saved.hasPrefix("quick:") {
+            print("""
+
+            A quick setup (`briglia quicksetup`) was interrupted; run it again to
+            continue where it stopped — everything already verified is saved.
+            """)
+            if !WizardIO.askYesNo("Use this step-by-step wizard instead?", default: false) {
+                print("Run: briglia quicksetup")
+                return
+            }
+        } else if let saved = KeychainHelper.load(key: Self.progressKey),
            let interrupted = Int(saved), (1..<steps.count).contains(interrupted) {
             print("""
 
@@ -460,21 +477,11 @@ struct SetupWizard {
 
     #if os(macOS)
     private func stepPermissions() async {
-        // Keep-awake: Briglia works autonomously (reminders, Telegram, background
-        // tasks) — a sleeping Mac silently stops all of it.
-        let sleep = PermissionsService.displaySleepMinutes()
-        if let ac = sleep.ac, ac != 0 {
-            print("""
-            ⚠ Your display sleeps after \(ac) minutes on power. The DISPLAY may
-              sleep, but the SYSTEM must stay awake or Briglia stops working when
-              unattended. Recommended: System Settings → Energy → enable
-              "Prevent automatic sleeping on power adapter when the display is
-              off" (or run Briglia under `caffeinate -is briglia daemon`).
-            """)
-            _ = WizardIO.ask("Press Enter when done (or to continue anyway)")
-        } else {
-            print("  ✔ Display sleep is off")
-        }
+        // Keep-awake: Briglia holds an idle-sleep assertion while it runs
+        // (chat, daemon, quick setup), so no Energy Settings change is
+        // needed. Display sleep is harmless; a closed lid or a manual sleep
+        // still stops it — say so, once.
+        print("  ✔ Keep-awake: Briglia prevents idle system sleep while it runs (display may sleep; a closed lid or manual sleep still stops it)")
 
         // Full Disk Access for the hosting terminal (the CLI inherits it).
         if PermissionsService.fullDiskAccessGranted() {
@@ -522,33 +529,26 @@ struct SetupWizard {
         }
 
         // Keep-awake: automatic suspend is the one thing that silently stops
-        // an unattended agent. Desktop installs auto-suspend by default.
-        let status = PermissionsService.linuxSleepStatus()
-        if status.neverSuspends {
-            if status.sleepTargetsMasked {
-                print("  ✔ Automatic suspend: impossible (systemd sleep targets are masked)")
-            } else if status.desktop == nil {
-                print("  ✔ Automatic suspend: none detected (headless system)")
-            } else {
-                print("  ✔ Automatic suspend: off")
-            }
+        // an unattended agent. The verdict is evidence-based (plan §4.6):
+        // it never infers safety from missing information, so an unknown
+        // desktop says "may suspend" instead of silently passing.
+        let verdict = PermissionsService.autoSuspendVerdict()
+        if verdict.isOK {
+            print("  ✔ \(verdict.summary)")
             return
         }
-
-        let acText = status.acSuspendMinutes.map { "\($0) min on AC" }
-        let batteryText = status.batterySuspendMinutes.flatMap { $0 == 0 ? nil : "\($0) min on battery" }
-        let timers = [acText, batteryText].compactMap { $0 }.joined(separator: ", ")
         print("""
-        ⚠ This machine auto-suspends (\(timers.isEmpty ? "desktop power settings" : timers)).
+        ⚠ This machine \(verdict.summary).
           A suspended machine stops Briglia completely — reminders, Telegram and
           background tasks all go silent.
         """)
 
-        if status.acSuspendMinutes != nil {
+        if case .maySuspend(let reason) = verdict, reason.hasPrefix("GNOME auto-suspend is on") {
             // GNOME with readable gsettings: offer the one-command fix.
             if WizardIO.askYesNo("Disable automatic suspend now (gsettings, no sudo needed)?", default: true) {
                 if PermissionsService.disableGnomeAutoSuspend() {
-                    print("  ✔ Automatic suspend disabled (AC + battery)")
+                    let after = PermissionsService.autoSuspendVerdict()
+                    print(after.isOK ? "  ✔ \(after.summary)" : "  ✖ still \(after.summary)")
                 } else {
                     print("  ✖ gsettings write failed — disable suspend manually in your desktop's power settings.")
                 }
@@ -561,7 +561,7 @@ struct SetupWizard {
           • Desktop: disable automatic suspend in your power settings.
           • Dedicated/headless box: mask the systemd sleep targets so the
             machine can never suspend (recommended for an always-on Briglia):
-              sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+              \(AutoSuspendCensus.Verdict.maskCommand)
         """)
         if WizardIO.askYesNo("Mask the systemd sleep targets now (asks for sudo)?", default: false) {
             if PermissionsService.maskLinuxSleepTargets() {
@@ -946,7 +946,10 @@ struct SetupWizard {
 
     // MARK: Summary + helpers
 
-    private func printSummary() {
+    private func printSummary() { Self.printSummaryStatic() }
+
+    /// Shared with `briglia quicksetup`.
+    nonisolated static func printSummaryStatic() {
         func mask(_ key: String) -> String {
             guard let value = KeychainHelper.load(key: key), !value.isEmpty else { return "—" }
             return WizardIO.masked(value)

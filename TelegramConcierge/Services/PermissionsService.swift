@@ -308,12 +308,14 @@ enum PermissionsService {
         /// way of making suspend impossible).
         let sleepTargetsMasked: Bool
 
-        /// True when nothing on this machine will auto-suspend it.
-        var neverSuspends: Bool {
-            if sleepTargetsMasked { return true }
-            if desktop == nil && acSuspendMinutes == nil { return true } // headless, no DE
-            return (acSuspendMinutes ?? 0) == 0 && (batterySuspendMinutes ?? 0) == 0
-        }
+        /// The honest verdict (plan §4.6): `neverSuspends` is gone — its
+        /// rules inferred safety from missing information.
+        var verdict: AutoSuspendCensus.Verdict { AutoSuspendCensus.currentVerdict() }
+    }
+
+    /// The three-level keep-awake verdict for this machine.
+    static func autoSuspendVerdict() -> AutoSuspendCensus.Verdict {
+        AutoSuspendCensus.currentVerdict()
     }
 
     static func linuxSleepStatus() -> LinuxSleepStatus {
