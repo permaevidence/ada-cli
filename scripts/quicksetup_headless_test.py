@@ -283,7 +283,13 @@ def main():
         check("finish accepted (202)", st == 202, str(js)[:200])
         done = False
         for _ in range(60):
-            st, js = call("GET", "/api/status", cookie=cookie)
+            try:
+                st, js = call("GET", "/api/status", cookie=cookie)
+            except ConnectionRefusedError:
+                # Linux: the server stops right after "done" and the process
+                # exits; the secrets check below is the evidence.
+                done = True
+                break
             if st == 404 or js.get("phase") == "done":
                 done = js.get("phase") == "done" if st == 200 else done
                 break
@@ -325,6 +331,8 @@ def main():
         # 8. Refusal: already set up.
         r2 = subprocess.run([ADA, "quicksetup"], env=env, capture_output=True, text=True, timeout=60)
         check("rerun refuses: already set up (exit 2)", r2.returncode == 2 and "already set up" in r2.stdout, r2.stdout[-200:])
+    except Exception as e:
+        check("driver raised %r" % (e,), False, "rc=%s tail=%r" % (proc.poll(), output()[-1500:]))
     finally:
         if proc.poll() is None:
             proc.kill()
