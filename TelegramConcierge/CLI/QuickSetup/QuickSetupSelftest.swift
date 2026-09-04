@@ -543,6 +543,37 @@ final class SelftestContext: @unchecked Sendable {
         let inFlightAfter = await wf7.inFlightOperations
         _ = try? await t7.value
         check("rotate() waits for the in-flight verify to unwind (in-flight 1 → 0)", inFlightBefore == 1 && inFlightAfter == 0, "\(inFlightBefore) \(inFlightAfter)")
+
+        // Revocation is immediate: while a rotation is blocked on a job that
+        // ignores SIGTERM, the old cookie and token are already dead, and
+        // a concurrent second rotation is serialized behind the first.
+        let (wf8, runner8) = try makeWorkflow(env, resume: .system)
+        let c8 = await wf8.exchange(token: await wf8.launchToken)
+        let g8 = await wf8.authorizedGeneration(cookie: c8)!
+        store.toolchain = ToolchainService.DesktopStatus(doctorRan: true, missing: ["pandoc"], libreOffice: true, mandatoryMissing: ["pandoc"])
+        store.toolchainJobs = [SetupJobRunner.Spec(row: "toolchain", command: ["/bin/sh", "-c", "trap '' TERM; sleep 30"], mode: .detached, timeout: 60, label: "stubborn")]
+        SetupJobRunner.termGrace = 3
+        for row in ["agentmail_cli", "fda", "keepawake"] { _ = try await wf8.systemRun(row: row, option: nil, generation: g8); try? await Task.sleep(nanoseconds: 200_000_000) }
+        let (stRun8, jsRun8) = try await wf8.systemRun(row: "toolchain", option: nil, generation: g8)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        let rows8 = (await wf8.status())["system_rows"] as? [[String: Any]] ?? []
+        check("stubborn job running", runner8.currentJob != nil, "run=\(stRun8) \(jsRun8) rows=\(rows8)")
+        let oldToken8 = await wf8.launchToken
+        let rot1 = Task { await wf8.rotate() }
+        try? await Task.sleep(nanoseconds: 300_000_000)   // rotation is now blocked in the SIGTERM grace
+        let duringCookie = await wf8.authorizedGeneration(cookie: c8)
+        let duringExchange = await wf8.exchange(token: oldToken8)
+        let duringToken = await wf8.launchToken
+        let rot2 = Task { await wf8.rotate() }
+        let r1 = await rot1.value
+        let r2 = await rot2.value
+        SetupJobRunner.termGrace = 5
+        let finalToken = await wf8.launchToken
+        check("during a blocked rotation: old cookie → nil, old token → no exchange, no token issued yet", duringCookie == nil && duringExchange == nil && duringToken.isEmpty)
+        check("concurrent rotations are serialized: both return, one live link, job reaped", !r1.randomnessFailed && !r2.randomnessFailed && !finalToken.isEmpty && runner8.currentJob == nil && r1.poison == nil)
+        let c8b = await wf8.exchange(token: finalToken)
+        let g8b = await wf8.authorizedGeneration(cookie: c8b)
+        check("the new link authorizes the new generation only", g8b == g8 + 2, "\(String(describing: g8b))")
     }
 
     // MARK: 3. Workflow enforcement

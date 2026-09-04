@@ -493,9 +493,33 @@ actor QuickSetupWorkflow {
         var randomnessFailed = false
     }
 
+    /// Rotations are serialized: a second Enter while one is in progress
+    /// waits for it (its own revocation is already effective — nothing is
+    /// authorized between the first revocation and the final mint).
+    private var rotating = false
+    private var rotationWaiters: [CheckedContinuation<Void, Never>] = []
+
     func rotate() async -> RotationResult {
-        generation += 1   // (1) revoke: every checkpoint of the old generation now throws
+        // (1) REVOKE FIRST, before any await: no cookie authorizes, no token
+        // exchanges, every checkpoint of the old generation throws. An
+        // old-cookie request arriving during the cancellation window below
+        // finds nothing to authorize and cannot inherit the new generation.
+        generation += 1
         generationBox.set(generation)
+        cookie = ""
+        token = nil
+        tokenUsed = true
+        if rotating {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in rotationWaiters.append(c) }
+            return RotationResult(poison: runner.currentPoison, randomnessFailed: token == nil)
+        }
+        rotating = true
+        defer {
+            rotating = false
+            let waiters = rotationWaiters
+            rotationWaiters = []
+            for w in waiters { w.resume() }
+        }
         let hadJob = runner.currentJob != nil
         if hadJob { env.log("cancelling the current step…") }
         rowTask?.cancel()
@@ -504,11 +528,8 @@ actor QuickSetupWorkflow {
         if let t = rowTask { await t.value }
         if let t = finishTask { await t.value }
         await settleInFlight()                     // (3) suspended operations unwound
-        // (4) mint — or abort: never reuse the revoked token/cookie.
+        // (4) mint — or abort: the revoked token/cookie were already cleared.
         guard let newToken = Self.randomHex(), let newCookie = Self.randomHex() else {
-            token = nil
-            cookie = ""
-            tokenUsed = true
             return RotationResult(poison: poison, randomnessFailed: true)
         }
         token = newToken

@@ -352,6 +352,29 @@ extension SelftestContext {
             let settled2 = await AgentMailService.repairTransaction()
             check("repair removes the debris", { if case .settled = settled2 { return true }; return false }() && !entries(dir).contains { $0.hasPrefix(".agentmail-staging") } && txState(dir) == nil, "\(settled2) \(entries(dir))")
         }
+        // Deletion failures preserve the evidence (never "restored" while the failed wrapper is live).
+        do {
+            dir = freshDir()
+            useFixture(vBadWrapped)
+            AgentMailService.injectUnlinkFailure = "agentmail"
+            failure = await AgentMailService.installAgentMailBinary()
+            AgentMailService.injectUnlinkFailure = nil
+            let liveIsNew = wrapperAnswers(dir, "3.0.0") == false && FileManager.default.fileExists(atPath: dir.appendingPathComponent("agentmail").path)
+            check("fresh rollback whose wrapper unlink fails → reported as rollback failure, metadata kept at committing, failed wrapper still live", (failure ?? "").contains("rollback failed") && txState(dir) == "committing" && liveIsNew, "\(failure ?? "") state=\(txState(dir) ?? "nil")")
+            check("doctor reports it", (AgentMailService.transactionReport() ?? "").contains("interrupted"))
+            let settled = await AgentMailService.repairTransaction()
+            check("repair (unlink working again) → verifies, fails, rolls back to no installation", { if case .settled = settled { return true }; return false }() && txState(dir) == nil && entries(dir).isEmpty, "\(settled) \(entries(dir))")
+            // Unreferenced previous binary that cannot be deleted after a verified upgrade.
+            useFixture(v1)
+            _ = await AgentMailService.installAgentMailBinary()
+            useFixture(v2)
+            AgentMailService.injectUnlinkFailure = v1name
+            failure = await AgentMailService.installAgentMailBinary()
+            AgentMailService.injectUnlinkFailure = nil
+            check("previous-binary deletion failure → retryable, new pair live, metadata kept", (failure ?? "").contains("cleanup did not complete") && wrapperAnswers(dir, "2.0.0") && txState(dir) != nil && entries(dir).contains(v1name), failure ?? "")
+            let settled2 = await AgentMailService.repairTransaction()
+            check("repair completes the cleanup", { if case .settled = settled2 { return true }; return false }() && txState(dir) == nil && entries(dir) == ["agentmail", v2name], "\(settled2) \(entries(dir))")
+        }
         // Locks.
         do {
             dir = freshDir()

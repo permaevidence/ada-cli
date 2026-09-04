@@ -272,7 +272,7 @@ extension AgentMailService {
         // goes, so a failed step leaves the evidence doctor reports and
         // repair retries from; the metadata is the last thing removed.
         if let prev = previous {
-            deleteIfUnreferenced(prev, liveTarget: liveTarget)
+            try deleteIfUnreferenced(prev, liveTarget: liveTarget)
         }
         try removeStagingChecked()
         func barrier() throws {
@@ -288,7 +288,7 @@ extension AgentMailService {
 
     private static func removeStagingChecked() throws {
         let fm = FileManager.default
-        for entry in (try? fm.contentsOfDirectory(atPath: installDirectory.path)) ?? [] where entry.hasPrefix(stagingPrefix) {
+        for entry in try stagingEntries() {
             if injectStagingRemovalFailure { throw CleanupFailure(description: "injected staging removal failure (\(entry))") }
             do { try fm.removeItem(at: installDirectory.appendingPathComponent(entry)) } catch {
                 throw CleanupFailure(description: "could not remove staging \(entry): \(error.localizedDescription)")
@@ -300,16 +300,32 @@ extension AgentMailService {
         if crashPoint == point { kill(getpid(), SIGKILL) }
     }
 
-    private static func deleteIfUnreferenced(_ name: String, liveTarget: String?) {
-        let path = installDirectory.appendingPathComponent(name).path
-        if let liveTarget, liveTarget == path { return }
-        unlink(path)
+    /// Selftest seam: make unlink of this basename fail (EACCES-like).
+    nonisolated(unsafe) static var injectUnlinkFailure: String?
+
+    /// Checked unlink: ENOENT is fine, anything else is a failure that must
+    /// preserve the transaction evidence.
+    private static func unlinkChecked(_ path: String) throws {
+        if let inject = injectUnlinkFailure, URL(fileURLWithPath: path).lastPathComponent == inject {
+            throw CleanupFailure(description: "injected unlink failure for \(inject)")
+        }
+        if unlink(path) != 0, errno != ENOENT {
+            throw CleanupFailure(description: "could not remove \(URL(fileURLWithPath: path).lastPathComponent): \(String(cString: strerror(errno)))")
+        }
     }
 
-    private static func removeStaging() {
-        let fm = FileManager.default
-        for entry in (try? fm.contentsOfDirectory(atPath: installDirectory.path)) ?? [] where entry.hasPrefix(stagingPrefix) {
-            try? fm.removeItem(at: installDirectory.appendingPathComponent(entry))
+    private static func deleteIfUnreferenced(_ name: String, liveTarget: String?) throws {
+        let path = installDirectory.appendingPathComponent(name).path
+        if let liveTarget, liveTarget == path { return }
+        try unlinkChecked(path)
+    }
+
+    /// Staging entries; an enumeration failure is an error, never "none".
+    private static func stagingEntries() throws -> [String] {
+        do {
+            return try FileManager.default.contentsOfDirectory(atPath: installDirectory.path).filter { $0.hasPrefix(stagingPrefix) }
+        } catch {
+            throw CleanupFailure(description: "could not list \(installDirectory.path): \(error.localizedDescription)")
         }
     }
 
@@ -522,7 +538,10 @@ extension AgentMailService {
             if let prev = tx.previousWrapper, let bytes = Data(base64Encoded: prev.bytesB64) {
                 try atomicReplaceWrapper(bytes: bytes, mode: mode_t(prev.mode))
             } else {
-                unlink(wrapperURL.path)
+                // A failed unlink leaves the failed wrapper live: the metadata
+                // stays at `committing` so doctor reports it and repair
+                // re-inspects; nothing claims "restored".
+                try unlinkChecked(wrapperURL.path)
                 try fsyncDir()
             }
             crashIf("after-rollback-swap")
@@ -633,17 +652,22 @@ extension AgentMailService {
         // Hold the installer lock (non-blocking) through the inspection so a
         // live installer's half-written metadata is never read as a state
         // (Codex, round 1). Doctor still never mutates.
-        let fd = open(lockURL.path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
-        if fd >= 0 {
-            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-                close(fd)
+        // The lock file is created if absent (0600, empty — the only file
+        // doctor ever creates) so a first installer racing with doctor is
+        // serialized too; a symlink or unopenable lock path is reported.
+        let fd: Int32
+        do {
+            guard let opened = try openInstallerLock() else {
                 return "AgentMail installation in progress (another process holds the installer lock)"
             }
+            fd = opened
+        } catch {
+            return "AgentMail installer lock cannot be taken (\(error.localizedDescription)); inspect \(lockURL.path)"
         }
-        defer { if fd >= 0 { close(fd) } }
+        defer { close(fd) }
         var st = stat()
         guard lstat(transactionURL.path, &st) == 0 else {
-            let staging = ((try? FileManager.default.contentsOfDirectory(atPath: installDirectory.path)) ?? []).filter { $0.hasPrefix(stagingPrefix) }
+            guard let staging = try? stagingEntries() else { return "AgentMail install directory cannot be listed (\(installDirectory.path))" }
             return staging.isEmpty ? nil : "AgentMail staging debris left behind (\(staging.joined(separator: ", "))); run `briglia agentmail repair`"
         }
         do {
